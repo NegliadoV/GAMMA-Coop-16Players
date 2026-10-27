@@ -48,7 +48,7 @@ namespace GammaZoneLauncher
         public bool HostSteam { get; set; } = true;
         public int AutosaveMinutes { get; set; } = 10;
         public bool SkipModCheck { get; set; } = false;
-        public string ReleaseManifestUrl { get; set; } = @"C:\GAMMA-Coop-Release";
+        public string ReleaseManifestUrl { get; set; } = "https://github.com/NegliadoV/GAMMA-Coop-16Players/releases/download/v1.0.0";
         public string ReleaseOutputDir { get; set; } = @"C:\GAMMA-Coop-Release";
         public List<ServerEntry> SavedServers { get; set; } = new List<ServerEntry>();
     }

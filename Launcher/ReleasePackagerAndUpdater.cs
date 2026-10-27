@@ -180,12 +180,18 @@ namespace GammaZoneLauncher
 
             if (volumeFiles.Count > 0)
             {
+                var prevByFile = manifest.BaseVolumes.ToDictionary(v => v.FileName, v => v, StringComparer.OrdinalIgnoreCase);
                 manifest.BaseVolumes.Clear();
                 int vIdx = 0;
                 foreach (var vf in volumeFiles)
                 {
                     vIdx++;
                     var vfi = new FileInfo(vf);
+                    if (prevByFile.TryGetValue(vfi.Name, out var prev) && prev.SizeBytes == vfi.Length && !string.IsNullOrEmpty(prev.Sha256))
+                    {
+                        manifest.BaseVolumes.Add(prev);
+                        continue;
+                    }
                     Report($"Хэширование тома {vIdx}/{volumeFiles.Count}: {vfi.Name}...", 2, 4, vfi.Name);
                     manifest.BaseVolumes.Add(new ReleaseVolumeEntry
                     {
