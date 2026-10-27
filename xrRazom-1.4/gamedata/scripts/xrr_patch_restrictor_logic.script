@@ -1,0 +1,804 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Host-authoritative restrictor logic: the host switches restrictors against every
+  player and replicates the section; a peer never evaluates a replicated restrictor.
+  The condlist effects a peer lost that way reach it over RESTRICTOR_EFFECT.
+  One whose effects never leave the machine is local and runs vanilla on every machine.
+]]
+
+local ACTOR_CONDS = {
+    on_actor_dist_le = true, on_actor_dist_le_nvis = true,
+    on_actor_dist_ge = true, on_actor_dist_ge_nvis = true,
+    on_actor_in_zone = true, on_actor_not_in_zone  = true,
+    on_actor_inside  = true, on_actor_outside      = true,
+}
+
+-- A player arriving starts a new audience; a player leaving addresses the one recorded.
+local ARRIVAL_CONDS = {
+    on_actor_dist_le = true, on_actor_dist_le_nvis = true,
+    on_actor_in_zone = true, on_actor_inside       = true,
+}
+
+-- GATED and ALWAYS act on db.actor itself and belong to the restrictor's audience;
+-- ALWAYS also runs on the host whatever the audience, as sr_cutscene locks its UI
+-- outside any condlist. MOVES teleports the actor and does world work besides.
+-- ROUTED is wrapped by its own module, which asks deliver(). PEER has no xr_effect.
+GATED, ALWAYS, MOVES, ROUTED, SOUND, PEER = 1, 2, 3, 4, 5, 6
+
+local FX = {
+    { "disable_ui",             GATED  },
+    { "disable_ui_only",        GATED  },
+    { "run_tutorial",           GATED  },
+    { "kill_actor",             GATED  },
+    { "hit_actor",              GATED  },
+    { "save_actor_position",    GATED  },
+    { "restore_actor_position", GATED  },
+    { "enable_ui",              ALWAYS },
+    { "enable_imput",           ALWAYS },
+    { "stop_tutorial",          ALWAYS },
+    { "bar_arena_teleport",     ALWAYS },
+    { "bar_arena_teleport_2",   ALWAYS },
+    { "bar_arena_weapon_slot",  ALWAYS },
+    { "teleport_actor",         ROUTED },
+    { "play_sound",             SOUND  },
+    { "stop_sound",             SOUND  },
+    { "play_sound_looped",      SOUND  },
+    { "stop_sound_looped",      SOUND  },
+    { "resume_sound",           PEER   },  -- play_sound for a peer joining mid-track
+    { "move_actor",             PEER   },  -- where a MOVES effect landed the host
+}
+
+-- RESTRICTOR_EFFECT's sub-action: the row index once apply() has sorted the rows by
+-- name, so it does not depend on the order the patches registered in.
+local CODE = {}
+
+local EVERY_PEER = 65535
+local KILL_RELAY_MS = 500
+
+-- The item spares only its holder, so the gate is judged per player inside.
+local KILL_GATES = { x16_timer_restrictor = "good_psy_helmet" }
+
+local EMPTY = {}
+local STYPE_RESTRICTOR
+local ALL_PLAYERS_ZONES = EMPTY
+local applied = false
+
+local orig_try_switch, orig_determine, orig_initialize, orig_switch
+
+local function on_peer()       return XrrSessionActive and not XrrHosting end
+local function hosting_peers() return XrrHosting and XrrPeerCount > 0 end
+
+-- Effects that touch only this machine's UI or player. sr_teleport is the
+-- transition prompt: each player answers their own.
+local MACHINE_EFFECTS = {
+    run_tutorial = true, stop_tutorial = true,
+    disable_ui = true, disable_ui_only = true, enable_ui = true,
+    sr_teleport = true,
+}
+
+-- Effects that take the player out of play: a restrictor firing one on a player's
+-- arrival is a scene. Every MOVES effect joins at registration.
+local GATHERS = { disable_ui = true, disable_ui_only = true, teleport_actor = true }
+
+-- bare = the effect block with every argument list cut out.
+local function block_is_shared(bare)
+    for kind, name in string.gmatch(bare, "([=+%-!])([%w_%.]+)") do
+        if kind == "=" then
+            if not MACHINE_EFFECTS[name] then return true end
+        elseif kind == "!" or not XrrPda():IsLocalInfoPortion(name) then
+            return true
+        end
+    end
+    return false
+end
+
+local function block_gathers(bare)
+    for name in string.gmatch(bare, "=([%w_%.]+)") do
+        if GATHERS[name] then return true end
+    end
+    return false
+end
+
+-- shared: some effect leaves the machine. positional: some switch waits for a
+-- player to arrive, so its effects never fall back on the whole party.
+local function scan(ini)
+    local shared, positional, gathers = false, false, false
+    if ini then
+        ini:section_for_each(function(sec)
+            for i = 0, ini:line_count(sec) - 1 do
+                local _, key, value = ini:r_line(sec, i, "", "")
+                if key and ARRIVAL_CONDS[(string.gsub(key, "%d+$", ""))] then
+                    positional = true
+                end
+                if value and not (shared and gathers) then
+                    for block in string.gmatch(value, "%%([^%%]*)%%") do
+                        local bare = string.gsub(block, "%b()", "")
+                        shared  = shared  or block_is_shared(bare)
+                        gathers = gathers or block_gathers(bare)
+                    end
+                end
+            end
+            return shared and positional and gathers
+        end)
+    end
+    return shared, positional, gathers
+end
+
+-- The whole ini, not the active section: switch conditions are parsed lazily per section.
+local function classify(obj, st, ini)
+    if st.xrr_local ~= nil or not (XrrSessionActive or XrrWillHost()) then return end
+    local shared, positional, gathers = scan(ini)
+    st.xrr_local      = not shared
+    st.xrr_positional = positional
+    st.xrr_scene      = positional and gathers
+    st.xrr_kill_gate  = KILL_GATES[obj:name()] or false
+end
+
+local function storage_of(npc)
+    if not npc then return nil end
+    local id = npc.id
+    if type(id) == "function" then id = npc:id() end
+    return id and db.storage[id]
+end
+
+local function is_local(npc)
+    local st = storage_of(npc)
+    return st ~= nil and st.xrr_local == true
+end
+
+function is_replicated(obj_id)
+    local st = db.storage[obj_id]
+    return st ~= nil and st.xrr_local == false
+end
+
+local function nearest_sqr(pos)
+    return xrr_patch_common.nearest_player_dist_sqr(pos)
+end
+
+-- range_sqr nil = at any distance.
+local function sees_player(npc, pos, range_sqr)
+    local a = db.actor
+    if a:alive() and npc:see(a)
+       and (not range_sqr or a:position():distance_to_sqr(pos) <= range_sqr) then
+        return true
+    end
+    local list = xrr_patch_common.alive_proxies()
+    for i = 1, #list do
+        local p = list[i]
+        if npc:see(p) and (not range_sqr or p:position():distance_to_sqr(pos) <= range_sqr) then
+            return true
+        end
+    end
+    return false
+end
+
+local function players_in_zone(name)
+    local zone = db.zone_by_name[name]
+    if not zone then return false end
+    if ALL_PLAYERS_ZONES[name] then return XrrPlayers():AllPlayersInside(zone:id()) end
+    return XrrPlayers():AnyPlayerInside(zone:id())
+end
+
+local function add_inside(zone, aud)
+    local a = db.actor
+    if a:alive() and zone:inside(a:position()) then aud[a:id()] = true end
+    local list = xrr_patch_common.alive_proxies()
+    for i = 1, #list do
+        local p = list[i]
+        if zone:inside(p:position()) then aud[p:id()] = true end
+    end
+end
+
+local function add_within(pos, range_sqr, aud)
+    local a = db.actor
+    if a:alive() and a:position():distance_to_sqr(pos) <= range_sqr then aud[a:id()] = true end
+    local list = xrr_patch_common.alive_proxies()
+    for i = 1, #list do
+        local p = list[i]
+        if p:position():distance_to_sqr(pos) <= range_sqr then aud[p:id()] = true end
+    end
+end
+
+local function near_any(pos, aud, fallback, range_sqr)
+    local measured = false
+    for id, inside in pairs(aud) do
+        if inside == true then
+            local who = level.object_by_id(id)
+            if who then
+                measured = true
+                if who:position():distance_to_sqr(pos) <= range_sqr then return true end
+            end
+        end
+    end
+    return not measured and fallback:distance_to_sqr(pos) <= range_sqr
+end
+
+-- A scene takes whoever stands within the party's teleport radius of the players
+-- that walked in, or of the trigger when nobody is inside it. 0 = the whole level.
+local NEAR = 1
+local function add_nearby(npc, aud)
+    local range = tonumber(get_console_cmd(0, "xrr_teleport_radius")) or 30
+    local range_sqr = range > 0 and range * range or math.huge
+    local from = npc:position()
+
+    local a = db.actor
+    if a:alive() and not aud[a:id()] and near_any(a:position(), aud, from, range_sqr) then
+        aud[a:id()] = NEAR
+    end
+    local list = xrr_patch_common.alive_proxies()
+    for i = 1, #list do
+        local p = list[i]
+        if not aud[p:id()] and near_any(p:position(), aud, from, range_sqr) then
+            aud[p:id()] = NEAR
+        end
+    end
+    -- Marked apart until here, so a player near a nearby one is not pulled in too.
+    for id, inside in pairs(aud) do
+        if inside == NEAR then aud[id] = true end
+    end
+end
+
+-- c = the arrival condition that fired: the players it matched start the audience.
+local function restart_audience(npc, st, c)
+    local aud = st.xrr_audience
+    if aud then
+        for id in pairs(aud) do aud[id] = nil end
+    else
+        aud = {}
+        st.xrr_audience = aud
+    end
+    local zone = c.name == "on_actor_in_zone" and db.zone_by_name[c.v1] or nil
+    st.xrr_trigger_zone = zone
+    if c.name == "on_actor_dist_le" or c.name == "on_actor_dist_le_nvis" then
+        add_within(npc:position(), c.v1 * c.v1, aud)
+    else
+        add_inside(zone or npc, aud)
+    end
+    if st.xrr_scene then add_nearby(zone or npc, aud) end
+end
+
+-- st.logic is rebuilt on every set_scheme, so the verdict keys on its identity.
+local function has_actor_conds(st, l)
+    if st.xrr_logic_seen ~= l then
+        local found = false
+        for _, c in pairs(l) do
+            if ACTOR_CONDS[c.name] then found = true break end
+        end
+        st.xrr_logic_seen, st.xrr_actor_conds = l, found
+    end
+    return st.xrr_actor_conds
+end
+
+-- Vanilla's loop with the actor conditions read against every alive player.
+local function team_try_switch(npc, st, actor, l)
+    local npc_id = npc:id()
+    local pos, nd
+    local switched = false
+    for _, c in pairs(l) do
+        local name, fire = c.name, false
+        if name == "on_actor_dist_le" then
+            pos = pos or npc:position()
+            fire = npc:alive() and sees_player(npc, pos, c.v1 * c.v1)
+        elseif name == "on_actor_dist_le_nvis" then
+            pos = pos or npc:position()
+            nd = nd or nearest_sqr(pos)
+            fire = nd <= c.v1 * c.v1
+        elseif name == "on_actor_dist_ge" then
+            pos = pos or npc:position()
+            nd = nd or nearest_sqr(pos)
+            fire = nd > c.v1 * c.v1 and npc:alive() and sees_player(npc)
+        elseif name == "on_actor_dist_ge_nvis" then
+            pos = pos or npc:position()
+            nd = nd or nearest_sqr(pos)
+            fire = nd > c.v1 * c.v1
+        elseif name == "on_signal" then
+            fire = st.signals and st.signals[c.v1]
+        elseif name == "on_info" then
+            fire = true
+        elseif name == "on_timer" then
+            fire = time_global() >= db.storage[npc_id].activation_time + c.v1
+        elseif name == "on_game_timer" then
+            fire = game.get_game_time():diffSec(db.storage[npc_id].activation_game_time) >= c.v1
+        elseif name == "on_actor_in_zone" then
+            fire = players_in_zone(c.v1)
+        elseif name == "on_actor_not_in_zone" then
+            fire = not players_in_zone(c.v1)
+        elseif name == "on_npc_in_zone" then
+            fire = utils_obj.npc_in_zone(level.object_by_id(c.npc_id), db.zone_by_name[c.v2])
+        elseif name == "on_npc_not_in_zone" then
+            fire = not utils_obj.npc_in_zone(level.object_by_id(c.npc_id), db.zone_by_name[c.v2])
+        elseif name == "on_actor_inside" then
+            fire = XrrPlayers():AnyPlayerInside(npc_id)
+        elseif name == "on_actor_outside" then
+            fire = not XrrPlayers():AnyPlayerInside(npc_id)
+        else
+            printf("WARNING: object '%s': try_switch_to_another_section: unknown condition '%s' encountered", npc:name(), name)
+        end
+        if fire then
+            -- Restarted only once the arrival delivers an effect or switches: one whose
+            -- condlist picks nothing fires every tick and must keep the recorded audience.
+            local ost = ARRIVAL_CONDS[name] and db.storage[npc_id]
+            if ost and ost.xrr_local == false then ost.xrr_arrival = c else ost = nil end
+            switched = xr_logic.switch_to_section(npc, st.ini,
+                xr_logic.pick_section_from_condlist(actor, npc, c.condlist))
+            if ost and ost.xrr_arrival then
+                if switched == true and ost.active_section then restart_audience(npc, ost, c) end
+                ost.xrr_arrival = nil
+            end
+        end
+        if switched == true then break end
+    end
+    return switched
+end
+
+local function try_switch(npc, st, actor)
+    if XrrSessionActive then
+        if XrrHosting then
+            local l = st.logic
+            if actor and l and XrrPeerCount > 0 and has_actor_conds(st, l) then
+                local ost = db.storage[npc:id()]
+                if not (ost and ost.xrr_local) then
+                    return team_try_switch(npc, st, actor, l)
+                end
+            end
+        else
+            local ost = db.storage[npc:id()]
+            if ost and ost.xrr_local == false then return false end
+        end
+    end
+    return orig_try_switch(npc, st, actor)
+end
+
+-- A peer never runs the active= pick: it takes the host's section, or waits in nil.
+local function determine_section(npc, ini, section_logic, actor)
+    local st = db.storage[npc:id()]
+    if st and st.stype == STYPE_RESTRICTOR then
+        classify(npc, st, ini)
+        if on_peer() and st.xrr_local == false then
+            local s = xrr_patch_logic_section.take_pending(npc:id())
+            if s and (s == "nil" or ini:section_exist(s)) then return s end
+            return "nil"
+        end
+    end
+    return orig_determine(npc, ini, section_logic, actor)
+end
+
+-- A loaded restrictor skips determine_section_to_activate, hence the verdict here too.
+local function initialize(obj, st, loaded, actor, stype)
+    orig_initialize(obj, st, loaded, actor, stype)
+    if stype ~= STYPE_RESTRICTOR then return end
+    classify(obj, st, st.ini)
+    if st.xrr_local == false and hosting_peers() then
+        XrrWorld():SendLogicSection(obj:id(), st.active_section or "nil")
+    end
+end
+
+-- The peer's own apply comes through here too, so only the host writes.
+local function switch_to_section(npc, ini, section)
+    local st = XrrSessionActive and npc and db.storage[npc:id()]
+    if not (st and st.xrr_local == false) then
+        return orig_switch(npc, ini, section)
+    end
+    if not XrrHosting then
+        if not _G.xrr_applying_logic_section then return false end
+        return orig_switch(npc, ini, section)
+    end
+    local switched = orig_switch(npc, ini, section)
+    if switched then
+        if not st.active_section then
+            st.xrr_audience, st.xrr_trigger_zone = nil, nil
+        end
+        if XrrPeerCount > 0 then
+            XrrWorld():SendLogicSection(npc:id(), st.active_section or "nil")
+        end
+    end
+    return switched
+end
+
+-- on_value picks run their %effects% before any switch could be refused.
+local function patch_sr_timer_peer_gate()
+    local cls = sr_timer and sr_timer.action_timer
+    local orig = cls and cls.update
+    if type(orig) ~= "function" then return end
+    function cls:update(delta)
+        local ost = on_peer() and db.storage[self.object:id()]
+        if ost and ost.xrr_local == false then
+            local on_value = self.st.on_value
+            self.st.on_value = EMPTY
+            orig(self, delta)
+            self.st.on_value = on_value
+            return
+        end
+        return orig(self, delta)
+    end
+end
+
+-- Only against the host's own actor: combat-ignore condlists pass the enemy as `actor`.
+local function team_actor(actor)
+    return hosting_peers() and actor ~= nil and actor:id() == AC_ID
+end
+
+local function all_inside_hold(zone, sec)
+    local n = 0
+    local a = db.actor
+    if a:alive() and zone:inside(a:position()) then
+        if not a:object(sec) then return false end
+        n = 1
+    end
+    local list = xrr_patch_common.alive_proxies()
+    for i = 1, #list do
+        local p = list[i]
+        if zone:inside(p:position()) then
+            if not p:object(sec) then return false end
+            n = n + 1
+        end
+    end
+    return n > 0
+end
+
+local function patch_functors()
+    local dist_le = xr_conditions.dist_to_actor_le
+    xr_conditions.dist_to_actor_le = function(actor, npc, p)
+        if team_actor(actor) and p[1] ~= nil and not is_local(npc) then
+            return nearest_sqr(npc:position()) <= tonumber(p[1]) ^ 2
+        end
+        return dist_le(actor, npc, p)
+    end
+
+    local dist_ge = xr_conditions.dist_to_actor_ge
+    xr_conditions.dist_to_actor_ge = function(actor, npc, p)
+        if team_actor(actor) and p[1] ~= nil and not is_local(npc) then
+            return nearest_sqr(npc:position()) >= tonumber(p[1]) ^ 2
+        end
+        return dist_ge(actor, npc, p)
+    end
+
+    local see = xr_conditions.actor_see_npc
+    xr_conditions.actor_see_npc = function(actor, npc, p)
+        local r = see(actor, npc, p)
+        if r or not hosting_peers() or is_local(npc) then return r end
+        local list = xrr_patch_common.alive_proxies()
+        for i = 1, #list do
+            if list[i]:see(npc) then return true end
+        end
+        return r
+    end
+
+    local near_smart = xr_conditions.actor_near_smart
+    xr_conditions.actor_near_smart = function(actor, npc, p)
+        if not (hosting_peers() and db.actor and p and p[1]) or is_local(npc) then
+            return near_smart(actor, npc, p)
+        end
+        local smart = SIMBOARD.smarts_by_names[p[1]]
+        if not (smart and smart.online and SIMBOARD.smarts[smart.id]) then return false end
+        local dist = p[2] and tonumber(p[2]) or 50
+        return nearest_sqr(smart.position) < dist * dist
+    end
+
+    -- Already party-wide for every caller (xrr_patch_quests); a local restrictor
+    -- needs the host's own inventory back, and a kill gate judges those inside.
+    local has_item = xr_conditions.actor_has_item
+    xr_conditions.actor_has_item = function(actor, npc, p)
+        if hosting_peers() and p and p[1] ~= nil then
+            local st = storage_of(npc)
+            if st and st.xrr_local then return db.actor:object(p[1]) ~= nil end
+            if st and st.xrr_kill_gate == p[1] then return all_inside_hold(npc, p[1]) end
+        end
+        return has_item(actor, npc, p)
+    end
+end
+
+-- Grows across the chain so an enable_ui still reaches whoever the disable_ui hit.
+-- Ids, so a relay can address each one.
+local function audience(zone, st)
+    if st.xrr_arrival then
+        restart_audience(zone, st, st.xrr_arrival)
+        st.xrr_arrival = nil
+    end
+    local aud = st.xrr_audience
+    if not aud then
+        aud = {}
+        st.xrr_audience = aud
+    end
+    -- A scene keeps the audience its arrival gathered: a latecomer gets none of it.
+    if st.xrr_scene then return aud end
+    add_inside(st.xrr_trigger_zone or zone, aud)
+    -- Nobody inside and nothing recorded, in a restrictor no player walks into: a story trigger.
+    if not st.xrr_positional and next(aud) == nil then
+        aud[db.actor:id()] = true
+        local list = xrr_patch_common.alive_proxies()
+        for i = 1, #list do aud[list[i]:id()] = true end
+    end
+    return aud
+end
+
+local function args_of(p)
+    return p and table.concat(p, ":") or ""
+end
+
+local function relay_audience(aud, npc_id, code, args)
+    local host = db.actor:id()
+    for id in pairs(aud) do
+        if id ~= host then XrrWorld():SendRestrictorEffect(id, npc_id, code, args) end
+    end
+end
+
+local function relay_all(npc_id, code, args)
+    XrrWorld():SendRestrictorEffect(EVERY_PEER, npc_id, code, args)
+end
+
+-- The restrictor's storage while the host runs its condlist for peers. Scheme-internal
+-- calls (sr_cutscene) are outside condlist context: every machine runs its own.
+local function relayed_restrictor(npc)
+    if not (_G.xrr_in_condlist_effects and hosting_peers()) then return nil end
+    local st = storage_of(npc)
+    return st and st.xrr_local == false and st or nil
+end
+
+-- Raised while a peer runs a relayed effect: its copy of the restrictor may not be
+-- classified yet, and the effect must still stay on this machine.
+local replaying = false
+
+-- true = run the effect on this machine, false = skip it, nil = not a replicated
+-- restrictor's effect. A peer gets here from the relay or a scheme's own call.
+function deliver(name, npc, p)
+    if replaying then return true end
+    local st = XrrSessionActive and storage_of(npc)
+    if not (st and st.xrr_local == false) then return nil end
+    if not relayed_restrictor(npc) then return true end
+
+    local code = CODE[name]
+    local aud  = audience(npc, st)
+    local mine = aud[db.actor:id()] == true
+    if name ~= "kill_actor" then
+        relay_audience(aud, npc:id(), code, args_of(p))
+        return mine or FX[code][2] == ALWAYS
+    end
+
+    -- A gated kill re-fires every tick until the unspared one is dead.
+    local now = time_global()
+    if now >= (st.xrr_kill_relay_at or 0) then
+        st.xrr_kill_relay_at = now + KILL_RELAY_MS
+        relay_audience(aud, npc:id(), code, "")
+    end
+    local gate = st.xrr_kill_gate
+    return mine and not (gate and db.actor:object(gate))
+end
+
+local function wrap_effect(name)
+    local orig = xr_effects[name]
+    if type(orig) ~= "function" then return end
+    xr_effects[name] = function(actor, npc, p)
+        if deliver(name, npc, p) == false then return end
+        return orig(actor, npc, p)
+    end
+end
+
+-- The host always runs it, for the world work, and steps back unless it is in the
+-- audience. The audience's peers are moved to where it landed, and run nothing else.
+local function wrap_moving(name)
+    local orig = xr_effects[name]
+    if type(orig) ~= "function" then return end
+    xr_effects[name] = function(actor, npc, p)
+        local st = relayed_restrictor(npc)
+        if not st then return orig(actor, npc, p) end
+
+        local a    = db.actor
+        local aud  = audience(npc, st)
+        local from = vector():set(a:position())
+        orig(actor, npc, p)
+        local to = a:position()
+        if to:distance_to_sqr(from) < 0.01 then return end
+
+        relay_audience(aud, npc:id(), CODE.move_actor,
+            string.format("%.3f:%.3f:%.3f", to.x, to.y, to.z))
+        if not aud[a:id()] then a:set_actor_position(from) end
+    end
+end
+
+-- A mod's actor effects join through its own patch, at file scope: apply() wraps
+-- what is registered by then. A name with no such xr_effect is carried and ignored.
+function register_effect(name, mode)
+    if applied or not mode then
+        printf("![xrRazom] restrictor effect %s refused: mode=%s applied=%s",
+            name, tostring(mode), tostring(applied))
+        return
+    end
+    for i = 1, #FX do
+        if FX[i][1] == name then return end
+    end
+    FX[#FX + 1] = { name, mode }
+    if mode == MOVES then GATHERS[name] = true end
+end
+
+-- nil = not the condlist of a replicated restrictor on a host with peers.
+function audience_of(npc)
+    local st = relayed_restrictor(npc)
+    return st and audience(npc, st) or nil
+end
+
+-- Relayed on the start vanilla's own guards let through, never per call: a
+-- section-less condlist calls these every tick.
+local function patch_sounds()
+    local play = xr_effects.play_sound
+    xr_effects.play_sound = function(actor, npc, p)
+        local st    = relayed_restrictor(npc)
+        local theme = st and p and sound_theme.theme[p[1]]
+        if not theme then return play(actor, npc, p) end
+
+        local was = theme.snd_obj
+        play(actor, npc, p)
+        local snd = theme.snd_obj
+        -- rawequal: luabind raises on == between two sound objects.
+        if not snd or rawequal(snd, was) then return end
+
+        -- The sample leads the args, so a peer plays the host's line of a sequence.
+        local args = theme.played_id .. ":" .. args_of(p)
+        printf("[xrRazom][restr] %s started %s", npc:name(), args)
+        if theme.class_id ~= "actor_sound" then
+            return relay_all(npc:id(), CODE.play_sound, args)
+        end
+        local aud = audience(npc, st)
+        relay_audience(aud, npc:id(), CODE.play_sound, args)
+        -- Played muted rather than skipped: sound_end reaches the chain from here alone.
+        if not aud[db.actor:id()] then snd.volume = 0 end
+    end
+
+    local stop = xr_effects.stop_sound
+    xr_effects.stop_sound = function(actor, npc, p)
+        local id   = relayed_restrictor(npc) and npc:id()
+        local busy = id and (xr_sound.sound_table[id] or xr_sound.looped_sound[id])
+        stop(actor, npc, p)
+        if busy then relay_all(id, CODE.stop_sound, "") end
+    end
+
+    local loop = xr_effects.play_sound_looped
+    xr_effects.play_sound_looped = function(actor, npc, p)
+        if not (relayed_restrictor(npc) and p and p[1]) then return loop(actor, npc, p) end
+        local id, name = npc:id(), p[1]
+        local t   = xr_sound.looped_sound[id]
+        local was = t and t[name] and t[name]:is_playing(id)
+        loop(actor, npc, p)
+        t = xr_sound.looped_sound[id]
+        if not was and t and t[name] then relay_all(id, CODE.play_sound_looped, name) end
+    end
+
+    local unloop = xr_effects.stop_sound_looped
+    xr_effects.stop_sound_looped = function(actor, npc, p)
+        local id   = relayed_restrictor(npc) and npc:id()
+        local busy = id and xr_sound.looped_sound[id]
+        unloop(actor, npc, p)
+        if busy then relay_all(id, CODE.stop_sound_looped, "") end
+    end
+end
+
+-- A peer never runs a replicated restrictor's condlist, so the news it raises is
+-- the party's. relayed_restrictor() cannot hold yet: this wrap sits outside the one
+-- that sets xrr_in_condlist_effects.
+local function patch_pick_news()
+    local pick = xr_logic.pick_section_from_condlist
+    xr_logic.pick_section_from_condlist = function(actor, npc, condlist)
+        local st = hosting_peers() and storage_of(npc)
+        if st and st.xrr_local == false then
+            return xrr_with_news_broadcast(pick, actor, npc, condlist)
+        end
+        return pick(actor, npc, condlist)
+    end
+end
+
+-- A loop or a track still playing is state: one started before a peer was ready
+-- never reached it. Personal sounds are not replayed.
+function replay_sounds(netid)
+    if not XrrHosting then return end
+    local world = XrrWorld()
+    for id, themes in pairs(xr_sound.looped_sound) do
+        if is_replicated(id) then
+            for name in pairs(themes) do
+                world:SendRestrictorEffectTo(netid, id, CODE.play_sound_looped, name)
+            end
+        end
+    end
+    for id, theme in pairs(xr_sound.sound_table) do
+        if is_replicated(id) and type(theme) ~= "string" and theme.class_id == "object_sound"
+           and theme.played_id and theme:is_playing(id) then
+            world:SendRestrictorEffectTo(netid, id, CODE.resume_sound,
+                theme.played_id .. ":" .. theme.section)
+        end
+    end
+end
+
+-- The host's guards let this start through; the peer's own, rolled apart, must not
+-- veto it. resume = a track the host is already in, which never cuts one playing here.
+local function replay_play_sound(actor, npc, p, resume)
+    local sample = table.remove(p, 1)
+    local theme  = sound_theme.theme[p[1]]
+    local path   = theme and theme.sound[sample]
+    if not path then return end
+
+    local id   = npc:id()
+    local prev = xr_sound.sound_table[id]
+    if prev then
+        if resume then return end
+        prev:stop(id)
+        xr_sound.sound_table[id] = nil
+    end
+    sound_theme.can_play_sound[theme.class_id == "actor_sound" and AC_ID or id] = true
+    if theme.cooldown then theme.cooldown[id] = nil end
+    theme.played_time = nil
+
+    -- One sample to choose from, so every shuffle mode lands on the host's.
+    local all = theme.sound
+    theme.sound, theme.played_id = { path }, nil
+    local ok, err = pcall(xr_effects.play_sound, actor, npc, p)
+    theme.sound, theme.played_id = all, sample
+    if not ok then error(err, 0) end
+end
+
+local REPLAY = {
+    play_sound   = replay_play_sound,
+    resume_sound = function(actor, npc, p) return replay_play_sound(actor, npc, p, true) end,
+    move_actor   = function(actor, npc, p)
+        actor:set_actor_position(vector():set(p[1], p[2], p[3]))
+    end,
+}
+
+function _G.OnRestrictorEffect(id, code, args)
+    local fx  = FX[code]
+    local st  = fx and db.actor and db.storage[id]
+    local npc = st and st.object
+    if not npc then
+        printf("![xrRazom] restrictor effect dropped: id=%s code=%s", id, code)
+        return
+    end
+    local name = fx[1]
+    if name == "kill_actor" then
+        local gate = KILL_GATES[npc:name()]
+        if gate and db.actor:object(gate) then return end
+    end
+
+    local run = REPLAY[name] or xr_effects[name]
+    local p   = args ~= "" and xr_logic.parse_func_params(args) or nil
+    replaying = true
+    local ok, err = pcall(run, db.actor, npc, p)
+    replaying = false
+    if not ok then
+        printf("![xrRazom] restrictor effect %s threw: id=%s err=%s", name, id, tostring(err))
+    end
+end
+
+function apply()
+    if applied then return end
+    applied = true
+
+    _G.xrr_applying_logic_section = _G.xrr_applying_logic_section or false
+    _G.xrr_in_condlist_effects    = _G.xrr_in_condlist_effects or false
+
+    STYPE_RESTRICTOR  = modules.stype_restrictor
+    ALL_PLAYERS_ZONES = xrr_patch_common.ALL_PLAYERS_ZONES
+
+    orig_try_switch = xr_logic.try_switch_to_another_section
+    orig_determine  = xr_logic.determine_section_to_activate
+    orig_initialize = xr_logic.initialize_obj
+    orig_switch     = xr_logic.switch_to_section
+    xr_logic.try_switch_to_another_section = try_switch
+    xr_logic.determine_section_to_activate = determine_section
+    xr_logic.initialize_obj                = initialize
+    xr_logic.switch_to_section             = switch_to_section
+
+    patch_sr_timer_peer_gate()
+    patch_functors()
+    patch_sounds()
+    patch_pick_news()
+    table.sort(FX, function(a, b) return a[1] < b[1] end)
+    for code = 1, #FX do
+        local name, mode = FX[code][1], FX[code][2]
+        CODE[name] = code
+        if mode == GATED or mode == ALWAYS then
+            wrap_effect(name)
+        elseif mode == MOVES then
+            wrap_moving(name)
+        end
+    end
+end

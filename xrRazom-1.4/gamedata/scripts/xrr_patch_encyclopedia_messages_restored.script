@@ -1,0 +1,16 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Encyclopedia Messages Restored (RavenAscendant): its unlock wrappers post a PDA
+  news line straight through db.actor, so a synced unlock bypassed our mute.
+]]
+
+function on_game_start()
+    local mod = zz_encyclopedia_messages_restored
+    if not (mod and type(mod.set_article) == "function") then return end -- mod absent
+
+    -- Its wrappers return before the news line when their own set_article comes back empty.
+    xrr_patch_encyclopedia.mute_during_apply(mod, "set_article")
+    log("[xrRazom][ency] Encyclopedia Messages Restored muted during synced unlocks")
+end

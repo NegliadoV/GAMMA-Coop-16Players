@@ -1,0 +1,26 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Module: base-game silent kills — the host judges, the peer does not.
+
+  A peer's hit on a mirror raises the before-hit evaluator locally, with the
+  peer's own actor as draftsman, so stealth_kill_detection would credit a
+  silent kill on a mirror the host never killed.
+]]
+
+function on_game_start()
+    local gsk = gameplay_silent_kills
+    local orig = gsk and gsk.feature_enabled
+    if type(orig) ~= "function" then
+        log("[xrRazom][silentkills] INSTALL FAILED: gameplay_silent_kills.feature_enabled missing")
+        return
+    end
+    -- The module resolves feature_enabled at call time, so the table write is
+    -- enough. Runs per NPC update: plain session globals, no luabind crossing.
+    gsk.feature_enabled = function()
+        if XrrSessionActive and not XrrHosting then return false end
+        return orig()
+    end
+    log("[xrRazom][silentkills] installed: in a session, only the host judges silent kills")
+end

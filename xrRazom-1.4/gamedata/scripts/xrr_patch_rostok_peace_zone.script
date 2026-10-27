@@ -1,0 +1,80 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  160 - Military not attacked by Duty at Rostok patch: the mod keeps one
+  actor-crime bit, which a peer's identity-swapped hit would set for the host;
+  the host tracks crime per peer instead. Diagnosis by Nito.
+]]
+
+-- netid string keyed: stable across a rejoin, unlike the avatar's object id.
+local peer_crime = {}
+local logged = {}
+
+local mod            -- gameplay_peace_zone, once its shape is verified
+local orig_friendly  -- its npcs_friendly_to_community, before our wrap
+
+local function peer_key(obj)
+    if not (obj and XrrIsHosted()) then return nil end
+    local players = XrrPlayers()
+    if not players:IsPlayerDummy(obj:id()) then return nil end
+    local netid = players:PlayerDummyPeerNetid(obj:id())
+    if netid and netid ~= "" and netid ~= "0" then return netid end
+    return nil
+end
+
+-- Duty-friendly and not an arena fighter: the source's own pairing test, asked
+-- of the unwrapped function so a peer gets a truthful answer.
+local function is_bar_friend_pair(npc, player)
+    if character_community(npc) == "arena_enemy" then return false end
+    return orig_friendly(npc, player, "dolg") and true or false
+end
+
+local function on_before_hit(npc, s_hit)
+    local key = peer_key(s_hit and s_hit.draftsman)
+    if not key then return end
+    if not (mod.level_is_bar() and is_bar_friend_pair(npc, s_hit.draftsman)) then return end
+    peer_crime[key] = true
+    if not logged[key] then
+        logged[key] = true
+        log("[xrRazom][rostok] peer angered the Duty peace zone")
+    end
+end
+
+local function on_enemy_eval(npc, ene, flags)
+    local key = peer_key(ene)
+    if not key then return end
+    if peer_crime[key] then return end   -- this offender keeps its normal relation
+    if not (mod.level_is_bar() and IsStalker(npc) and is_bar_friend_pair(npc, ene)) then return end
+    flags.override = true
+    flags.result = false
+end
+
+local function save_peer_crime(m_data) m_data.xrr_rostok_peer_crime = peer_crime end
+local function load_peer_crime(m_data) peer_crime = m_data.xrr_rostok_peer_crime or {} end
+local function clear_peer_crime() peer_crime = {}; logged = {} end
+
+function on_game_start()
+    if orig_friendly then return end  -- a VM that outlives a load must not re-wrap
+    local m = gameplay_peace_zone
+    if not m then return end
+    if not (type(m.npcs_friendly_to_community) == "function"
+        and type(m.level_is_bar) == "function") then
+        printe("![xrRazom][rostok] gameplay_peace_zone changed shape — peace-zone crimes stay shared")
+        return
+    end
+
+    mod, orig_friendly = m, m.npcs_friendly_to_community
+    -- False for a peer keeps the mod's own crime bit and on_enemy_eval off peers;
+    -- both of its call sites pass the player second.
+    m.npcs_friendly_to_community = function(npc_1, npc_2, com)
+        if peer_key(npc_2) then return false end
+        return orig_friendly(npc_1, npc_2, com)
+    end
+
+    RegisterScriptCallback("npc_on_before_hit", on_before_hit)
+    RegisterScriptCallback("on_enemy_eval", on_enemy_eval)
+    RegisterScriptCallback("save_state", save_peer_crime)
+    RegisterScriptCallback("load_state", load_peer_crime)
+    RegisterScriptCallback("on_level_changing", clear_peer_crime)  -- source clears its bit here too
+end

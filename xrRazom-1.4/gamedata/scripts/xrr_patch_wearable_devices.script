@@ -1,0 +1,29 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Wearable Devices keeps each device's worn state in m_data, which a peer never
+  saves; the keys ride the peer m_data blob instead.
+]]
+
+local KEYS = {
+	-- Worn state + the worn item's id, per device. A dangling id after a failed
+	-- gear adoption resolves to no object, and the mod's drop poll takes the
+	-- device off. Charges are left out: they are the item's condition.
+	"wd_bracer_worn", "wd_bracer_worn_id",
+	"metro_watch_worn", "metro_watch_worn_id",
+	"vektor_worn", "vektor_worn_id",
+	"wd_promin_worn", "wd_promin_worn_id",
+	"wd_glowstick_section", "wd_glowstick_section_id",
+	"wd_slots_loadout", "wd_slots_loadout_ids",
+	-- Installing a module consumes its item, so this list is the only record.
+	"wd_promin_modules",
+	"wd_promin_page",
+}
+
+function on_game_start()
+	if not wd_core then return end
+	for _, key in ipairs(KEYS) do
+		xrr_peer_mdata.register(key)
+	end
+end

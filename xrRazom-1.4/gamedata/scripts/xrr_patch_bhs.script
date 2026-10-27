@@ -1,0 +1,56 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Body Health System (zzz_player_injuries): without this a rescued player is re-downed next tick.
+]]
+
+local PARTS = { "head", "torso", "leftarm", "rightarm", "leftleg", "rightleg" }
+
+-- Checked up front: axr_main's dispatch has no pcall, so failing mid-write would
+-- take the rest of the revive chain with it.
+local function tables_ok(bhs)
+    return bhs and bhs.health and bhs.maxhp and bhs.timedhp and bhs.medkits
+end
+
+-- The healing branch of zzz_player_injuries.MedicineUsed (local there); BHS's own
+-- item-use heal never fires on the rescued machine.
+local function apply_medkit(bhs, section)
+    local kit = section and bhs.medkits[section]
+    if not kit then return end
+    for _, k in ipairs(PARTS) do
+        local bonus = kit[k]
+        if bonus then
+            local room = bhs.maxhp[k] - bhs.health[k]
+            local amount = bonus < room and bonus or room
+            bhs.health[k] = bhs.health[k] + amount
+            bhs.timedhp[k] = bhs.timedhp[k] + amount
+        end
+    end
+    bhs.medkits.lastregen = time_global()
+    bhs.medkits.timedhealth = kit.timeregen
+end
+
+local function on_revived(reason, section)
+    local bhs = zzz_player_injuries
+    if not tables_ok(bhs) then return end
+
+    -- BHS writes health -1 while head or torso is 0 until a death. Unlike the medkit
+    -- this floor is not timedhp: decay back to a 0 base would re-arm that write.
+    if bhs.health.head <= 0 then bhs.health.head = 1 end
+    if bhs.health.torso <= 0 then bhs.health.torso = 1 end
+    apply_medkit(bhs, section)
+
+    -- SaveHealthStatus is local; these keys are what LoadHealthStatus reads.
+    for _, k in ipairs(PARTS) do
+        utils_obj.save_var(db.actor, "health." .. k, bhs.health[k])
+        utils_obj.save_var(db.actor, "timedhp." .. k, bhs.timedhp[k])
+    end
+    printf("[xrRazom][bhs] revived (reason %s, %s): head=%s torso=%s",
+        tostring(reason), tostring(section), tostring(bhs.health.head), tostring(bhs.health.torso))
+end
+
+function on_game_start()
+    if not tables_ok(zzz_player_injuries) then return end
+    RegisterScriptCallback("xrr_on_actor_revived", on_revived)
+end

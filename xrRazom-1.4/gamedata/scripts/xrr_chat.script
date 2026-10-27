@@ -1,0 +1,82 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  In-game co-op chat input line; history and overlay are owned engine-side.
+]]
+
+local _box = nil
+
+local function in_session()
+    return db.actor and (XrrIsHosted() or XrrIsConnected())
+end
+
+function get_box()
+    if not _box then _box = ChatBox() end
+    return _box
+end
+
+function open_close()
+    if not get_console_cmd(1, "xrr_chat_enable") then return end
+    if not in_session() then return end
+    local box = get_box()
+    if box:IsShown() then box:Close() else box:Open() end
+end
+
+-- No Lua caller: the engine's kXRR_CHAT bind handler calls this global by name.
+_G.xrr_open_chat = function() open_close() end
+
+class "ChatBox" (CUIScriptWnd)
+
+function ChatBox:__init() super()
+    self.shown = false
+    self:SetWndRect(Frect():set(0, 0, 1024, 768))
+
+    self.xml = CScriptXmlInit()
+    self.xml:ParseFile("chatbox.xml")
+    self.input = self.xml:InitEditBox("input", self)
+    self:Register(self.input, "chat_input")
+end
+
+function ChatBox:__finalize() end
+
+function ChatBox:IsShown() return self.shown end
+
+function ChatBox:Open()
+    self.input:SetText("")
+    self:ShowDialog(true)
+    self:Show(true)
+    self.input:CaptureFocus(true)
+    self.shown = true
+    XrrPlayers():SetChatInputOpen(true)
+    Register_UI("ChatBox", "xrr_chat")
+end
+
+function ChatBox:Close()
+    self.input:CaptureFocus(false)
+    self:HideDialog()
+    self:Show(false)
+    self.shown = false
+    XrrPlayers():SetChatInputOpen(false)
+    Unregister_UI("ChatBox")
+end
+
+function ChatBox:Send()
+    local txt = self.input:GetText()
+    self:Close()
+    if txt and txt ~= "" and txt ~= " " then
+        XrrPlayers():SendChat(txt)
+    end
+end
+
+function ChatBox:OnKeyboard(dik, action)
+    local res = CUIScriptWnd.OnKeyboard(self, dik, action)
+    if action == ui_events.WINDOW_KEY_PRESSED then
+        if dik == DIK_keys.DIK_RETURN or dik == DIK_keys.DIK_NUMPADENTER then
+            self:Send()
+        elseif dik == DIK_keys.DIK_ESCAPE then
+            self:Close()
+        end
+    end
+    return res
+end

@@ -1,0 +1,1317 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Peer-side DLL→Lua callbacks: session lifecycle, task/quest sync and shadow
+  target anchors, world/HUD mirrors, peer stats/condition persistence.
+]]
+
+-- Shadows are peer-local: the ownership-gated release path refuses them.
+local function release_shadow(shadow_id)
+    if not alife_object(shadow_id) then return end
+    xrr_release_direct(shadow_id)
+end
+
+-- Mutes a restored task's settling news burst.
+local TASK_RESTORE_SILENCE_MS = 8000
+local function arm_task_restore_silence(task_id)
+    _G.xrr_silent_restore_tasks = _G.xrr_silent_restore_tasks or {}
+    _G.xrr_silent_restore_tasks[tostring(task_id)] = time_global() + TASK_RESTORE_SILENCE_MS
+end
+
+local function clear_task_restore_silence(task_id)
+    if _G.xrr_silent_restore_tasks then
+        _G.xrr_silent_restore_tasks[tostring(task_id)] = nil
+    end
+end
+
+-- pcall: the engine swallows a throw out of give_task, which would latch both flags.
+local function apply_remote_task(tm, task_id, giver_id, silent)
+    if silent then
+        _G.xrr_restoring_tasks = true
+        arm_task_restore_silence(task_id)
+    end
+    _G.xrr_applying_remote_task = true
+    local ok, err = pcall(tm.give_task, tm, task_id, giver_id < 65535 and giver_id or nil)
+    _G.xrr_applying_remote_task = false
+    if silent then _G.xrr_restoring_tasks = false end
+    if not ok then
+        printf("![xrRazom][quest] apply_remote_task %s: %s", tostring(task_id), tostring(err))
+    end
+end
+
+-- Re-stamps deadlines so the silence window counts from gameplay resume.
+function XrrTaskRestoreSilenceTick()
+    local set = _G.xrr_silent_restore_tasks
+    if not set then return end
+    local deadline = time_global() + TASK_RESTORE_SILENCE_MS
+    for id in pairs(set) do
+        set[id] = deadline
+    end
+end
+
+function OnConnected(state)
+    local role = state and "host" or "client"
+    printf("[xrRazom] OnConnected | role=%s level=%s GameLoaded=%s",
+        role, tostring(level.present()), tostring(GameLoaded))
+    local on_fake = level.present() and level.name() == "fake_start"
+    if level.present() and not on_fake then
+        news_manager.send_tip(db.actor, "Connected to server as " .. role, nil, "nano", 20000)
+    elseif not GameLoaded or on_fake then
+        log("[xrRazom] OnConnected | client pre-game: awaiting host level info")
+    else
+        log("[xrRazom] OnConnected | WARNING: GameLoaded=true but no level — dialog skipped")
+    end
+end
+
+function OnHostAutoStarted(mode, port)
+    -- Deferred: a tip during the intro animation is suppressed by the PDA.
+    CreateTimeEvent("xrr", "xrr_host_notify", 5, function()
+        if not (db.actor and db.actor:alive()) then return true end
+        if mode == 2 then
+            news_manager.send_tip(db.actor, "xrRazom: Steam co-op hosting active\nFriends can join via the Steam overlay", nil, nil, 10000)
+        elseif mode == 1 then
+            news_manager.send_tip(db.actor, "xrRazom: LAN server started on port " .. tostring(port), nil, nil, 10000)
+        else
+            news_manager.send_tip(db.actor, "xrRazom: failed to start server", nil, nil, 10000)
+        end
+        return true
+    end)
+end
+
+function OnPlayerChangedLevel(player_netid, se_obj, nickname)
+    if not se_obj then return end
+    log("[xrRazom] Player changing level: " .. tostring(nickname))
+    if db.actor then
+        news_manager.send_tip(db.actor,
+            "Player " .. tostring(nickname) .. " changing level",
+            nil, "nano", 20000)
+    end
+end
+
+function OnPeerGiftReceived(sender_nick)
+    if not db.actor then return end
+    -- Empty nick = host-synthesized grant (a use-intent pickup): no tip.
+    if not sender_nick or sender_nick == "" then return end
+    local text = string.format(game.translate_string("st_xrr_gift_received"), sender_nick)
+    news_manager.send_tip(db.actor, text, nil, "nano", 8000)
+end
+
+-- The Tronex inventory only redraws the money readout on open.
+local function refresh_inventory_money()
+    local gui = ui_inventory and ui_inventory.GUI
+    if gui and gui:IsShown() then gui:UpdateCharacter() end
+end
+
+function OnMoneyReceived(sender_nick, amount)
+    if not db.actor then return end
+    refresh_inventory_money()
+    local name = (sender_nick and sender_nick ~= "") and sender_nick or "?"
+    local text = string.format(game.translate_string("st_xrr_money_received"),
+        name, tostring(amount), xrr_currency.suffix())
+    news_manager.send_tip(db.actor, text, nil, "nano", 8000)
+end
+
+function OnMoneyRefunded(amount)
+    if not db.actor then return end
+    refresh_inventory_money()
+    local text = string.format(game.translate_string("st_xrr_money_refunded"),
+        tostring(amount), xrr_currency.suffix())
+    news_manager.send_tip(db.actor, text, nil, "nano", 8000)
+end
+
+-- Fires on every machine, host included.
+function OnNameChanged(player_netid, old_name, new_name, is_self)
+    log("[xrRazom] OnNameChanged: '" .. tostring(old_name) .. "' -> '"
+        .. tostring(new_name) .. "' self=" .. tostring(is_self))
+    if db.actor then
+        local text = string.format(game.translate_string("st_xrr_renamed"),
+            tostring(old_name), tostring(new_name))
+        news_manager.send_tip(db.actor, text, nil, "nano", 8000)
+    end
+end
+
+-- Requester only; C++ has already rolled xrr_player_name back to the name still in use.
+local REJECT_REASON_STR = {
+    [0] = "st_xrr_name_taken_active",   -- XRR_NAME_TAKEN_ACTIVE
+    [1] = "st_xrr_name_taken_host",     -- XRR_NAME_TAKEN_HOST
+    [2] = "st_xrr_name_taken_offline",  -- XRR_NAME_TAKEN_OFFLINE
+    [3] = "st_xrr_name_invalid",        -- XRR_NAME_INVALID
+}
+function OnNameRejected(reason, attempted)
+    log("[xrRazom] OnNameRejected: '" .. tostring(attempted) .. "' reason=" .. tostring(reason))
+    if db.actor then
+        local sid = REJECT_REASON_STR[reason] or "st_xrr_name_invalid"
+        local text = string.format(game.translate_string(sid), tostring(attempted))
+        news_manager.send_tip(db.actor, text, nil, "nano", 8000)
+    end
+end
+
+-- Must be stashed BEFORE give_task: CGeneralTask.__init runs the text functors synchronously.
+local function stash_synced_task_text(task_id, title, descr)
+    if title == "" then title = nil end
+    if descr == "" then descr = nil end
+    _G.xrr_synced_task_text = _G.xrr_synced_task_text or {}
+    if title or descr then
+        _G.xrr_synced_task_text[task_id] = { title = title, descr = descr }
+    else
+        _G.xrr_synced_task_text[task_id] = nil
+    end
+end
+
+function OnPlayerTask(player_netid, task_id, task_giver, task_mid, task_state, task_stage,
+                     shadow_section, shadow_x, shadow_y, shadow_z, shadow_lvid, shadow_gvid,
+                     task_title, task_descr)
+    local tm = task_manager.get_task_manager()
+    if not tm then return end
+
+    -- A same-stage update (target move) still trips check_task's news pop: mute it.
+    -- A stage advance pops explicitly below.
+    local stage_advanced = false
+    do
+        local tsk0 = tm.task_info[task_id]
+        if task_state == 0 and (not tsk0 or tsk0.stage == task_stage) then
+            arm_task_restore_silence(task_id)
+        else
+            clear_task_restore_silence(task_id)
+            stage_advanced = task_state == 0 and tsk0 ~= nil and tsk0.stage ~= task_stage
+        end
+    end
+
+    -- pcall: a failed anchor must not abort the give below; the resolver retries every tick.
+    local anchor_ok, anchor_id = pcall(xrr_resolve_task_anchor, task_mid,
+        shadow_section, shadow_x, shadow_y, shadow_z, shadow_lvid, shadow_gvid)
+    if not anchor_ok then
+        log("[xrRazom][shadow] anchor pre-create failed task=" .. tostring(task_id)
+            .. " err=" .. tostring(anchor_id))
+        anchor_id = nil
+    end
+
+    _G.xrr_synced_task_targets = _G.xrr_synced_task_targets or {}
+    if task_mid and task_mid > 0 then
+        _G.xrr_synced_task_targets[task_id] = {
+            host_id        = task_mid,
+            shadow_section = shadow_section,
+            shadow_x       = shadow_x, shadow_y = shadow_y, shadow_z = shadow_z,
+            shadow_lvid    = shadow_lvid, shadow_gvid = shadow_gvid,
+        }
+    else
+        _G.xrr_synced_task_targets[task_id] = nil
+    end
+
+    stash_synced_task_text(task_id, task_title, task_descr)
+
+    printf("[xrRazom][quest] OnPlayerTask task=%s giver=%s task_mid=%s anchor=%s state=%s stage=%s",
+        task_id, tostring(task_giver), tostring(task_mid),
+        tostring(anchor_id), tostring(task_state), tostring(task_stage))
+
+    if not tm.task_info[task_id] then
+        apply_remote_task(tm, task_id, task_giver, false)
+    end
+
+    -- Wire task_state 0 means in progress, not task.fail (also 0); terminal states come via FORCED_TASK.
+    local tsk = tm.task_info[task_id]
+    if tsk then
+        tsk.stage         = task_stage
+        tsk.task_giver_id = task_giver
+        -- Re-arm the mute so check_task's functor diff doesn't pop this same news twice.
+        if stage_advanced and tsk.t then
+            news_manager.send_task(db.actor, "updated", tsk.t)
+            arm_task_restore_silence(task_id)
+        end
+    end
+    xrr_patch_quest_drx.xrr_drx_task_received(task_id)
+end
+
+function OnTaskSyncWith(netid, task_id, giver_id, stage)
+    local tm = task_manager.get_task_manager()
+    if not tm then return end
+    local tsk = tm.task_info[task_id]
+    if tsk then
+        tsk.stage         = stage
+        tsk.task_giver_id = giver_id
+    else
+        apply_remote_task(tm, task_id, giver_id, true)
+    end
+    xrr_patch_quest_drx.xrr_drx_task_received(task_id)
+end
+
+-- task_state: 1 = fail, 2 = complete, 3 = cancelled (fail + cancelled_by_actor).
+function OnForcedTaskState(player_netid, task_id, task_state)
+    local status_str = task_state == 2 and "complete"
+        or (task_state == 1 or task_state == 3) and "fail" or task_state
+    printf("[xrRazom] OnForcedTaskState player=%s task=%s state=%s cancelled=%s host=%s",
+        player_netid, task_id, tostring(status_str), tostring(task_state == 3),
+        tostring(XrrIsHost()))
+    local tm  = task_manager.get_task_manager()
+    local tsk = tm and tm.task_info[task_id]
+    if not tsk then return end
+    tsk.forced_status = status_str
+    tsk.cancelled_by_actor = (task_state == 3) or nil
+    if XrrIsHost() then
+        -- The host's task_callback re-broadcasts once forced_status is consumed, so receivers
+        -- get this twice: keep every side effect here idempotent.
+        XrrAlife():SendForcedTaskState(task_id, task_state)
+        return
+    end
+    if status_str == "complete" then
+        -- The host removes the task's items; a local on_complete would race it. This also
+        -- skips vanilla's save_var(id, nil) pstor reset, which sits in the same guard.
+        tsk.on_complete = nil
+        xrr_patch_quest_drx.xrr_drx_on_task_complete(task_id)
+    end
+end
+
+function OnPlayerInteracted(player_netid, typea, obj_id, state)
+    local obj = level.object_by_id(obj_id)
+    if not obj then return end
+    if typea == 0 then
+        local cf = obj.get_campfire and obj:get_campfire()
+        if cf then
+            if state and not cf:is_on() then
+                cf:turn_on()
+            elseif not state and cf:is_on() then
+                cf:turn_off()
+            end
+        end
+    elseif typea == 2 then
+        OnPlayerSwitchButton(player_netid, obj_id, state)
+    end
+end
+
+-- Not a raw open_door/close_door: that leaves active_section stale and can weld the door.
+function OnLogicSection(obj_id, section)
+    if xrr_apply_logic_section then
+        xrr_apply_logic_section(obj_id, section)
+    end
+end
+
+function OnPlayerSwitchButton(player_netid, button_id, state)
+    local to     = db.storage[button_id]
+    local button = to and to.ph_button and to.ph_button.button_action
+    if not button or not button.use_callback then
+        log("[xrRazom] OnPlayerSwitchButton: button " .. tostring(button_id) .. " not found")
+        return
+    end
+    button:try_switch()
+end
+
+function OnPlaySound(sound_name, position, np_id)
+    if not getFS():exist("$game_sounds$", sound_name .. ".ogg") then
+        return
+    end
+    local snd = sound_object(sound_name)
+    if not snd then
+        return
+    end
+    -- Anchor only to a mirror: an owned sound raises a local AI-hearing event.
+    local anchor = nil
+    if XrrMirrors():IsMirrorOrCorpse(np_id) then
+        anchor = level.object_by_id(np_id)
+    end
+    local pos = vector():set(position.x, position.y, position.z)
+    snd:play_no_feedback(anchor, 0, 0, pos, 1.0, 1.0)
+end
+
+-- No new_game_faction here: it would re-run vanilla character setup, which is host-synced.
+function xrr_change_level(x, y, z, lvid, gvid, yaw)
+    -- Everyone's already reloading — suppress the TRANSITION_PENDING notice.
+    _G.XrrSuppressTransitionNotice = true
+    ChangeLevel(vector():set(x, y, z), lvid, gvid, vector():set(0, yaw, 0))
+    -- Reached only if ChangeLevel returned: the join gates stay armed on true alone.
+    return true
+end
+
+local function resolve_live_target(host_id, expect_section)
+    if not host_id or host_id <= 0 then return nil end
+
+    if XrrMirrors():IsMirrorOrCorpse(host_id) and alife_object(host_id) then
+        return host_id
+    end
+
+    local item_local = XrrAlife():GetLocalItemIDByHostID(host_id)
+    if item_local and item_local ~= 65535 and alife_object(item_local) then
+        return item_local
+    end
+
+    -- The direct slot needs a section match: some peer ids are still allocated independently.
+    local se = alife_object(host_id)
+    if se then
+        if not expect_section or expect_section == ""
+           or se:section_name() == expect_section then
+            return host_id
+        end
+    end
+
+    return nil
+end
+
+local function release_superseded_shadow(host_id, live_id)
+    local dedup = _G.xrr_shadow_dedup
+    local sid = dedup and dedup[host_id]
+    if not sid or sid == live_id then return end
+    dedup[host_id] = nil
+    if alife_object(sid) then
+        release_shadow(sid)
+        log("[xrRazom][shadow] released superseded id=" .. tostring(sid)
+            .. " host_id=" .. tostring(host_id) .. " live=" .. tostring(live_id))
+    end
+end
+
+-- Shadows stand in for targets that never enter peer alife (off-bubble or spawn-gated).
+function xrr_resolve_task_anchor(host_target_id,
+                                 shadow_section, shadow_x, shadow_y, shadow_z,
+                                 shadow_lvid, shadow_gvid)
+    if not host_target_id or host_target_id <= 0 then return nil end
+
+    local live = resolve_live_target(host_target_id, shadow_section)
+    if live then
+        release_superseded_shadow(host_target_id, live)
+        return live
+    end
+
+    if shadow_section and shadow_section ~= "" then
+        return xrr_create_shadow_npc(host_target_id, shadow_section,
+                                     shadow_x, shadow_y, shadow_z,
+                                     shadow_lvid, shadow_gvid)
+    end
+
+    return nil
+end
+
+-- nil lets the caller fall back to tsk.current_target / task_giver_id.
+function xrr_resolve_synced_target(task_id)
+    local synced = _G.xrr_synced_task_targets and _G.xrr_synced_task_targets[task_id]
+    if not synced then return nil end
+
+    if type(synced) ~= "table" or not synced.host_id then return nil end
+
+    local live = resolve_live_target(synced.host_id, synced.shadow_section)
+    if live then
+        release_superseded_shadow(synced.host_id, live)
+        return live
+    end
+
+    -- Squad targets carry the commander's id, which resolves to nothing off-bubble:
+    -- the squad registry's live anchor beats a frozen shadow.
+    local sq = XrrAlife():SquadAnchor(synced.host_id)
+    if sq and sq ~= 65535 and alife_object(sq) then
+        release_superseded_shadow(synced.host_id, sq)
+        return sq
+    end
+
+    local sec = synced.shadow_section
+    if sec and sec ~= "" then
+        if synced.create_block_until and time_global() < synced.create_block_until then
+            return nil
+        end
+        local id = xrr_create_shadow_npc(synced.host_id, sec,
+                                         synced.shadow_x, synced.shadow_y, synced.shadow_z,
+                                         synced.shadow_lvid, synced.shadow_gvid)
+        if id then return id end
+        synced.create_block_until = time_global() + 10000
+    end
+
+    return nil
+end
+
+-- So the peer renders what the host rendered, instead of re-running the functor locally.
+function xrr_get_synced_task_text(task_id, field)
+    local t = _G.xrr_synced_task_text and _G.xrr_synced_task_text[task_id]
+    if not t then return nil end
+    if field == "title" then return t.title end
+    return t.descr
+end
+
+function xrr_create_shadow_npc(host_id, section, x, y, z, lvid, gvid)
+    if not section or section == "" then return nil end
+    if not host_id or host_id <= 0 then return nil end
+    if not alife() then return nil end
+    _G.xrr_shadow_dedup = _G.xrr_shadow_dedup or {}
+    local pos = vector():set(x or 0, y or 0, z or 0)
+    local existing = _G.xrr_shadow_dedup[host_id]
+    if existing then
+        local se = alife_object(existing)
+        if se and se:section_name() == section
+           and se.position:distance_to_sqr(pos) < 4 then
+            return existing
+        end
+        _G.xrr_shadow_dedup[host_id] = nil
+        if se then release_shadow(existing) end
+    end
+    local sim = alife()
+    local ok, se = pcall(sim.xrr_create_direct, sim, section, pos, lvid or 0, gvid or 0)
+    if not ok or not se then
+        log("[xrRazom][shadow] create failed section=" .. tostring(section)
+            .. " err=" .. tostring(se))
+        return nil
+    end
+    -- In C++: the can_switch_online Lua binding is missing on some server classes.
+    XrrAlife():PinShadow(se.id)
+    -- The shadow inherits the target section's story_id; story_objects.register would
+    -- then refuse the mirror's claim to it.
+    story_objects.unregister(se.id)
+    _G.xrr_shadow_dedup[host_id] = se.id
+    log("[xrRazom][shadow] created section=" .. tostring(section)
+        .. " id=" .. tostring(se.id) .. " host_id=" .. tostring(host_id)
+        .. " lvid=" .. tostring(lvid) .. " gvid=" .. tostring(gvid)
+        .. " pos=" .. tostring(x) .. "," .. tostring(y) .. "," .. tostring(z))
+    return se.id
+end
+
+-- The entered level's task bulk re-seeds its shadows. alife() is nil in a menu-time dispatch.
+function xrr_release_level_shadows(level_name)
+    local dedup = _G.xrr_shadow_dedup
+    local sim = alife()
+    if not (dedup and sim) then return end
+    local gg = game_graph()
+    for host_id, shadow_id in pairs(dedup) do
+        local se = alife_object(shadow_id)
+        if se then
+            local lvl = sim:level_name(gg:vertex(se.m_game_vertex_id):level_id())
+            if lvl == level_name then
+                release_shadow(shadow_id)
+                dedup[host_id] = nil
+                log("[xrRazom][shadow] released id=" .. tostring(shadow_id)
+                    .. " on level=" .. tostring(level_name))
+            end
+        else
+            dedup[host_id] = nil  -- stale entry
+        end
+    end
+end
+
+function OnJoinTask(task_id, giver_id, stage, target_id,
+                   shadow_section, shadow_x, shadow_y, shadow_z, shadow_lvid, shadow_gvid,
+                   task_title, task_descr)
+    local tm = task_manager.get_task_manager()
+    if not tm then return end
+
+    -- pcall: a failed anchor must not abort the meta store / give below.
+    local anchor_ok, anchor_id = pcall(xrr_resolve_task_anchor, target_id,
+        shadow_section, shadow_x, shadow_y, shadow_z, shadow_lvid, shadow_gvid)
+    if not anchor_ok then
+        log("[xrRazom][shadow] anchor pre-create failed task=" .. tostring(task_id)
+            .. " err=" .. tostring(anchor_id))
+        anchor_id = nil
+    end
+
+    _G.xrr_synced_task_targets = _G.xrr_synced_task_targets or {}
+    if target_id and target_id > 0 then
+        _G.xrr_synced_task_targets[task_id] = {
+            host_id        = target_id,
+            shadow_section = shadow_section,
+            shadow_x       = shadow_x, shadow_y = shadow_y, shadow_z = shadow_z,
+            shadow_lvid    = shadow_lvid, shadow_gvid = shadow_gvid,
+        }
+    else
+        _G.xrr_synced_task_targets[task_id] = nil
+    end
+
+    stash_synced_task_text(task_id, task_title, task_descr)
+
+    if _G.XrrDebugTasks then
+        log("[xrRazom][task] OnJoinTask task=" .. tostring(task_id)
+            .. " giver=" .. tostring(giver_id) .. " stage=" .. tostring(stage)
+            .. " host_target=" .. tostring(target_id)
+            .. " anchor=" .. tostring(anchor_id)
+            .. " section=" .. tostring(shadow_section))
+    end
+
+    if not tm.task_info[task_id] then
+        apply_remote_task(tm, task_id, giver_id, true)
+    else
+        -- Re-bulk over an existing task: fresh meta can move the anchor and trip check_task's pop.
+        arm_task_restore_silence(task_id)
+    end
+    xrr_patch_quest_drx.xrr_drx_task_received(task_id)
+
+    local tsk = tm.task_info[task_id]
+    if tsk then
+        tsk.stage         = stage
+        tsk.task_giver_id = giver_id
+    end
+
+    if _G.XrrDebugTasks then
+        local dbg = tm.task_info[task_id]
+        if dbg then
+            log("[xrRazom][task] OnJoinTask post-give task=" .. tostring(task_id)
+                .. " current_target=" .. tostring(dbg.current_target)
+                .. " spot=" .. tostring(dbg.spot))
+        end
+    end
+end
+
+function OnJoinPreComplete()
+    -- Deferred: Phase B delivers the mirrors that make shadows redundant after this point.
+    CreateTimeEvent("xrr", "xrr_shadow_sweep", 2, function()
+        xrr_release_redundant_shadows()
+        return true
+    end)
+end
+
+function xrr_release_redundant_shadows()
+    if not _G.xrr_shadow_dedup then return end
+    for host_id, shadow_id in pairs(_G.xrr_shadow_dedup) do
+        local se = alife_object(shadow_id)
+        if not se then
+            _G.xrr_shadow_dedup[host_id] = nil
+        elseif type(host_id) == "number" then
+            -- live ~= shadow_id: a peer-allocated shadow id can coincide with the host's.
+            local live = resolve_live_target(host_id, se:section_name())
+            if live and live ~= shadow_id then
+                release_shadow(shadow_id)
+                _G.xrr_shadow_dedup[host_id] = nil
+                log("[xrRazom][shadow] sweep released redundant id=" .. tostring(shadow_id)
+                    .. " host_id=" .. tostring(host_id) .. " live=" .. tostring(live))
+            end
+        end
+    end
+end
+
+-- Assault-task "Unknown enemy" squad spot (TASK_ENEMY_SPOT)
+
+local ENEMY_SPOT      = "red_location"
+local ENEMY_SPOT_HINT = "st_ui_pda_task_unknown_enemy"
+local ENEMY_SPOT_TTL  = 15000
+
+local _enemy_spots   = {}
+local _enemy_loop_on = false
+
+local function enemy_spot_remove(st)
+    if st.local_id and level.map_has_object_spot(st.local_id, ENEMY_SPOT) == 1 then
+        level.map_remove_object_spot(st.local_id, ENEMY_SPOT)
+    end
+    st.local_id = nil
+end
+
+local function enemy_spot_resolve(st)
+    local live = resolve_live_target(st.host_id, st.shadow_section)
+    if live then
+        release_superseded_shadow(st.host_id, live)
+        return live
+    end
+    local sq = XrrAlife():SquadAnchor(st.host_id)
+    if sq and sq ~= 65535 and alife_object(sq) then
+        release_superseded_shadow(st.host_id, sq)
+        return sq
+    end
+    local sec = st.shadow_section
+    if sec and sec ~= "" then
+        if st.create_block_until and time_global() < st.create_block_until then
+            return nil
+        end
+        local id = xrr_create_shadow_npc(st.host_id, sec,
+                                         st.shadow_x, st.shadow_y, st.shadow_z,
+                                         st.shadow_lvid, st.shadow_gvid)
+        if id then return id end
+        st.create_block_until = time_global() + 10000
+    end
+    return nil
+end
+
+local function ensure_enemy_spot_loop()
+    if _enemy_loop_on then return end
+    _enemy_loop_on = true
+    CreateTimeEvent("xrr", "xrr_enemy_spot_loop", 1, function()
+        if not XrrIsConnected() or not next(_enemy_spots) then
+            for tid, st in pairs(_enemy_spots) do
+                enemy_spot_remove(st)
+                _enemy_spots[tid] = nil
+            end
+            _enemy_loop_on = false
+            return true
+        end
+        local now = time_global()
+        local tm = task_manager.get_task_manager()
+        for task_id, st in pairs(_enemy_spots) do
+            if now - st.last_seen > ENEMY_SPOT_TTL
+               or not (tm and tm.task_info[task_id]) then
+                enemy_spot_remove(st)
+                _enemy_spots[task_id] = nil
+            else
+                local id = enemy_spot_resolve(st)
+                if id ~= st.local_id then
+                    enemy_spot_remove(st)
+                    if id then
+                        -- Two tasks on the same squad share one anchor — don't stack a spot.
+                        if level.map_has_object_spot(id, ENEMY_SPOT) == 0 then
+                            level.map_add_object_spot(id, ENEMY_SPOT, ENEMY_SPOT_HINT)
+                        end
+                        st.local_id = id
+                    end
+                end
+            end
+        end
+        ResetTimeEvent("xrr", "xrr_enemy_spot_loop", 1)
+        return false
+    end)
+end
+
+function OnTaskEnemySpot(task_id, show, anchor_id, sec, x, y, z, lvid, gvid)
+    if not show then
+        local st = _enemy_spots[task_id]
+        if st then
+            enemy_spot_remove(st)
+            _enemy_spots[task_id] = nil
+        end
+        return
+    end
+    local st = _enemy_spots[task_id]
+    if st and st.host_id == anchor_id then
+        st.last_seen = time_global()
+        -- Only past 50 m: every coord update churns the shadow through its recreate check.
+        local dx = (x or 0) - (st.shadow_x or 0)
+        local dy = (y or 0) - (st.shadow_y or 0)
+        local dz = (z or 0) - (st.shadow_z or 0)
+        if dx * dx + dy * dy + dz * dz > 2500 then
+            st.shadow_section = sec
+            st.shadow_x, st.shadow_y, st.shadow_z = x, y, z
+            st.shadow_lvid, st.shadow_gvid = lvid, gvid
+            st.create_block_until = nil
+        end
+    else
+        -- Keep local_id so the loop removes the old spot before placing the new one.
+        _enemy_spots[task_id] = {
+            host_id        = anchor_id,
+            shadow_section = sec,
+            shadow_x       = x, shadow_y = y, shadow_z = z,
+            shadow_lvid    = lvid, shadow_gvid = gvid,
+            last_seen      = time_global(),
+            local_id       = st and st.local_id or nil,
+        }
+    end
+    ensure_enemy_spot_loop()
+end
+
+-- No Lua caller: the engine calls this to resolve a stash anchor.
+function xrr_resolve_anchor_for_pda(host_id, section, x, y, z, lvid, gvid)
+    return xrr_resolve_task_anchor(host_id, section, x, y, z, lvid, gvid)
+end
+
+function OnJoinDifficulty(diff_game_tbl, diff_eco_tbl, trader_cond)
+    if not game_difficulties then return end
+    -- The plain setters are gated on the peer; the _from_host variants let these through.
+    local set_game = (xrr_patch_difficulty and xrr_patch_difficulty.set_game_factor_from_host)
+                     or game_difficulties.set_game_factor
+    local set_eco  = (xrr_patch_difficulty and xrr_patch_difficulty.set_eco_factor_from_host)
+                     or game_difficulties.set_eco_factor
+    if type(diff_game_tbl) == "table" then
+        for k, v in pairs(diff_game_tbl) do
+            set_game(k, v)
+        end
+    end
+    if type(diff_eco_tbl) == "table" then
+        for k, v in pairs(diff_eco_tbl) do
+            set_eco(k, v)
+        end
+    end
+    if type(trader_cond) == "number" then
+        alife_storage_manager.get_state().trader_buy_condition_override = trader_cond
+    end
+end
+
+-- Values are already substituted in C++; this only tells caching mods to re-read.
+-- Option functors are UI-Apply machinery and deliberately not run.
+function OnMcmAuthorityDelta(keys_csv)
+    if type(keys_csv) ~= "string" or keys_csv == "" then return end
+
+    local changed, n = {}, 0
+    for _, id in ipairs(str_explode(keys_csv, ",")) do
+        if id ~= "" then
+            changed[id] = true
+            n = n + 1
+        end
+    end
+    if n == 0 then return end
+
+    -- mcm_option_change only exists once MCM has registered it.
+    if ui_mcm then SendScriptCallback("mcm_option_change", changed) end
+    if level.present() then SendScriptCallback("on_option_change", true) end
+    log("[xrRazom] mcm overlay: " .. n .. " keys changed — re-read callbacks fired")
+end
+
+function OnJoinInteractable(obj_id, typea, state)
+    if typea == 0 then
+        local obj = level.object_by_id(obj_id)
+        if not obj then return end
+        local cf = obj.get_campfire and obj:get_campfire()
+        if cf then
+            if state and not cf:is_on() then cf:turn_on()
+            elseif not state and cf:is_on() then cf:turn_off() end
+        end
+    elseif typea == 1 then
+        if xrr_apply_logic_section then
+            xrr_apply_logic_section(obj_id, state)
+        end
+    end
+end
+
+-- Mirror NPCs never run xr_logic, so trade_manager would default them to trade_generic.ltx.
+-- XrrTraderProfiles keeps the peer trade_init wrap from clobbering the host's cfg.
+_G.XrrTraderProfiles = {}
+xrr_register_cleanup(function() _G.XrrTraderProfiles = {} end)  -- local ids are per-session
+function xrr_apply_trader_profile(npc_id, cfg)
+    if not cfg or cfg == "" then return end
+    local npc = level.object_by_id(npc_id)
+    if not npc then return end
+    XrrTraderProfiles[npc_id] = cfg
+    trade_manager.trade_init(npc, cfg)
+    -- Profile-only on the peer: buy/sell conditions for the trade UI, no restock.
+    trade_manager.update(npc, false)
+    printf("[xrRazom][Client] trader profile applied: id=%s cfg=%s", npc_id, cfg)
+end
+
+local function get_active_partner_ui(partner_id)
+    local gui = ui_inventory and ui_inventory.GUI
+    if not gui or not gui.IsShown or not gui:IsShown() then return nil end
+    -- Trade too: a restock respawns items under the window, leaving cells on freed PIItems.
+    if gui.mode ~= "loot" and gui.mode ~= "trade" then return nil end
+    local partner = gui.GetPartner and gui:GetPartner()
+    if not partner or partner:id() ~= partner_id then return nil end
+    return gui
+end
+
+-- No Lua caller: the engine calls this a few frames after a container change.
+function on_container_ui_refresh(partner_id)
+    local gui = get_active_partner_ui(partner_id)
+    if not gui then return end
+    if gui.mode == "trade" then
+        gui:TMode_RefreshInventories()
+    else
+        gui:LMode_RefreshInventories()
+    end
+end
+
+-- The world half of vanilla's corpse use_callback; both calls are idempotent and go
+-- through the module field so mod wrappers still fire.
+function xrr_ensure_corpse_loot(npc_id)
+    local npc = level.object_by_id(npc_id)
+    if not npc then return end
+    if death_manager and death_manager.create_release_item then
+        death_manager.create_release_item(npc)
+    end
+    if item_money and item_money.actor_on_loot_money then
+        item_money.actor_on_loot_money(npc)
+    end
+end
+
+function OnMutantLootState(local_id, verdict, tbl)
+    if xrr_patch_client and xrr_patch_client.on_mutant_loot_state then
+        xrr_patch_client.on_mutant_loot_state(local_id, verdict, tbl)
+    end
+end
+
+-- Both stores: the use-callback gates on the se var, FillList on the pstor one, and so
+-- does FDDA's anim-end start, which bypasses the use-callback.
+function OnMutantLootedEdge(local_id, looted)
+    local obj = level.object_by_id(local_id)
+    if not obj then return end
+    se_save_var(local_id, obj:name(), "looted", looted and true or false)
+    save_var(obj, "looted", looted and true or nil)
+end
+
+_G.OnMutantLootState  = OnMutantLootState
+_G.OnMutantLootedEdge = OnMutantLootedEdge
+
+local function OnSessionEnd()
+    log("[xrRazom] OnSessionEnd — local cleanup")
+    xrr_session_cleanup()
+end
+
+-- Without this the peer faction screen stays up on a dead connection.
+local function close_faction_screen(msg)
+    local mm = xrr_menu and xrr_menu.INSTANCE
+    local dlg = mm and mm.peer_faction_dlg
+    if not (dlg and dlg:IsShown()) then return false end
+    local gm = XrrNet and XrrNet()
+    if gm and msg and msg ~= "" then gm:SetPendingError(msg) end
+    dlg:CloseToMenu()
+    return true
+end
+
+local function OnSessionReset(reason)
+    reason = reason or 0
+    local msg = game.translate_string("ui_xrr_host_ended_session")
+    if reason == 1 then
+        msg = game.translate_string("ui_xrr_no_save_data")
+    end
+    log("[xrRazom] OnSessionReset — reason=" .. tostring(reason) .. " msg=" .. msg)
+
+    local mm = xrr_menu and xrr_menu.INSTANCE
+    if mm and mm.xrr_connecting then
+        mm:OnXrrConnectFailed(msg)
+        return
+    end
+
+    if close_faction_screen(msg) then
+        log("[xrRazom] OnSessionReset — closed faction screen, error queued for menu")
+        return
+    end
+
+    if not level.present() then
+        log("[xrRazom] OnSessionReset — already on main menu, nothing to disconnect")
+        return
+    end
+
+    xrr_session_cleanup()
+    local gm = XrrNet and XrrNet()
+    if gm then gm:SetPendingError(msg) end
+    if db.actor then
+        news_manager.send_tip(db.actor, msg, nil, "nano", 10000)
+    end
+    CreateTimeEvent(0, "xrr_session_reset_kick", 0, function()
+        exec_console_cmd("disconnect")
+        return true
+    end)
+end
+
+-- The co-op rejoin boot completed into fake_start with the session already gone.
+local function OnCoopBootLost()
+    local msg = game.translate_string("ui_xrr_session_lost_during_load")
+    log("[xrRazom] OnCoopBootLost — stranded in fake_start, returning to main menu")
+
+    xrr_session_cleanup()
+    local gm = XrrNet and XrrNet()
+    if gm then gm:SetPendingError(msg) end
+    if db.actor then
+        news_manager.send_tip(db.actor, msg, nil, "nano", 10000)
+    end
+    CreateTimeEvent(0, "xrr_coop_boot_lost_kick", 0, function()
+        exec_console_cmd("disconnect")
+        return true
+    end)
+end
+
+local function OnSessionLost(reason)
+    log("[xrRazom] OnSessionLost — connection to host dropped"
+        .. (reason and reason ~= "" and (": " .. reason) or ""))
+
+    local lost_msg = (reason and reason ~= "") and game.translate_string(reason)
+        or game.translate_string("ui_xrr_connection_failed")
+    if close_faction_screen(lost_msg) then
+        log("[xrRazom] OnSessionLost — closed faction screen, error queued for menu")
+        return
+    end
+
+    local mm = xrr_menu and xrr_menu.INSTANCE
+
+    -- Not gated on xrr_connecting: a join can land here before the connecting dialog is up.
+    if mm and not level.present() then
+        if mm.xrr_connecting then
+            mm:OnXrrConnectFailed(reason)
+        else
+            local text = (reason and reason ~= "")
+                and game.translate_string(reason)
+                or game.translate_string("ui_xrr_connection_failed")
+            mm.xrr_msg_box:InitMessageBox("message_box_ok")
+            mm.xrr_msg_box:SetText(text)
+            mm.xrr_msg_box:ShowDialog(true)
+            mm.mbox_mode = 0
+        end
+        return
+    end
+
+    if not level.present() then
+        log("[xrRazom] OnSessionLost — already on main menu, nothing to disconnect")
+        return
+    end
+
+    CreateTimeEvent(0, "xrr_session_lost_kick", 0, function()
+        exec_console_cmd("disconnect")
+        return true
+    end)
+end
+
+_G.OnConnected              = OnConnected
+_G.OnHostAutoStarted        = OnHostAutoStarted
+_G.xrr_change_level         = xrr_change_level
+_G.xrr_release_level_shadows = xrr_release_level_shadows
+-- OnClientReady is host-only; this no-op keeps the engine from erroring before the real one loads.
+_G.OnClientReady            = function() end
+_G.OnPlayerChangedLevel     = OnPlayerChangedLevel
+_G.OnPeerGiftReceived       = OnPeerGiftReceived
+_G.OnMoneyReceived          = OnMoneyReceived
+_G.OnMoneyRefunded          = OnMoneyRefunded
+_G.OnNameChanged            = OnNameChanged
+_G.OnNameRejected           = OnNameRejected
+_G.OnPlayerTask             = OnPlayerTask
+_G.OnTaskSyncWith           = OnTaskSyncWith
+_G.OnForcedTaskState        = OnForcedTaskState
+_G.OnPlayerInteracted       = OnPlayerInteracted
+_G.OnLogicSection           = OnLogicSection
+_G.OnPlayerSwitchButton     = OnPlayerSwitchButton
+_G.OnPlaySound              = OnPlaySound
+_G.OnJoinTask               = OnJoinTask
+_G.OnTaskEnemySpot          = OnTaskEnemySpot
+_G.OnJoinPreComplete        = OnJoinPreComplete
+_G.XrrTaskRestoreSilenceTick = XrrTaskRestoreSilenceTick
+_G.xrr_resolve_anchor_for_pda = xrr_resolve_anchor_for_pda
+_G.OnJoinDifficulty         = OnJoinDifficulty
+_G.OnMcmAuthorityDelta      = OnMcmAuthorityDelta
+_G.OnJoinInteractable       = OnJoinInteractable
+_G.OnSessionEnd              = OnSessionEnd
+_G.OnSessionReset            = OnSessionReset
+_G.OnSessionLost             = OnSessionLost
+_G.OnCoopBootLost            = OnCoopBootLost
+_G.on_container_ui_refresh   = on_container_ui_refresh
+_G.xrr_ensure_corpse_loot    = xrr_ensure_corpse_loot
+_G.xrr_apply_trader_profile  = xrr_apply_trader_profile
+_G.xrr_give_actor_item       = function(section)
+    if db.actor and section and section ~= "" then
+        alife_create_item(section, db.actor)
+    end
+end
+
+_G.xrr_treasure_boxes = {}
+_G.xrr_on_treasure_box_received = function(box_id)
+    _G.xrr_treasure_boxes[box_id] = true
+end
+
+_G.xrr_on_npc_lock_denied = function()
+    if db.actor then
+        news_manager.send_tip(db.actor, "NPC is busy talking to another player", nil, "nano", 4000)
+    end
+end
+
+xrr_script_event.register("xrr:save_refused", function(args, sender)
+    if db.actor and sender == "host" then
+        actor_menu.set_msg(1, game.translate_string("st_xrr_save_refused_by_host"), 4)
+    end
+end)
+
+-- Composed here so it resolves in this peer's locale.
+-- kind 2 = transition wait, arg = the nick still loading.
+_G.OnPeerScreenMsg = function(kind, arg)
+    if not (db.actor and actor_menu and actor_menu.set_msg) then return end
+    if kind == 2 then
+        actor_menu.set_msg(1, string.format(game.translate_string("st_xrr_transition_waiting"),
+                                            tostring(arg)), 4)
+    end
+end
+
+-- The hint arrives in the host's locale: rebuild its durable part here. Count/timer lines
+-- are add-time snapshots and are dropped.
+_G.OnWarfareSpotApplied = function(id, spot_type)
+    local ok, hint = pcall(function()
+        local se = alife_object(id)
+        if not se then return nil end
+
+        local faction = string.sub(spot_type, 8)  -- strip "circle_"
+        local stw  = smart_terrain_warfare
+        local name = stw and stw.translate_smart_name(se:name())
+        if not name or name == "" then name = se:name() end
+
+        if not se.props and simulation_objects and simulation_objects.get_props then
+            simulation_objects.get_props(se)
+        end
+
+        local clr_o  = utils_xml.get_color("d_orange")
+        local clr_gr = utils_xml.get_color("ui_gray_1")
+        local clr_w  = utils_xml.get_color("white")
+
+        local t = clr_o .. name .. " \\n"
+        t = t .. clr_o .. "................................\\n " .. clr_gr
+        if faction ~= "empty" and faction ~= "target" then
+            t = t .. " \n" .. clr_gr .. game.translate_string("st_wrfr_prop_faction")
+                  .. ": " .. clr_w .. game.translate_string(faction) .. "\\n"
+        end
+        local p = se.props
+        if p then
+            if (p.base or 0) > 0 then
+                t = t .. " \\n" .. clr_gr .. game.translate_string("st_wrfr_prop_base") .. " \\n"
+            end
+            if (p.resource or 0) > 0 then
+                t = t .. " \\n" .. clr_gr .. game.translate_string("st_wrfr_prop_resource") .. " \\n"
+            end
+            if (p.territory or 0) > 0 then
+                t = t .. " \\n" .. clr_gr .. game.translate_string("st_wrfr_prop_territory") .. " \\n"
+            end
+            if (p.lair or 0) > 0 then
+                t = t .. " \\n" .. clr_gr .. game.translate_string("st_wrfr_prop_lair") .. " \\n"
+            end
+        end
+        return t
+    end)
+    if ok and hint then
+        level.map_change_spot_hint(id, spot_type, hint)
+    end
+end
+
+function OnStatIncrement(key, count, rank_delta, rep_delta)
+    if not game_statistics then return end
+    for i = 1, count do
+        game_statistics.increment_statistic(key,
+            rank_delta ~= 0 and rank_delta or nil,
+            rep_delta  ~= 0 and rep_delta  or nil)
+    end
+end
+
+-- Peers have no save file, so the host persists this blob in PeerDb. Sorted keys keep it
+-- deterministic for the C++ change-gate: "<key>:<count>;...|<level>,<level>,..."
+function xrr_collect_stats_blob()
+    if not game_statistics then return "" end
+    local keys = {}
+    for k in pairs(game_statistics.actor_statistics) do keys[#keys + 1] = k end
+    table.sort(keys)
+    local parts = {}
+    for _, k in ipairs(keys) do
+        local s = game_statistics.actor_statistics[k]
+        parts[#parts + 1] = k .. ":" .. tostring((s and s.count) or 0)
+    end
+    local counts = table.concat(parts, ";")
+
+    local lv = {}
+    for k, v in pairs(game_statistics.actor_visited_levels) do
+        if v == true then lv[#lv + 1] = k end
+    end
+    table.sort(lv)
+    return counts .. "|" .. table.concat(lv, ",")
+end
+
+-- SET counts, never increment_statistic: restoring N kills must not re-award N× rank/rep.
+function OnPeerStatsRestore(blob)
+    if not game_statistics then return end
+    if not blob or blob == "" then return end
+    local counts_str, lv_str = blob:match("^(.-)|(.*)$")
+    if counts_str then
+        for k, c in counts_str:gmatch("([%w_]+):(%-?%d+)") do
+            local s = game_statistics.actor_statistics[k]
+            if s then s.count = tonumber(c) or 0 end
+        end
+    end
+    if lv_str then
+        for name in lv_str:gmatch("([%w_]+)") do
+            if game_statistics.actor_visited_levels[name] ~= nil then
+                game_statistics.actor_visited_levels[name] = true
+            end
+        end
+    end
+end
+
+-- C++ already set rank/rep; re-baseline so the first increment pops no spurious news.
+-- create_relations_tables covers a restore landing before on_game_start.
+function OnPeerProgressRestore()
+    if not (game_statistics and db.actor) then return end
+    game_statistics.create_relations_tables()
+    game_statistics.check_for_rank_change(true)
+    game_statistics.check_for_reputation_change(true)
+end
+
+-- C++ gates and sends. IsConnected() is the peer-only predicate.
+local _xrr_stats_next_push = 0
+function xrr_stats_report_update()
+    local mgr = XrrNet and XrrNet()
+    if not (mgr and mgr:IsConnected()) then return end
+    local now = time_global()
+    if now < _xrr_stats_next_push then return end
+    _xrr_stats_next_push = now + 1000
+    XrrPlayers():SetLocalStatsBlob(xrr_collect_stats_blob())
+end
+
+-- Registered after game_statistics' on_level_changing (alphabetical load order), so the
+-- push includes this transition's level_changes.
+function xrr_stats_report_flush()
+    local mgr = XrrNet and XrrNet()
+    if not (mgr and mgr:IsConnected()) then return end
+    _xrr_stats_next_push = time_global() + 1000
+    XrrPlayers():SetLocalStatsBlob(xrr_collect_stats_blob())
+end
+
+-- Same round-trip as the stats blob: a fresh join actor starts at default condition.
+-- Deterministic so the C++ change-gate can compare successive blobs.
+function xrr_collect_condition_blob()
+    -- GetSatiety(), not db.actor.satiety: the property reads 1.0/nil here.
+    local sat = 1.0
+    local cond = nil
+    if db.actor then
+        local act = db.actor:cast_Actor()
+        cond = act and act:conditions()
+        if cond then sat = cond:GetSatiety() end
+    end
+
+    local drink, sleep = 0, 0
+    if actor_status_thirst and actor_status_thirst.save_state then
+        local t = {}
+        actor_status_thirst.save_state(t)
+        if t.drink then drink = t.drink.last_drink or 0 end
+    end
+    if actor_status_sleep and actor_status_sleep.save_state then
+        local t = {}
+        actor_status_sleep.save_state(t)
+        if t.sleep then sleep = t.sleep.last_sleep or 0 end
+    end
+
+    local base = string.format("sat:%.3f;drink:%d;sleep:%d",
+        sat, math.floor(drink + 0.5), math.floor(sleep + 0.5))
+
+    local boosts = {}
+    if cond then
+        cond:BoosterForEach(function(btype, btime, bvalue)
+            if btime and btime > 0 then
+                boosts[#boosts + 1] = string.format("%d,%.2f,%.4f", btype, btime, bvalue)
+            end
+        end)
+    end
+    if #boosts > 0 then
+        base = base .. ";boost:" .. table.concat(boosts, "|")
+    end
+
+    -- Radiation has no CSE→spawn path, so it rides here. Health must not: it reaches the CSE
+    -- via PLAYER_STATE, and a full-HP join actor's value would overwrite it.
+    if db.actor then
+        base = base .. string.format(";rad:%.3f", clamp(db.actor.radiation, 0, 1))
+    end
+
+    -- Bleeding speed depends on TotalSize() alone, so the aggregate restores faithfully.
+    local wounds = {}
+    if cond then
+        cond:WoundForEach(function(w)
+            local sz = w:TotalSize()
+            if sz and sz > 0.001 then
+                wounds[#wounds + 1] = string.format("%d,%.3f", w:GetBoneNum(), sz)
+            end
+        end)
+    end
+    if #wounds > 0 then
+        base = base .. ";wnd:" .. table.concat(wounds, "|")
+    end
+
+    return base
+end
+
+-- Checkpoints stay nil so the next actor_on_update re-baselines them; a stale timestamp
+-- would force a catch-up.
+function OnPeerConditionRestore(blob)
+    if not blob or blob == "" then return end
+    local sat   = tonumber(blob:match("sat:([%-%d%.]+)"))
+    local drink = tonumber(blob:match("drink:(%-?%d+)"))
+    local sleep = tonumber(blob:match("sleep:(%-?%d+)"))
+
+    if drink and actor_status_thirst and actor_status_thirst.load_state then
+        actor_status_thirst.load_state({ drink = { last_drink = drink } })
+    end
+    if sleep and actor_status_sleep and actor_status_sleep.load_state then
+        actor_status_sleep.load_state({ sleep = { last_sleep = sleep } })
+    end
+
+    -- CActorCondition::reinit() resets satiety and can land just after this: re-apply later.
+    if db.actor and sat then
+        local target = clamp(sat, 0, 1)
+        db.actor.satiety = target
+        local function reapply()
+            if db.actor then db.actor.satiety = target end
+            return true
+        end
+        CreateTimeEvent("xrr_cond_satiety", "reapply_1", 1, reapply)
+        CreateTimeEvent("xrr_cond_satiety", "reapply_3", 3, reapply)
+    end
+
+    -- reinit() leaves boosters alone: one apply suffices. Empty sect = no use-sound.
+    local bstr = blob:match("boost:([^;]*)")
+    if bstr and bstr ~= "" and db.actor then
+        local cond = db.actor:cast_Actor()
+        cond = cond and cond:conditions()
+        if cond then
+            for entry in bstr:gmatch("[^|]+") do
+                local t, tm, v = entry:match("(%-?%d+),([%-%d%.]+),([%-%d%.]+)")
+                t, tm, v = tonumber(t), tonumber(tm), tonumber(v)
+                if t and tm and v and tm > 0 and v > 0 then
+                    local B = SBooster()
+                    B.m_type      = t
+                    B.fBoostTime  = tm
+                    B.fBoostValue = v
+                    cond:ApplyBooster(B, "")
+                end
+            end
+        end
+    end
+
+    -- Same reinit() race as satiety; ClearWounds + exact sizes keep the re-apply idempotent.
+    local rad = tonumber(blob:match("rad:([%d%.]+)"))
+    local wnd = blob:match("wnd:([^;]*)")
+    if rad or wnd then
+        local function apply_vitals()
+            if not db.actor then return true end
+            if rad then db.actor.radiation = clamp(rad, 0, 1) end
+            if wnd and wnd ~= "" then
+                local act  = db.actor:cast_Actor()
+                local cnd  = act and act:conditions()
+                if cnd then
+                    cnd:ClearWounds()
+                    for entry in wnd:gmatch("[^|]+") do
+                        local bone, sz = entry:match("(%d+),([%d%.]+)")
+                        bone, sz = tonumber(bone), tonumber(sz)
+                        if bone and sz and sz > 0 then
+                            -- AddWound randomizes its initial size: open at 0, then AddHit.
+                            if bone >= 64 then bone = 0 end -- engine bone cap
+                            local w = cnd:AddWound(0, hit.wound, bone)
+                            if w then w:AddHit(sz, hit.wound) end
+                        end
+                    end
+                end
+            end
+            return true
+        end
+        apply_vitals()
+        CreateTimeEvent("xrr_cond_vitals", "reapply_1", 1, apply_vitals)
+        CreateTimeEvent("xrr_cond_vitals", "reapply_3", 3, apply_vitals)
+    end
+end
+
+local _xrr_cond_next_push = 0
+function xrr_condition_report_update()
+    local mgr = XrrNet and XrrNet()
+    if not (mgr and mgr:IsConnected()) then return end
+    local now = time_global()
+    if now < _xrr_cond_next_push then return end
+    _xrr_cond_next_push = now + 5000
+    XrrPlayers():SetLocalConditionBlob(xrr_collect_condition_blob())
+end
+
+-- Force a push before a level transition tears the Lua VM down.
+function xrr_condition_report_flush()
+    local mgr = XrrNet and XrrNet()
+    if not (mgr and mgr:IsConnected()) then return end
+    _xrr_cond_next_push = time_global() + 5000
+    XrrPlayers():SetLocalConditionBlob(xrr_collect_condition_blob())
+end
+
+function OnRankingResponse(blob)
+    if xrr_patch_pda and xrr_patch_pda.on_ranking_response then
+        xrr_patch_pda.on_ranking_response(blob)
+    end
+end
+
+function OnPdaInfo(blob)
+    if xrr_patch_pda and xrr_patch_pda.on_pda_info then
+        xrr_patch_pda.on_pda_info(blob)
+    end
+end
+
+function OnRfBind(blob)
+    if xrr_patch_radio and xrr_patch_radio.on_rf_bind then
+        xrr_patch_radio.on_rf_bind(blob)
+    end
+end
+
+function OnRadioChannelState(channel, kind, name)
+    if xrr_patch_radio_fm and xrr_patch_radio_fm.on_channel_state then
+        xrr_patch_radio_fm.on_channel_state(channel, kind, name)
+    end
+end
+
+_G.OnStatIncrement      = OnStatIncrement
+_G.OnRankingResponse    = OnRankingResponse
+_G.OnPdaInfo            = OnPdaInfo
+_G.OnRfBind             = OnRfBind
+_G.OnRadioChannelState  = OnRadioChannelState
+
+_G.OnPeerStatsRestore      = OnPeerStatsRestore
+_G.OnPeerProgressRestore   = OnPeerProgressRestore
+_G.xrr_stats_report_update = xrr_stats_report_update
+_G.xrr_stats_report_flush  = xrr_stats_report_flush
+
+_G.OnPeerConditionRestore      = OnPeerConditionRestore
+_G.xrr_condition_report_update = xrr_condition_report_update
+_G.xrr_condition_report_flush  = xrr_condition_report_flush

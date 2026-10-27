@@ -1,0 +1,71 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  axr_companions is host-authoritative: a peer forwards recruit/dismiss to the
+  host, and every companion joins the host's squad.
+]]
+
+local NOP = function() end
+
+function apply()
+    _G.xrr_story_quest_handlers = _G.xrr_story_quest_handlers or {}
+
+    if not dialogs_axr_companion then
+        printe("[xrr_patch_companions] dialogs_axr_companion missing — companions not patched")
+        return
+    end
+
+    -- Captured before the peer branch below reassigns these fields.
+    local _orig_become = dialogs_axr_companion.become_actor_companion
+    local _orig_remove = dialogs_axr_companion.remove_companions_from_squad
+
+    _G.xrr_story_quest_handlers["__companion_add"] = function(npc_host_id)
+        local npc = npc_host_id and level.object_by_id(npc_host_id)
+        if not npc then
+            printf("[xrRazom][companion] __companion_add HOST: npc %s not online", tostring(npc_host_id))
+            return
+        end
+        printf("[xrRazom][companion] __companion_add HOST -> become_actor_companion npc=%s", tostring(npc_host_id))
+        _orig_become(db.actor, npc)
+    end
+    _G.xrr_story_quest_handlers["__companion_remove"] = function(npc_host_id)
+        local npc = npc_host_id and level.object_by_id(npc_host_id)
+        if not npc then
+            printf("[xrRazom][companion] __companion_remove HOST: npc %s not online", tostring(npc_host_id))
+            return
+        end
+        printf("[xrRazom][companion] __companion_remove HOST -> remove_companions_from_squad npc=%s", tostring(npc_host_id))
+        _orig_remove(db.actor, npc)
+    end
+
+    if XrrIsHost() then return end
+
+    local function forward(pseudo_id)
+        local host_id = xrr_pending_npc_lock_host_id()
+        if not (host_id and host_id > 0 and host_id < 65535) then
+            printf("[xrRazom][companion] %s PEER: no lock host_id, dropping", pseudo_id)
+            return
+        end
+        printf("[xrRazom][companion] %s PEER -> SendQuestAccept npc=%s", pseudo_id, tostring(host_id))
+        XrrAlife():SendQuestAccept(pseudo_id, host_id)
+    end
+
+    dialogs_axr_companion.become_actor_companion       = function() forward("__companion_add") end
+    dialogs_axr_companion.remove_companions_from_squad = function() forward("__companion_remove") end
+
+    -- companion_squads is always empty on a peer, so these forward too.
+    axr_companions.add_to_actor_squad      = dialogs_axr_companion.become_actor_companion
+    axr_companions.remove_from_actor_squad = dialogs_axr_companion.remove_companions_from_squad
+    axr_companions.companion_add_waypoints    = NOP
+    axr_companions.companion_remove_waypoints = NOP
+
+    if dialogs_lostzone then
+        dialogs_lostzone.set_stalker_living_legend_as_companion     = dialogs_axr_companion.become_actor_companion
+        dialogs_lostzone.dismiss_speaker_companion                  = dialogs_axr_companion.remove_companions_from_squad
+        dialogs_lostzone.set_degtyarev_taskforce_squad_as_companion = dialogs_axr_companion.become_actor_companion
+    end
+    if dialogs_agr_u then
+        dialogs_agr_u.set_speaker_as_companion = dialogs_axr_companion.become_actor_companion
+    end
+end

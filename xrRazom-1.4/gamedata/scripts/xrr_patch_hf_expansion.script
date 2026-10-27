@@ -1,0 +1,102 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+
+  Hideout Furniture Expansion patch: the stove's box link lives in the
+  mod-private m_data.stove_stashes, which no channel carries, so the host
+  bridges it to peers over the use-intent seam.
+]]
+
+-- se_object[stove_id] key carrying the box's shared id.
+local KEY = "xrr_stove_stash_id"
+
+-- The deferred box-open access_inventory queues; its event ns is the stove id.
+local OPEN_KEY = "container"
+
+local _applied = false
+
+local _orig_access_inventory, _orig_start_dialog, _orig_use_cook
+
+-- Resolve from the replicated carrier into the mod's own m_data: its read paths
+-- (GetStashObj, the cook flow) look the link up there.
+local peer_resolve = xrr_use_intent.linked_box_resolver(KEY,
+    function(stove_id, stash_id)
+        local m_data = alife_storage_manager.get_state()
+        if not m_data.stove_stashes then m_data.stove_stashes = {} end
+        m_data.stove_stashes[stove_id] = stash_id
+    end)
+
+local function peer_access_inventory(stove_id)
+    xrr_use_intent.request{
+        verb = "hf:stove_stash", obj_id = stove_id, state = true,
+        resolve = peer_resolve,
+        on_ready = xrr_use_intent.open_box_when_online,
+    }
+end
+
+-- Warm the link when the dialog opens, so the buttons find it resolved. Never
+-- defer onto the dialog: UICookStove is SetAutoDelete(true).
+local function peer_warm_stash(stove_id)
+    xrr_use_intent.request{
+        verb = "hf:stove_stash", obj_id = stove_id, state = true,
+        resolve = peer_resolve,
+    }
+end
+
+-- UseCook reads the link straight out of m_data and never creates, so an
+-- unresolved peer would cook on an empty stove.
+local function peer_use_cook(dlg)
+    if peer_resolve(dlg.obj_id) then return _orig_use_cook(dlg) end
+    actor_menu.set_msg(1, "The stove's storage is still syncing — try again.", 4)
+end
+
+-- access_inventory both creates-or-gets the box and queues its open: reuse the
+-- mod's creation and drop the queued open.
+local function host_stove_stash(stove_id)
+    local obj = level.object_by_id(stove_id)
+    if not obj then
+        printe("![xrRazom][use] hf:stove_stash obj=%s: stove offline host-side — refused",
+            tostring(stove_id))
+        return
+    end
+    _orig_access_inventory(obj)
+    RemoveTimeEvent(stove_id, OPEN_KEY)
+
+    local stashes = alife_storage_manager.get_state().stove_stashes
+    local stash_id = stashes and stashes[stove_id]
+    if not stash_id then
+        printe("![xrRazom][use] hf:stove_stash obj=%s: no box after access_inventory",
+            tostring(stove_id))
+        return
+    end
+    xrr_use_intent.host_bridge(stove_id, KEY, stash_id)
+end
+
+function on_game_start()
+    if _applied then return end
+    if not (ui_stove_furniture and ui_stove_furniture.access_inventory) then return end
+    _applied = true
+
+    _orig_access_inventory = ui_stove_furniture.access_inventory
+    xrr_use_intent.register("hf:stove_stash", host_stove_stash)
+
+    function ui_stove_furniture.access_inventory(obj)
+        if not XrrIsClient() then return _orig_access_inventory(obj) end
+        peer_access_inventory(obj:id())
+    end
+
+    if ui_stove_furniture.start_dialog then
+        _orig_start_dialog = ui_stove_furniture.start_dialog
+        function ui_stove_furniture.start_dialog(obj_id)
+            if XrrIsClient() then peer_warm_stash(obj_id) end
+            return _orig_start_dialog(obj_id)
+        end
+    end
+
+    if ui_stove_furniture.UICookStove and ui_stove_furniture.UICookStove.UseCook then
+        _orig_use_cook = ui_stove_furniture.UICookStove.UseCook
+        function ui_stove_furniture.UICookStove:UseCook()
+            if not XrrIsClient() then return _orig_use_cook(self) end
+            return peer_use_cook(self)
+        end
+    end
+end

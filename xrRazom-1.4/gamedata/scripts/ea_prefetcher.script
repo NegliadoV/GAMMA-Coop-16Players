@@ -1,0 +1,6 @@
+-- xrRazom override of FDDA's ea_prefetcher.script, inert when FDDA is absent.
+-- The HUD warm-up is disabled entirely: its play_hud_motion failures escape
+-- pcall and hard-crash the actor_on_first_update chain.
+
+function on_game_start()
+end

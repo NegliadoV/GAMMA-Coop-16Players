@@ -1,0 +1,65 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  248 - Night Mutants patch: its no-spawn radius keys off db.actor alone, so
+  mutants spawn on top of a peer; the mod's own check is re-asked per peer.
+  Diagnosis by Nito.
+]]
+
+-- Narrow the mod's answer, never replace it: it decides for the host actor
+-- first, and a "yes, spawn here" is then re-asked per peer.
+local function install_host_radius()
+    local orig = night_mutants.se_obj_outside_spawn_radius
+    if type(orig) ~= "function" then
+        printe("![xrRazom][night_mutants] se_obj_outside_spawn_radius missing — "
+            .. "mutants may spawn on a peer")
+        return
+    end
+
+    -- spawn_mutants reaches it as a bare global, so the module-table wrap covers
+    -- the mod's own call.
+    night_mutants.se_obj_outside_spawn_radius = function(se_obj)
+        if not orig(se_obj) then return false end          -- host actor too close
+        if not (se_obj and XrrPlayers():GetPeerCount() > 0) then return true end
+
+        local players = XrrPlayers()
+        for i = 1, players:GetPeerCount() do
+            local id = players:GetPeerLocalIdAt(i)
+            local avatar = id and id > 0 and id ~= 65535 and level.object_by_id(id)
+            if avatar and avatar:alive() then
+                -- The mod's same-level fast path still reads alife():actor(),
+                -- which is right: peers live in the host's bubble.
+                local ok, outside = pcall(XrrPlayerIdentityCall, avatar, orig, se_obj)
+                if not ok then
+                    log("[xrRazom][night_mutants] radius check crashed: " .. tostring(outside))
+                elseif not outside then
+                    return false
+                end
+            end
+        end
+        return true
+    end
+end
+
+function on_game_start()
+    if not night_mutants then return end
+
+    -- try_to_spawn is registered by value, but the two mutators it calls are
+    -- bare globals; gating them on the peer leaves only its throttled time check.
+    local orig_spawn, orig_delete = night_mutants.spawn_mutants, night_mutants.delete_mutants
+    if type(orig_spawn) == "function" then
+        night_mutants.spawn_mutants = function(...)
+            if XrrIsConnected() then return end
+            return orig_spawn(...)
+        end
+    end
+    if type(orig_delete) == "function" then
+        night_mutants.delete_mutants = function(...)
+            if XrrIsConnected() then return end
+            return orig_delete(...)
+        end
+    end
+
+    install_host_radius()
+end

@@ -1,0 +1,14 @@
+; xrRazom — Useful Idiots (450- Useful Idiots - bellyillish).
+; illish/patches/xr_danger.lua identifies the player by a literal
+; dangerObject:id() == 0, which no identity swap can rebind, so NPCs at neutral
+; relation discarded a peer's gunfire. The engine rewrites the two compares on
+; that line to XrrIsPlayerId (xrr_patch_common) when the package is required;
+; the rest of the body runs as the mod wrote it under the danger-surface
+; identity swap. A miss logs INSTALL FAILED and the file runs untouched.
+; Upstream one-token fix requested (== AC_ID); when it lands, delete this file.
+
+[illish.patches.xr_danger]
+from_1 = "dangerObject:id() == 0"
+to_1   = "XrrIsPlayerId(dangerObject:id())"
+from_2 = "dangerObject:id() ~= 0"
+to_2   = "not XrrIsPlayerId(dangerObject:id())"

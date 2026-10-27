@@ -1,0 +1,127 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Fast travel as a group action: gathered party required, the initiator's move
+  drags everyone, and the time cost lands once on the host.
+]]
+
+local _installed = false
+local _orig_property_box_clicked = nil
+local _orig_advance = nil
+local _fft = false
+
+local TP_NO_DIR = 1.0e10  -- "keep heading"; must stay >= XRR_TP_NO_DIR engine-side
+local MOVE_EPS  = 0.5
+
+local REASON_FAST_TRAVEL = 1  -- must match XRR_TIME_ADV_FAST_TRAVEL engine-side
+
+local function veto_travel()
+    return xrr_group_action.party_fast_travel()
+       and xrr_group_action.veto_if_ungathered()
+end
+
+local function in_session()
+    return XrrIsHosted() or XrrIsConnected()
+end
+
+-- Vanilla click match: ft props start with the fast-travel prefix under both
+-- longnames settings; bp is a fixed string.
+local function vanilla_travel_prop(prop)
+    if not prop or prop == "" then return false end
+    if prop == game.translate_string("bp_to") then return true end
+    local prefix = game.translate_string("st_pda_fast_travel_to") .. " "
+    return string.find(prop, prefix, 1, true) == 1
+end
+
+local function selected_prop(property_ui)
+    local ok, prop = pcall(function()
+        local item = property_ui:GetSelectedItem()
+        return item and item:GetTextItem():GetText()
+    end)
+    return ok and prop or nil
+end
+
+-- The arm is a C++ latch cleared only by the jump it awaits, and listeners run
+-- unprotected: disarm must survive a throw or the latch eats the next jump.
+local function call_armed(arm, fn, ...)
+    if not arm then return fn(...) end
+    XrrWorld():ArmTimeForward(REASON_FAST_TRAVEL)
+    local ok, r = pcall(fn, ...)
+    XrrWorld():DisarmTimeForward()
+    if not ok then
+        printf("[xrRazom] fast-travel: wrapped call raised: %s", tostring(r))
+        return
+    end
+    return r
+end
+
+-- The origin rides the wire so gathered teammates self-gate; recipients dedup,
+-- so the initiator's own echo is at worst a small jitter.
+local function property_box_clicked_wrapper(property_ui)
+    if not (in_session() and db.actor) then
+        return _orig_property_box_clicked(property_ui)
+    end
+
+    local prop    = selected_prop(property_ui)
+    local vanilla = not _fft and vanilla_travel_prop(prop)
+
+    if vanilla and veto_travel() then return end
+
+    local pos0  = vector():set(db.actor:position())
+    local gvid0 = db.actor:game_vertex_id()
+    local lvl0  = level.name()
+
+    local r = call_armed(vanilla and XrrIsClient(),
+                         _orig_property_box_clicked, property_ui)
+
+    if db.actor and level.name() == lvl0
+        and db.actor:position():distance_to(pos0) > MOVE_EPS
+        and get_console_cmd(1, "xrr_sync_teleport") then
+        local d = db.actor:position()
+        if XrrIsHost() then
+            XrrPlayers():SendTeleportAll(d.x, d.y, d.z, TP_NO_DIR,
+                                         pos0.x, pos0.y, pos0.z, gvid0)
+        else
+            XrrPlayers():SendTeleportRequest(d.x, d.y, d.z, TP_NO_DIR,
+                                             pos0.x, pos0.y, pos0.z, gvid0)
+        end
+    end
+    return r
+end
+
+local function on_try_fast_travel(trip)
+    if not in_session() then return end
+    if veto_travel() then
+        trip.ret_value = false
+    end
+end
+
+-- FFT's single time chokepoint, guide travel included.
+local function advance_trip_time_wrapper(tt, dist, mapchange, pause_survival)
+    return call_armed(in_session() and XrrIsClient(),
+                      _orig_advance, tt, dist, mapchange, pause_survival)
+end
+
+function on_game_start()
+    if _installed then return end
+    if not (pda and type(pda.property_box_clicked) == "function") then
+        log("[xrRazom] fast-travel: pda.property_box_clicked missing — skipped")
+        return
+    end
+    _installed = true
+
+    local ft = game_fast_travel
+    _fft = ft and type(ft.advance_trip_time) == "function" or false
+    if _fft then
+        _orig_advance = ft.advance_trip_time
+        ft.advance_trip_time = advance_trip_time_wrapper
+        RegisterScriptCallback("on_try_fast_travel", on_try_fast_travel)
+    end
+
+    -- Resolved by name per click; vanilla's own click handlers are file-locals.
+    _orig_property_box_clicked = pda.property_box_clicked
+    pda.property_box_clicked = property_box_clicked_wrapper
+    log(string.format("[xrRazom] fast-travel: group travel armed (%s)",
+        _fft and "FFT" or "vanilla"))
+end

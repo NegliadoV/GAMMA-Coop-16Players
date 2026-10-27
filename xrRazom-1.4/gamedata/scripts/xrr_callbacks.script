@@ -1,0 +1,334 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  on_game_start() applies the patches whose relative order matters (axr_main runs
+  scripts in unsorted FS-registry order) and registers the Anomaly callbacks.
+]]
+
+local function on_game_load()
+    if not db.actor then return end
+    _G.GlobalLastPosition = db.actor:position()
+    local comm = character_community(db.actor)
+    local money = db.actor:money()
+    log("[xrRazom] on_game_load(xrr): community=" .. tostring(comm)
+        .. " money=" .. tostring(money))
+    local cfg = axr_main and axr_main.config
+    if cfg then
+        local f = cfg:r_value("character_creation","new_game_faction",3)
+        local m = cfg:r_value("character_creation","new_game_money",3)
+        log("[xrRazom] on_game_load(xrr): config faction=" .. tostring(f)
+            .. " money=" .. tostring(m))
+    end
+
+    -- axr_main.config writes don't survive new_game()'s VM restart, so the faction
+    -- comes from C++. Connected-only: a solo new game must never inherit it.
+    if comm == "actor" and XrrIsConnected and XrrIsConnected() then
+        local pf = XrrNet():PendingJoinFaction()
+        if pf and pf ~= "" then
+            local bare = pf:match("^actor_(.+)") or pf
+            db.actor:set_character_community("actor_" .. bare, 0, 0)
+            alife_storage_manager.get_state().default_faction = bare
+            log("[xrRazom] on_game_load(xrr): applied pending faction=" .. bare)
+        end
+    end
+end
+
+local function actor_on_first_update()
+    if _G.GameLoaded then return end
+    -- The dispatch-gate flip must FOLLOW the actor binder's first update — flipping
+    -- earlier runs the peer's Phase-B work during the load window.
+    _G.GameLoaded = true
+    XrrNet():SetGameLoaded(true)
+    xrr_peer_hud.activate_hud()
+
+    xrr_patch_currency.apply_late()
+
+    -- Deferred: set_character_name triggers ALife serialization which re-enters Lua.
+    CreateTimeEvent(0, "xrr_set_charname", 0, function()
+        local se_actor = alife():actor()
+        if se_actor then
+            se_actor:set_character_name(XrrNet():GetNickName())
+        end
+        return true
+    end)
+end
+
+local function actor_on_sleep(hour)
+    if not (XrrIsHosted() or XrrIsConnected()) then return end
+    XrrPlayers():SendPeerAnim("sleep_idle_0", 1.6, "")
+end
+
+-- Every use path asks this gate first. A use-animation mod (FDDA) vetoes here and
+-- eats the item mid-clip; C++ holds the section until the clip starts.
+local function wrap_item_use_gate()
+    local orig = _G.CInventory__eat
+    if not orig then return end
+    _G.CInventory__eat = function(item)
+        local ok = orig(item)
+        if ok == false and item and (XrrIsHosted() or XrrIsConnected()) then
+            XrrPlayers():NoteVetoedUse(item:section())
+        end
+        return ok
+    end
+end
+
+-- ui_inventory opens boxes straight from this callback, so CUIGameSP::StartCarBody
+-- and its engine-side contents request never run for them.
+local function physic_object_on_use(obj, who)
+    if not XrrIsConnected() then return end
+    if who and who:id() == AC_ID and IsInvbox(obj) then
+        XrrWorld():RequestContainerContents(obj:id(), 0)
+    end
+end
+
+-- Corpse half of the request above: the loot UI is already up by the time
+-- StartCarBody runs, so its hook returns at the top.
+local function npc_on_use(obj, who)
+    if not XrrIsConnected() then return end
+    if who and who:id() == AC_ID and IsStalker(obj) and not obj:alive() then
+        XrrWorld():RequestContainerContents(obj:id(), 1)
+    end
+end
+
+-- 2 = trade, 0 = closed. Close keys on the menu closing, not on leaving trade:
+-- a mechanic's window can go trade → repair without passing through 0.
+local function on_actor_menu_mode(mode)
+    if not (XrrIsHosted() or XrrIsConnected()) then return end
+    if mode == 2 then
+        XrrAlife():OnTradeUiOpened()
+    elseif mode == 0 then
+        XrrAlife():OnTradeUiClosed()
+    end
+end
+
+-- Routing in-flight veto: a routed take/buy has no answer yet, so the cell stays
+-- put until the host's ITEM_MOVE lands or the in-flight TTL expires.
+local function on_item_before_move(flags, npc_id, obj, mode, bag_from)
+    if not obj then return end
+    if not XrrIsConnected() then return end
+    if XrrWorld():IsItemIntentPending(obj:id()) then
+        flags.ret_value = false
+    end
+end
+
+-- Peer proxies are absent from db.storage / db.heli_enemies (their
+-- script_binding is a no-op); heli combat needs it, but so does GAMMA's
+-- corpse-danger path (db.storage[id].object) — keep even if heli stops needing it.
+local _heli_proxy_ids = {}
+local _heli_proxy_t   = 0
+
+local function heli_drop_stale(seen)
+    for cid in pairs(_heli_proxy_ids) do
+        if not seen[cid] then
+            for j = #db.heli_enemies, 1, -1 do
+                if db.heli_enemies[j] == cid then table.remove(db.heli_enemies, j) end
+            end
+            db.storage[cid] = nil
+            _heli_proxy_ids[cid] = nil
+        end
+    end
+end
+
+local function heli_sync_proxy_targets()
+    if not XrrIsHosted() then return end
+    local now = time_global()
+    if now - _heli_proxy_t < 1500 then return end
+    _heli_proxy_t = now
+
+    local players = XrrPlayers()
+    local n = players:GetPeerCount()
+    local seen = {}
+    for i = 1, n do
+        local cid = players:GetPeerLocalIdAt(i)
+        if cid and cid > 0 and cid ~= 65535 then
+            local obj = level.object_by_id(cid)
+            if obj then
+                seen[cid] = true
+                if not db.storage[cid] then db.storage[cid] = {} end
+                db.storage[cid].object = obj
+                db.add_enemy(obj)           -- idempotent (membership-checked)
+                _heli_proxy_ids[cid] = true
+            end
+        end
+    end
+
+    heli_drop_stale(seen)
+end
+
+-- Called from OnPlayerDisconnected: the released proxy must leave db.heli_enemies
+-- before the next heli AI tick, and the 1.5 s poll above loses that race.
+function heli_purge_proxy_targets()
+    if not next(_heli_proxy_ids) then return end
+    local players = XrrPlayers()
+    local seen = {}
+    for i = 1, players:GetPeerCount() do
+        local cid = players:GetPeerLocalIdAt(i)
+        if cid and cid > 0 and cid ~= 65535 then seen[cid] = true end
+    end
+    heli_drop_stale(seen)
+end
+
+-- axr_main runs actor_on_first_update registrants with no pcall, so one throw starves
+-- every later mod's init; its intercepts table is local, so the wrap goes on at registration.
+local _fu_wrap = setmetatable({}, { __mode = "kv" })  -- raw fn -> pcall wrapper
+
+if axr_main and not axr_main.__xrr_fu_isolated then
+    axr_main.__xrr_fu_isolated = true
+    local orig_set   = axr_main.callback_set
+    local orig_unset = axr_main.callback_unset
+
+    axr_main.callback_set = function(name, func_or_userdata)
+        if name == "actor_on_first_update" and type(func_or_userdata) == "function" then
+            local fn = func_or_userdata
+            local w = _fu_wrap[fn]
+            if not w then
+                w = function(...)
+                    local in_session = XrrIsHosted and (XrrIsHosted() or XrrIsConnected())
+                    if not in_session then return fn(...) end
+                    local ok, err = pcall(fn, ...)
+                    if not ok then
+                        printe("![xrRazom] actor_on_first_update callback isolated: %s", tostring(err))
+                    end
+                end
+                _fu_wrap[fn] = w
+            end
+            func_or_userdata = w
+        end
+        return orig_set(name, func_or_userdata)
+    end
+
+    axr_main.callback_unset = function(name, func_or_userdata)
+        if name == "actor_on_first_update" and type(func_or_userdata) == "function" then
+            func_or_userdata = _fu_wrap[func_or_userdata] or func_or_userdata
+        end
+        return orig_unset(name, func_or_userdata)
+    end
+end
+
+-- actor_on_* for a remote player's body. footstep carries mstate (for IsMoveState) in
+-- place of hud_view/flags; land's speed is the last airborne speed, not a contact speed.
+AddScriptCallback("avatar_on_footstep")
+AddScriptCallback("avatar_on_jump")
+AddScriptCallback("avatar_on_land")
+
+function xrr_avatar_on_footstep(avatar, material, power, mstate)
+    SendScriptCallback("avatar_on_footstep", avatar, material, power, mstate)
+end
+
+function xrr_avatar_on_jump(avatar)
+    SendScriptCallback("avatar_on_jump", avatar)
+end
+
+function xrr_avatar_on_land(avatar, speed)
+    SendScriptCallback("avatar_on_land", avatar, speed)
+end
+
+_G.xrr_avatar_on_footstep = xrr_avatar_on_footstep
+_G.xrr_avatar_on_jump     = xrr_avatar_on_jump
+_G.xrr_avatar_on_land     = xrr_avatar_on_land
+
+-- Backstop for userdata registrants and bind_stalker_ext's own body. The gate flip
+-- runs FIRST: a third-party callback can abort the chain in a way pcall cannot catch.
+local _orig_first_update = nil
+
+local function xrr_first_update_guard(binder, delta)
+    if not _G.GameLoaded then
+        local okf, errf = pcall(actor_on_first_update)
+        if not okf then printe("![xrRazom] gate-flip raised: %s", tostring(errf)) end
+    end
+    local ok, err = pcall(_orig_first_update, binder, delta)
+    if not ok then
+        printe("![xrRazom] actor_on_first_update chain raised: %s", tostring(err))
+    end
+end
+
+function on_game_start()
+    local cfg = axr_main and axr_main.config
+    if cfg then
+        local f = cfg:r_value("character_creation","new_game_faction",3)
+        local m = cfg:r_value("character_creation","new_game_money",3)
+        log("[xrRazom] on_game_start: config new_game_faction="
+            .. tostring(f) .. " new_game_money=" .. tostring(m))
+    else
+        log("[xrRazom] on_game_start: axr_main.config is nil!")
+    end
+
+    xrr_patch_common.apply()
+
+    xrr_patch_activatables.apply()
+
+    xrr_patch_logic_section.apply()
+
+    -- Runs after the world patches so its NOPs (door/campfire AI) take precedence.
+    if XrrIsClient() then
+        xrr_patch_client.apply()
+    end
+
+    xrr_patch_anomalies.apply()
+
+    xrr_patch_weather.apply()
+
+    -- Before xrr_patch_quests.
+    xrr_patch_task_guards.apply()
+
+    xrr_patch_quests.apply()
+
+    xrr_patch_quest_spawns.apply()
+
+    xrr_patch_quest_story_effects.apply()
+
+    -- After xrr_patch_quests: its actor_has_item replacement sits beneath this wrap.
+    xrr_patch_restrictor_logic.apply()
+
+    xrr_patch_quest_drx.apply()
+
+    xrr_patch_companions.apply()
+
+    -- After xrr_patch_weather.
+    xrr_patch_immersive_sleep.apply()
+
+    xrr_mcm_authority.apply()
+
+    xrr_travel_settings_authority.apply()
+
+    if bind_stalker_ext and bind_stalker_ext.actor_on_first_update and not _orig_first_update then
+        _orig_first_update                      = bind_stalker_ext.actor_on_first_update
+        bind_stalker_ext.actor_on_first_update  = xrr_first_update_guard
+        log("[xrRazom] actor_on_first_update chain guard installed (gate-flip backstop active)")
+    elseif not bind_stalker_ext or not bind_stalker_ext.actor_on_first_update then
+        printe("![xrRazom] actor_on_first_update chain guard FAILED — bind_stalker_ext.actor_on_first_update missing")
+    end
+
+    wrap_item_use_gate()
+
+    RegisterScriptCallback("actor_on_first_update", actor_on_first_update)
+    RegisterScriptCallback("on_game_load",          on_game_load)
+    RegisterScriptCallback("actor_on_sleep",        actor_on_sleep)
+    RegisterScriptCallback("physic_object_on_use_callback", physic_object_on_use)
+    RegisterScriptCallback("npc_on_use",                    npc_on_use)
+    RegisterScriptCallback("ActorMenu_on_item_before_move", on_item_before_move)
+    RegisterScriptCallback("ActorMenu_on_mode_changed",     on_actor_menu_mode)
+
+    RegisterScriptCallback("actor_on_update",       heli_sync_proxy_targets)
+    RegisterScriptCallback("actor_on_update",       xrr_stats_report_update)
+    RegisterScriptCallback("on_level_changing",     xrr_stats_report_flush)
+    RegisterScriptCallback("actor_on_update",       xrr_condition_report_update)
+    RegisterScriptCallback("on_level_changing",     xrr_condition_report_flush)
+    RegisterScriptCallback("actor_on_update",        xrr_disguise_report_update)
+    RegisterScriptCallback("actor_on_item_drop",     xrr_disguise_on_item_drop)
+    RegisterScriptCallback("actor_on_weapon_zoom_in", xrr_disguise_on_weapon_zoom)
+    RegisterScriptCallback("on_option_change",       xrr_disguise_on_option_change)
+
+    -- Peer load delegation (F9/quickload here, death-screen engine-side). Saves
+    -- are deliberately not delegated from a callback: a handler in that chain
+    -- can't observe its own verdict, so it would overrule every save-gating mod.
+    RegisterScriptCallback("on_before_load_input", function(dik, bind, flags)
+        if XrrIsClient() then
+            flags.ret = true
+            if db.actor and XrrNet() then
+                XrrPlayers():SendPeerLoadLastSaveRequest()
+            end
+        end
+    end)
+end

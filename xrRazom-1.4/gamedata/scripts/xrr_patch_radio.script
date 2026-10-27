@@ -1,0 +1,253 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  RF receiver (item_radio) frequency tables: the host owns RF_stashes / RF_targets;
+  peers take a full replace at join plus mid-game deltas.
+]]
+
+local UNMAPPED = 65535  -- GetLocalItemIDByHostID: the object does not exist here
+
+-- Binary blob helpers
+local function blob_w_u8(t, v)  t[#t+1] = string.char(v % 256) end
+local function blob_w_u16(t, v)
+    v = math.floor(v)
+    t[#t+1] = string.char(v % 256, math.floor(v / 256) % 256)
+end
+local function blob_w_u32(t, v)
+    v = math.floor(v)
+    t[#t+1] = string.char(v % 256, math.floor(v / 256) % 256,
+                          math.floor(v / 65536) % 256, math.floor(v / 16777216) % 256)
+end
+local function blob_w_str(t, s)
+    s = s or ""
+    blob_w_u16(t, #s)
+    if #s > 0 then t[#t+1] = s end
+end
+
+local _bp, _bd = 1, ""
+local function blob_r_init(data) _bd = data; _bp = 1 end
+local function blob_r_u8()
+    local v = string.byte(_bd, _bp); _bp = _bp + 1; return v
+end
+local function blob_r_u16()
+    local lo, hi = string.byte(_bd, _bp), string.byte(_bd, _bp + 1)
+    _bp = _bp + 2; return lo + hi * 256
+end
+local function blob_r_u32()
+    local b1, b2, b3, b4 = string.byte(_bd, _bp, _bp + 3)
+    _bp = _bp + 4; return b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+end
+local function blob_r_str()
+    local len = blob_r_u16()
+    if len == 0 then return "" end
+    local s = string.sub(_bd, _bp, _bp + len - 1)
+    _bp = _bp + len; return s
+end
+
+-- stashes : { [level_name] = { [id] = freq } }   (nil = none)
+-- targets : { [id] = { freq = f, dist = d } }     (nil = none)
+-- removes : { host_id, ... }  target host ids to drop on the peer  (nil = none)
+local function pack_rf(is_bulk, stashes, targets, removes)
+    local t = {}
+    blob_w_u8(t, is_bulk and 1 or 0)
+
+    local levels = {}
+    if stashes then
+        for lvl in pairs(stashes) do levels[#levels + 1] = lvl end
+    end
+    blob_w_u8(t, #levels)
+    for _, lvl in ipairs(levels) do
+        blob_w_str(t, lvl)
+        local ids = stashes[lvl]
+        local cnt = 0
+        for _ in pairs(ids) do cnt = cnt + 1 end
+        blob_w_u16(t, cnt)
+        for id, freq in pairs(ids) do
+            blob_w_u32(t, id)
+            blob_w_u16(t, freq)
+        end
+    end
+
+    local tids = {}
+    if targets then
+        for id in pairs(targets) do tids[#tids + 1] = id end
+    end
+    blob_w_u16(t, #tids)
+    for _, id in ipairs(tids) do
+        local v = targets[id]
+        blob_w_u32(t, id)
+        blob_w_u16(t, v.freq or 0)
+        blob_w_u16(t, v.dist or 200)
+    end
+
+    removes = removes or {}
+    blob_w_u16(t, #removes)
+    for _, id in ipairs(removes) do
+        blob_w_u32(t, id)
+    end
+
+    return table.concat(t)
+end
+
+local function broadcast(blob)
+    local a = XrrAlife and XrrAlife()
+    if a then a:SendRfBind(blob, #blob) end
+end
+
+-- Host: full table, REPLACE semantics, sent at each join.
+function broadcast_bulk()
+    if not (item_radio and XrrIsHosted and XrrIsHosted()) then return end
+    broadcast(pack_rf(true, item_radio.RF_stashes, item_radio.RF_targets))
+end
+
+local _prev_targets = {}
+
+-- A target a PLAYER pocketed is done: a pickup re-parents the alife item rather
+-- than unregistering it, so only a player's take counts here — any-parent would
+-- also kill the fate task's target while it sits in a corpse.
+local function host_clear_pocketed_target(item_id)
+    if not (item_radio and item_radio.RF_targets[item_id]) then return end
+    if not (XrrIsHosted and XrrIsHosted()) then return end
+    item_radio.clear_target(item_id)
+end
+
+-- Broadcasts the targets that left RF_targets since the last tick, whoever
+-- removed them (a pickup above, a task, vanilla's gone-entity validation).
+local function host_diff_removals()
+    if not item_radio then return end
+
+    local gone = {}
+    for host_id in pairs(item_radio.RF_targets) do
+        if not alife_object(host_id) then gone[#gone + 1] = host_id end
+    end
+    for _, host_id in ipairs(gone) do
+        item_radio.clear_target(host_id)
+    end
+
+    local cur = {}
+    for id in pairs(item_radio.RF_targets) do cur[id] = true end
+    local removed = {}
+    for id in pairs(_prev_targets) do
+        if not cur[id] then removed[#removed + 1] = id end
+    end
+    _prev_targets = cur
+    if #removed > 0 then
+        broadcast(pack_rf(false, nil, nil, removed))
+    end
+end
+
+-- Peer: quest targets are runtime-spawned, so they park until the object exists here.
+local _pending = {}   -- [host_id] = { freq, dist }
+local _applied = {}   -- [host_id] = local_id currently written into RF_targets
+local _recon_tg = 0
+
+local function resolve_local(host_id)
+    local a = XrrAlife and XrrAlife()
+    local lid = a and a:GetLocalItemIDByHostID(host_id)
+    if (not lid) or (lid == UNMAPPED) then return nil end
+    return lid
+end
+
+local function reconcile_targets()
+    if not item_radio then return end
+    for host_id, v in pairs(_pending) do
+        local lid = resolve_local(host_id)
+        if lid and _applied[host_id] ~= lid then
+            local prev = _applied[host_id]
+            if prev then item_radio.RF_targets[prev] = nil end
+            item_radio.RF_targets[lid] = { freq = v.freq, dist = v.dist }
+            _applied[host_id] = lid
+        end
+    end
+end
+
+-- No Lua caller: xrr_net_client.OnRfBind delivers it.
+function on_rf_bind(blob)
+    if not item_radio then return end
+    if XrrIsHost and XrrIsHost() then return end  -- host owns the tables
+
+    blob_r_init(blob)
+    local is_bulk = blob_r_u8()
+    if is_bulk == 1 then
+        item_radio.RF_stashes = {}
+        item_radio.RF_targets = {}
+        _pending = {}
+        _applied = {}
+    end
+
+    -- Stashes are all.spawn objects: the id holds even before the object exists here.
+    local level_count = blob_r_u8()
+    for _ = 1, level_count do
+        local lvl = blob_r_str()
+        local cnt = blob_r_u16()
+        item_radio.RF_stashes[lvl] = item_radio.RF_stashes[lvl] or {}
+        local bucket = item_radio.RF_stashes[lvl]
+        for _ = 1, cnt do
+            local id   = blob_r_u32()
+            local freq = blob_r_u16()
+            bucket[resolve_local(id) or id] = freq
+        end
+    end
+
+    local tcount = blob_r_u16()
+    for _ = 1, tcount do
+        local id   = blob_r_u32()
+        local freq = blob_r_u16()
+        local dist = blob_r_u16()
+        _pending[id] = { freq = freq, dist = dist }
+    end
+
+    -- Removals drop from _pending too, or the reconcile poll revives them.
+    local rcount = blob_r_u16()
+    for _ = 1, rcount do
+        local host_id = blob_r_u32()
+        _pending[host_id] = nil
+        local lid = _applied[host_id]
+        if lid then item_radio.RF_targets[lid] = nil end
+        _applied[host_id] = nil
+    end
+
+    reconcile_targets()
+end
+
+function on_game_start()
+    if not item_radio then return end
+
+    -- Read back from the table: item_radio defaults a nil freq/dist when storing.
+    local _orig_add_target = item_radio.add_target
+    item_radio.add_target = function(id, freq, dist)
+        _orig_add_target(id, freq, dist)
+        if XrrIsHosted and XrrIsHosted() then
+            local v = item_radio.RF_targets[id]
+            if v then broadcast(pack_rf(false, nil, { [id] = v })) end
+        end
+    end
+
+    local _orig_add_stash = item_radio.add_stash
+    item_radio.add_stash = function(lvl, id, freq)
+        _orig_add_stash(lvl, id, freq)
+        if XrrIsHosted and XrrIsHosted() and lvl
+           and item_radio.RF_stashes[lvl] and item_radio.RF_stashes[lvl][id] then
+            broadcast(pack_rf(false, { [lvl] = { [id] = item_radio.RF_stashes[lvl][id] } }, nil))
+        end
+    end
+
+    RegisterScriptCallback("actor_on_item_take", function(obj)
+        host_clear_pocketed_target(obj:id())
+    end)
+    RegisterScriptCallback("xrr_on_peer_item_take", function(avatar_id, item_id)
+        host_clear_pocketed_target(item_id)
+    end)
+
+    RegisterScriptCallback("actor_on_update", function()
+        local tg = time_global()
+        if tg < _recon_tg then return end
+        _recon_tg = tg + 2000
+        if XrrIsHost and XrrIsHost() then
+            if XrrIsHosted and XrrIsHosted() then host_diff_removals() end
+        elseif next(_pending) then
+            reconcile_targets()
+        end
+    end)
+end

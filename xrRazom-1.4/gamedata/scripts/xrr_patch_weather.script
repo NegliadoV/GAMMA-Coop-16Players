@@ -1,0 +1,636 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Weather, time, emission and sleep sync. The host is authoritative; peers suppress
+  autonomous selection and route sleep through the host.
+]]
+
+local SLEEP_RADIUS = 4.0
+
+-- Set by the host's forced-nap branch: private recovery, doesn't advance the shared clock.
+local _xrr_host_local_nap = false
+
+-- Real-time, not the actor_is_sleeping info: a mid-fade autosave would bake that in for good.
+local SLEEP_GUARD_MS        = 10000
+local _xrr_sleep_guard_until = 0
+
+local function _xrr_sleep_in_progress()
+    return time_global() < _xrr_sleep_guard_until
+end
+
+local function _xrr_arm_sleep_guard()
+    _xrr_sleep_guard_until = time_global() + SLEEP_GUARD_MS
+end
+
+-- Drain is sleep-rate only while actor_is_sleeping is set, and the host's clock jump lands
+-- after vanilla clears it: hold the flag until the fade ended and the jump was consumed.
+local _xrr_psleep_hold      = false
+local _xrr_psleep_jump_done = false
+local _xrr_psleep_fade_done = false
+
+local function _xrr_psleep_release_check()
+    if not _xrr_psleep_hold then return end
+    if db.actor then db.actor:give_info_portion("actor_is_sleeping") end
+    if not (_xrr_psleep_jump_done and _xrr_psleep_fade_done) then return end
+    -- Hold across the post-fade condition tick that consumes the jump (~1.4s later).
+    CreateTimeEvent("xrr_psleep", "release", 3, function()
+        if db.actor then disable_info("actor_is_sleeping") end
+        _xrr_psleep_hold = false
+        return true
+    end)
+end
+
+-- The safety release keeps the flag from sticking if OnTimeChanged never lands.
+local function _xrr_psleep_arm()
+    _xrr_psleep_hold      = true
+    _xrr_psleep_jump_done = false
+    _xrr_psleep_fade_done = false
+    CreateTimeEvent("xrr_psleep", "safety", 20, function()
+        if _xrr_psleep_hold then
+            if db.actor then disable_info("actor_is_sleeping") end
+            _xrr_psleep_hold = false
+        end
+        return true
+    end)
+end
+
+local _orig_surge_start  = surge_manager.CSurgeManager.start
+local _orig_surge_stop   = surge_manager.CSurgeManager.end_surge
+local _orig_surge_update = surge_manager.CSurgeManager.update
+local _orig_surge_newt   = surge_manager.CSurgeManager.new_surge_time
+local _orig_dream2      = ui_sleep_dialog.dream_callback2
+local _orig_dream_cb    = ui_sleep_dialog.dream_callback
+local _orig_sleep_btn   = ui_sleep_dialog.UISleep.OnButtonSleep
+
+local _orig_psi_start, _orig_psi_stop, _orig_psi_update, _orig_psi_newt
+local PSI_CLASS
+if psi_storm_manager then
+    PSI_CLASS = psi_storm_manager.CPsiStormManager or psi_storm_manager.PsiStormManager
+    if PSI_CLASS then
+        _orig_psi_start  = PSI_CLASS.start
+        _orig_psi_stop   = PSI_CLASS.finish
+        _orig_psi_update = PSI_CLASS.update
+        _orig_psi_newt   = PSI_CLASS.new_psi_storm_time
+    end
+end
+
+-- Vanilla dream_callback minus level.change_game_time: the world clock is host-owned.
+local function local_nap_dream()
+    local GUI = ui_sleep_dialog.GUI
+    if GUI and GUI.forced then
+        level.add_cam_effector("camera_effects\\surge_01.anm", 10, false, "ui_sleep_dialog.dream_callback2")
+    else
+        level.add_cam_effector("camera_effects\\sleep.anm", 10, false, "ui_sleep_dialog.dream_callback2")
+    end
+    local hours = (GUI and (GUI.forced or (GUI.time_track and GUI.time_track:GetIValue()))) or 0
+    if db.actor then db.actor.power = 1 end
+    SendScriptCallback("actor_on_sleep", hours)
+end
+
+-- Read at load: at apply time the peer's clock may already run at surge rate.
+local NORMAL_TF = ini_file("alife.ltx"):r_float_ex("alife", "time_factor") or 6
+
+-- The emission countdown is drawn at random per machine: on a peer it mirrors the host's.
+local SURGE_ANCHOR = "last_surge_time"
+local PSI_ANCHOR   = "last_psi_storm_time"
+
+local _sched_seeded  = {}                                        -- peer: host numbers arrived
+local _sched_sent    = {}                                        -- host: what peers were last sent
+local _sched_skipped = { [SURGE_ANCHOR] = 0, [PSI_ANCHOR] = 0 }  -- peer: ticks dropped pre-seed
+
+local function sched_anchor(is_psy)
+    return is_psy and PSI_ANCHOR or SURGE_ANCHOR
+end
+
+-- All-zero when the manager has none: the wire's no-schedule sentinel (year 0).
+local function anchor_components(mgr, anchor)
+    local t = mgr and mgr[anchor]
+    if not t then return 0, 0, 0, 0, 0, 0 end
+    local Y, M, D, h, mi, s, ms = 0, 0, 0, 0, 0, 0, 0
+    Y, M, D, h, mi, s, ms = t:get(Y, M, D, h, mi, s, ms)
+    return Y, M, D, h, mi, s
+end
+
+-- start()/end_surge self-skip on invalid levels: trust mgr.started, not the call site.
+local function send_emission_state(is_psy, mgr)
+    local active = (mgr and mgr.started and mgr.inited_time) and true or false
+    local Y, M, D, h, mi, s, ms = 0, 0, 0, 0, 0, 0, 0
+    if active then
+        Y, M, D, h, mi, s, ms = mgr.inited_time:get(Y, M, D, h, mi, s, ms)
+    end
+    local aY, aM, aD, ah, ami, as = anchor_components(mgr, sched_anchor(is_psy))
+    XrrWorld():SendEmissionPsy(is_psy, active, Y, M, D, h, mi, s,
+                               (mgr and mgr._delta) or 0, aY, aM, aD, ah, ami, as)
+end
+
+-- Diffing against the last send covers every schedule writer; update() runs at 1 Hz.
+local function sched_host_push(mgr, is_psy)
+    if not (mgr and XrrIsHosted()) then return end
+    local anchor = sched_anchor(is_psy)
+    local aY, aM, aD, ah, ami, as = anchor_components(mgr, anchor)
+    local now = table.concat({ mgr._delta or 0, aY, aM, aD, ah, ami, as }, ":")
+    if _sched_sent[anchor] == now then return end
+    _sched_sent[anchor] = now
+    printf("[xrRazom][Emission] schedule sent is_psy=%s delta=%s",
+        tostring(is_psy), tostring(mgr._delta))
+    send_emission_state(is_psy, mgr)
+end
+
+-- end_surge, skip_surge and the time_forwarded fix rewrite the host's numbers inside the
+-- tick: restore them after. By components, since skip_surge mutates the CTime in place.
+local function sched_peer_tick(mgr, is_psy, orig)
+    if not XrrIsConnected() then return orig(mgr) end
+    local anchor = sched_anchor(is_psy)
+    if not _sched_seeded[anchor] then
+        _sched_skipped[anchor] = _sched_skipped[anchor] + 1
+        return
+    end
+    local delta = mgr._delta
+    local aY, aM, aD, ah, ami, as = anchor_components(mgr, anchor)
+    orig(mgr)
+    local t = game.get_game_time()
+    t:set(aY, aM, aD, ah, ami, as, 0)
+    mgr._delta  = delta
+    mgr[anchor] = t
+end
+
+-- No Lua caller; read engine-side. Flat array, two 14-field halves (surge then
+-- psi): active(1/0), inited Y/M/D/h/mi/s, delta, anchor Y/M/D/h/mi/s.
+function xrr_collect_emission_state()
+    local out = {}
+    local function pack(mgr, base, is_psy)
+        if mgr and mgr.started and mgr.inited_time then
+            local Y, M, D, h, mi, s, ms = 0, 0, 0, 0, 0, 0, 0
+            Y, M, D, h, mi, s, ms = mgr.inited_time:get(Y, M, D, h, mi, s, ms)
+            out[base]     = 1
+            out[base + 1] = Y; out[base + 2] = M; out[base + 3] = D
+            out[base + 4] = h; out[base + 5] = mi; out[base + 6] = s
+        else
+            for i = 0, 6 do out[base + i] = 0 end
+        end
+        -- Unconditional: a joiner at rest still needs the countdown seeded.
+        local aY, aM, aD, ah, ami, as = anchor_components(mgr, sched_anchor(is_psy))
+        out[base + 7]  = (mgr and mgr._delta) or 0
+        out[base + 8]  = aY; out[base + 9]  = aM;  out[base + 10] = aD
+        out[base + 11] = ah; out[base + 12] = ami; out[base + 13] = as
+    end
+    pack(surge_manager.get_surge_manager(), 1, false)
+    -- Gate on PSI_CLASS: the module can exist without a recognized manager class.
+    pack(PSI_CLASS and psi_storm_manager.get_psi_storm_manager(), 15, true)
+    return out
+end
+
+-- active=false is not an end: the peer's own timer drives finish() so the afterglow plays.
+local function xrr_apply_emission(mgr, is_psy, active, Y, M, D, h, mi, s,
+                                  delta, aY, aM, aD, ah, ami, as)
+    if not mgr then return end
+    -- First: with _state_loaded false, update() re-runs initialize() and clears started.
+    if not mgr._state_loaded then
+        mgr:initialize()
+        mgr._state_loaded = true
+    end
+    if aY and aY > 0 then
+        local anchor = sched_anchor(is_psy)
+        local t = game.get_game_time()
+        t:set(aY, aM, aD, ah, ami, as, 0)
+        mgr._delta  = delta
+        mgr[anchor] = t
+        printf("[xrRazom][Emission] schedule seeded is_psy=%s delta=%s pre-seed ticks skipped=%s",
+            tostring(is_psy), tostring(delta), tostring(_sched_skipped[anchor]))
+        _sched_seeded[anchor] = true
+    end
+    if not active then return end
+    if not mgr.started then
+        mgr:start(true, true)
+        if not mgr.started then return end  -- start() self-skipped (invalid level / option off)
+    end
+    if Y and Y > 0 then
+        local t = game.get_game_time()
+        t:set(Y, M, D, h, mi, s, 0)
+        mgr.inited_time = t
+    end
+    -- start() captured the surge-rate factor; end_surge must restore the normal one.
+    mgr.game_time_factor = NORMAL_TF
+end
+
+-- Anabiotic's ~40 min skip would move the shared clock: strip the skip, surge-end and
+-- forced weather, and hold anabiotic_in_process until the emission ends instead.
+local _orig_ana_cb, _orig_ana_cb2
+
+local _ana_active      = false
+local _ana_t0          = 0
+local _ana_seen_surge  = false
+local _ana_next_check  = 0
+local ANA_GRACE_MS     = 20000    -- popped with no emission incoming → clear after this
+local ANA_MAX_HOLD_MS  = 300000   -- safety cap so immunity can't latch forever
+
+local function _ana_in_session()
+    return XrrIsHosted() or XrrIsConnected()
+end
+
+local function _ana_emission_active()
+    if surge_manager.is_started() then return true end
+    if psi_storm_manager and psi_storm_manager.is_started() then return true end
+    return false
+end
+
+-- Latches on seeing the emission, so a pop during the warning phase doesn't clear early.
+local function _ana_poll()
+    local tg = time_global()
+    if tg < _ana_next_check then return end
+    _ana_next_check = tg + 1000
+    if _ana_active then
+        local active = _ana_emission_active()
+        if active then _ana_seen_surge = true end
+        local elapsed = tg - _ana_t0
+        if (_ana_seen_surge and not active)
+           or (not _ana_seen_surge and elapsed > ANA_GRACE_MS)
+           or (elapsed > ANA_MAX_HOLD_MS)
+        then
+            disable_info("anabiotic_in_process")
+            _ana_active     = false
+            _ana_seen_surge = false
+        end
+    elseif _ana_in_session() and has_alife_info("anabiotic_in_process") then
+        -- A join-bulk flag: the joiner must not inherit immunity (disable_info stays local).
+        disable_info("anabiotic_in_process")
+    end
+end
+
+-- `survive` blocks only the HP wave; arszi_psy's psi damage never checks the flag.
+local function _ana_before_hit(s_hit)
+    if not _ana_in_session() then return end
+    if not s_hit or s_hit.type ~= 4 then return end   -- 4 == Telepatic (matches arszi_psy)
+    if not has_alife_info("anabiotic_in_process") then return end
+    s_hit.power = 0
+    if arszi_psy and arszi_psy.set_psy_health then
+        arszi_psy.set_psy_health(1)
+    end
+end
+
+-- Armed at item use, not in anabiotic_callback, so the fade-in is covered too.
+local function _ana_on_item_use(item)
+    if not _ana_in_session() then return end
+    if not item or item:section() ~= "drug_anabiotic" then return end
+    _ana_active     = true
+    _ana_t0         = time_global()
+    _ana_seen_surge = false
+end
+
+local function apply_anabiotic()
+    if _orig_ana_cb then return end  -- already installed (guard re-apply on rejoin)
+    if not bind_stalker_ext then return end
+    _orig_ana_cb  = bind_stalker_ext.anabiotic_callback
+    _orig_ana_cb2 = bind_stalker_ext.anabiotic_callback2
+    if not (_orig_ana_cb and _orig_ana_cb2) then
+        _orig_ana_cb = nil   -- keep guard open so a later apply can retry
+        return
+    end
+
+    bind_stalker_ext.anabiotic_callback = function()
+        if not _ana_in_session() then return _orig_ana_cb() end
+        level.add_cam_effector("camera_effects\\surge_01.anm", 10, false,
+            "bind_stalker_ext.anabiotic_callback2")
+    end
+
+    -- Deliberately leaves anabiotic_in_process set — _ana_poll owns clearing it.
+    bind_stalker_ext.anabiotic_callback2 = function()
+        if not _ana_in_session() then return _orig_ana_cb2() end
+        xr_effects.enable_ui(db.actor, nil)
+        exec_console_cmd("snd_volume_music " .. tostring(_G.mus_vol))
+        exec_console_cmd("snd_volume_eff " .. tostring(_G.amb_vol))
+        _G.amb_vol = 0
+        _G.mus_vol = 0
+    end
+
+    RegisterScriptCallback("actor_on_item_use", _ana_on_item_use)
+    RegisterScriptCallback("actor_on_update", _ana_poll)
+    RegisterScriptCallback("actor_on_before_hit", _ana_before_hit)
+
+    if xrr_register_cleanup then
+        xrr_register_cleanup(function()
+            _ana_active     = false
+            _ana_seen_surge = false
+            _ana_next_check = 0
+        end)
+    end
+end
+
+local function apply_host()
+    function surge_manager.CSurgeManager:start(manual, force)
+        _orig_surge_start(self, manual, force)
+        send_emission_state(false, self)
+        return true
+    end
+
+    function surge_manager.CSurgeManager:end_surge(manual, force)
+        _orig_surge_stop(self, manual, force)
+        send_emission_state(false, self)  -- started=false now → active=false
+        return true
+    end
+
+    function surge_manager.CSurgeManager:update()
+        _orig_surge_update(self)
+        sched_host_push(self, false)
+    end
+
+    if PSI_CLASS and _orig_psi_start then
+        function PSI_CLASS:start(manual, force)
+            _orig_psi_start(self, manual, force)
+            send_emission_state(true, self)
+            return true
+        end
+
+        function PSI_CLASS:finish(manual, force)
+            _orig_psi_stop(self, manual, force)
+            send_emission_state(true, self)
+            return true
+        end
+
+        if _orig_psi_update then
+            function PSI_CLASS:update()
+                _orig_psi_update(self)
+                sched_host_push(self, true)
+            end
+        end
+    end
+
+    -- TIME_SYNC already went out from the engine chokepoint; this adds the forced reselect.
+    ui_sleep_dialog.dream_callback2 = function()
+        _orig_dream2()
+        XrrWorld():SendWeatherChanged(true)
+        return true
+    end
+
+    -- A forced/survival nap must not fast-forward everyone else's clock.
+    ui_sleep_dialog.dream_callback = function()
+        if not _xrr_host_local_nap then
+            return _orig_dream_cb()
+        end
+        _xrr_host_local_nap = false
+        local_nap_dream()
+    end
+
+    function ui_sleep_dialog.UISleep:OnButtonSleep()
+        local forced = self.forced or (ui_sleep_dialog.GUI and ui_sleep_dialog.GUI.forced)
+        if forced then
+            printf("[xrRazom][Sleep] HOST forced nap hours=%s (local recovery, no broadcast)", tostring(forced))
+            _xrr_host_local_nap = true
+            _xrr_arm_sleep_guard()
+            _orig_sleep_btn(self)
+            return
+        end
+        if xrr_group_action.veto_if_ungathered(SLEEP_RADIUS, "st_xrr_sleep_peers_far") then
+            printf("[xrRazom][Sleep] HOST blocked: peer beyond %sm", SLEEP_RADIUS)
+            return
+        end
+        local hours = self.time_track:GetIValue()
+        printf("[xrRazom][Sleep] HOST sleep init hours=%s -> SLEEP_BEGIN", hours)
+        _xrr_host_local_nap = false  -- coordinated sleep advances the shared clock
+        _xrr_arm_sleep_guard()
+        XrrWorld():BroadcastSleepBegin(hours)
+        _orig_sleep_btn(self)
+    end
+
+    -- Read the forced bit BEFORE calling through: select_weather flips `now`.
+    local WM = level_weathers.WeatherManager
+    if WM then
+        local _orig_select = WM.select_weather
+        WM.select_weather = function(self, now)
+            local effective_now = now or self.forced_weather_change_on_time_change
+            _orig_select(self, now)
+            if self.weather_file then
+                XrrWorld():SendWeatherChanged(effective_now and true or false)
+            end
+        end
+    end
+end
+
+-- The caller validated proximity and sent SLEEP_BEGIN: bypass the OnButtonSleep wrap.
+local function _xrr_host_sleep_now(hours)
+    if not db.actor then return end
+    if _xrr_sleep_in_progress() then
+        printf("[xrRazom][Sleep] HOST already sleeping — coalesced duplicate coordinated sleep")
+        return
+    end
+    if ui_sleep_dialog.GUI == nil then
+        ui_sleep_dialog.GUI = ui_sleep_dialog.UISleep()
+    end
+    ui_sleep_dialog.GUI.forced = hours
+    _xrr_host_local_nap = false  -- coordinated sleep advances the shared clock
+    _xrr_arm_sleep_guard()
+    _orig_sleep_btn(ui_sleep_dialog.GUI)
+end
+
+local function apply_peer()
+    -- Only a forced start (the host's EMISSION) runs; the end is the peer's own timer.
+    function surge_manager.CSurgeManager:start(manual, force)
+        if not force then return true end
+        _orig_surge_start(self, manual, force)
+        return true
+    end
+
+    -- The peer skips fake_start, which is what sets _state_loaded.
+    function surge_manager.CSurgeManager:update()
+        if not self._state_loaded then
+            self:initialize()
+            self._state_loaded = true
+        end
+        sched_peer_tick(self, false, _orig_surge_update)
+    end
+
+    -- A local redraw would diverge where the host's dirty check can't see it.
+    function surge_manager.CSurgeManager:new_surge_time(reset)
+        if XrrIsConnected() then return end
+        _orig_surge_newt(self, reset)
+    end
+
+    if PSI_CLASS and _orig_psi_start then
+        function PSI_CLASS:start(manual, force)
+            if not force then return true end
+            _orig_psi_start(self, manual, force)
+            return true
+        end
+
+        if _orig_psi_update then
+            function PSI_CLASS:update()
+                if not self._state_loaded then
+                    self:initialize()
+                    self._state_loaded = true
+                end
+                sched_peer_tick(self, true, _orig_psi_update)
+            end
+        end
+
+        if _orig_psi_newt then
+            function PSI_CLASS:new_psi_storm_time()
+                if XrrIsConnected() then return end
+                _orig_psi_newt(self)
+            end
+        end
+    end
+
+    -- WEATHER_SYNC drives the cycle; the first call passes through to initialize levelWeather.
+    local WM = level_weathers.WeatherManager
+    if WM then
+        local _orig_select = WM.select_weather
+        local initialized = false
+        WM.select_weather = function(self, now)
+            if not initialized then
+                initialized = true
+                _orig_select(self, now)
+                return
+            end
+            if _G.xrr_weather_forced then
+                _G.xrr_weather_forced = false
+                _orig_select(self, now)
+            end
+        end
+    end
+
+    function ui_sleep_dialog.UISleep:OnButtonSleep()
+        local forced = self.forced or (ui_sleep_dialog.GUI and ui_sleep_dialog.GUI.forced)
+        if forced then
+            printf("[xrRazom][Sleep] PEER forced nap hours=%s (local recovery, no host)", tostring(forced))
+            _xrr_arm_sleep_guard()
+            _orig_sleep_btn(self)
+            return
+        end
+        if xrr_group_action.veto_if_ungathered(SLEEP_RADIUS, "st_xrr_sleep_peers_far") then
+            printf("[xrRazom][Sleep] PEER blocked: peer beyond %sm", SLEEP_RADIUS)
+            return
+        end
+        local hours = self.time_track:GetIValue()
+        if self:IsShown() then
+            self:HideDialog()
+            Unregister_UI("UISleep")
+        end
+        printf("[xrRazom][Sleep] PEER -> SLEEP_REQUEST hours=%s (awaiting host SLEEP_BEGIN)", hours)
+        XrrWorld():SendSleepRequest(hours)
+    end
+
+    -- The clock arrives via OnTimeChanged during the fade, not from here.
+    ui_sleep_dialog.dream_callback = local_nap_dream
+
+    -- Vanilla clears actor_is_sleeping here; release_check re-holds it.
+    ui_sleep_dialog.dream_callback2 = function()
+        _orig_dream2()
+        _xrr_psleep_fade_done = true
+        _xrr_psleep_release_check()
+    end
+end
+
+-- Applied engine-side in ms: level.change_game_time drops corrections under a game-minute.
+function OnTimeChanged(delta_sec, host_tf)
+    if not level.present() then return end
+    if delta_sec and delta_sec > 0 and _xrr_psleep_hold then
+        _xrr_psleep_jump_done = true
+        _xrr_psleep_release_check()
+    end
+    if host_tf then
+        level.set_time_factor(host_tf)
+    end
+end
+
+function OnWeatherChanged(forced, weather_name)
+    if not level.present() then return end
+    if not XrrIsHost() then
+        if surge_manager.is_started() then return end
+        if psi_storm_manager and psi_storm_manager.is_started() then return end
+    end
+    if weather_name and weather_name ~= "" then
+        -- Not forced: on a synced clock the transition folds in at the host's env boundary.
+        level.set_weather(weather_name, forced and true or false)
+    else
+        _G.xrr_weather_forced = true
+        local wm = level_weathers.get_weather_manager()
+        if wm then
+            wm:select_weather(forced)
+        end
+    end
+end
+
+function OnEmissionPsy(is_psy, active, Y, M, D, h, mi, s, delta, aY, aM, aD, ah, ami, as)
+    if XrrIsHost() then return end
+    local mgr
+    if is_psy then
+        mgr = psi_storm_manager and psi_storm_manager.get_psi_storm_manager()
+    else
+        mgr = surge_manager.get_surge_manager()
+    end
+    xrr_apply_emission(mgr, is_psy, active, Y, M, D, h, mi, s,
+                       delta, aY, aM, aD, ah, ami, as)
+end
+
+-- Join-time variant; netid is unused ("for us" by definition).
+function OnEmissionPsyTarget(netid, is_psy, active, Y, M, D, h, mi, s,
+                             delta, aY, aM, aD, ah, ami, as)
+    OnEmissionPsy(is_psy, active, Y, M, D, h, mi, s, delta, aY, aM, aD, ah, ami, as)
+end
+
+-- Host-only: fires once per applied TIME_ADVANCE_REQUEST, args (minutes, reason).
+AddScriptCallback("xrr_on_time_advanced")
+
+-- Without time_forwarded an overdue emission fires the moment the clock jumps.
+function OnTimeAdvanced(minutes, reason)
+    surge_manager.get_surge_manager().time_forwarded = true
+    if psi_storm_manager and psi_storm_manager.get_psi_storm_manager then
+        psi_storm_manager.get_psi_storm_manager().time_forwarded = true
+    end
+    SendScriptCallback("xrr_on_time_advanced", minutes, reason)
+end
+
+-- Proximity was already validated by the requesting peer.
+function OnPeerSleepRequest(hours)
+    -- A second SLEEP_BEGIN would double-fade every peer.
+    if _xrr_sleep_in_progress() then
+        printf("[xrRazom][Sleep] HOST recv SLEEP_REQUEST hours=%s but already sleeping — ignored", hours)
+        return
+    end
+    printf("[xrRazom][Sleep] HOST recv SLEEP_REQUEST hours=%s -> SLEEP_BEGIN + local sleep", hours)
+    XrrWorld():BroadcastSleepBegin(hours)
+    _xrr_host_sleep_now(hours)
+end
+
+function OnSleepBegin(hours)
+    if not db.actor then return end
+    if _xrr_sleep_in_progress() then
+        printf("[xrRazom][Sleep] PEER recv SLEEP_BEGIN hours=%s but already sleeping — coalesced", hours)
+        return
+    end
+    printf("[xrRazom][Sleep] PEER recv SLEEP_BEGIN hours=%s -> fade (clock via OnTimeChanged)", hours)
+    if ui_sleep_dialog.GUI == nil then
+        ui_sleep_dialog.GUI = ui_sleep_dialog.UISleep()
+    end
+    ui_sleep_dialog.GUI.forced = hours
+    _xrr_arm_sleep_guard()
+    _xrr_psleep_arm()
+    _orig_sleep_btn(ui_sleep_dialog.GUI)
+end
+
+function apply()
+    if xrr_register_cleanup then
+        xrr_register_cleanup(function()
+            _sched_seeded  = {}
+            _sched_sent    = {}
+            _sched_skipped = { [SURGE_ANCHOR] = 0, [PSI_ANCHOR] = 0 }
+        end)
+    end
+    if XrrIsHost() then
+        apply_host()
+    elseif XrrIsClient() then
+        apply_peer()
+    end
+    -- Both roles: apply_anabiotic gates on the session itself.
+    apply_anabiotic()
+end
+
+_G.OnTimeChanged        = OnTimeChanged
+_G.OnWeatherChanged     = OnWeatherChanged
+_G.OnEmissionPsy        = OnEmissionPsy
+_G.OnEmissionPsyTarget  = OnEmissionPsyTarget
+_G.OnTimeAdvanced       = OnTimeAdvanced
+_G.OnPeerSleepRequest   = OnPeerSleepRequest
+_G.OnSleepBegin         = OnSleepBegin
+_G.xrr_collect_emission_state = xrr_collect_emission_state

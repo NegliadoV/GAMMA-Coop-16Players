@@ -1,0 +1,115 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Yantar + MLR story-quest dialogs: a peer delegates their host-side effects
+  through the __yan_* / __mlr_* pseudo quest ids.
+]]
+
+function on_game_start()
+    log("[xrRazom] Patching Yantar/MLR story-quest dialogs")
+
+    _G.xrr_story_quest_handlers = _G.xrr_story_quest_handlers or {}
+
+    -- The buyer skips the fan-out copy of its own purchase: its new helmet is
+    -- invisible to db.actor:object() until it onlines.
+    local self_bought = {}
+
+    -- Psi restrictors read the local inventory, so every player gets a helmet;
+    -- the reward's "@effect" entry re-runs this on every peer.
+    xr_effects.xrr_give_psi_helmet = function(actor, npc, p)
+        local kind = (p and p[1] == "good") and "good" or "bad"
+        if self_bought[kind] then
+            self_bought[kind] = nil
+            return
+        end
+        local sec = kind .. "_psy_helmet"
+        if db.actor:object(sec) then return end
+        alife_create_item(sec, db.actor)
+        news_manager.relocate_item(db.actor, "in", sec)
+    end
+
+    local function share_psi_helmet(kind)
+        if not XrrIsHosted() then return end
+        XrrAlife():SendQuestReward("__yan_" .. kind .. "_helmet", 0,
+                                   "@xrr_give_psi_helmet:" .. kind)
+    end
+
+    -- Yantar — psi helmet quests.
+    dialogs_yantar.give_player_bad_psi_helmet = function(a, b)
+        if db.actor:object("bad_psy_helmet") then return end
+        if a then dialogs.relocate_money_from_actor(a, b, 10000) end
+        alife_create_item("bad_psy_helmet", db.actor)
+        news_manager.relocate_item(db.actor, "in", "bad_psy_helmet")
+        task_manager.get_task_manager():give_task("turn_off_brain_scorcher")
+        share_psi_helmet("bad")
+        if not XrrIsHost() and a then
+            local host_id = xrr_pending_npc_lock_host_id()
+            if host_id and host_id > 0 then
+                self_bought.bad = true
+                XrrAlife():SendQuestAccept("__yan_bad_helmet", host_id)
+            end
+        end
+    end
+
+    dialogs_yantar.give_player_good_psi_helmet = function(a, b)
+        if db.actor:object("good_psy_helmet") then return end
+        alife_create_item("good_psy_helmet", db.actor)
+        news_manager.relocate_item(db.actor, "in", "good_psy_helmet")
+        local tm_ = task_manager.get_task_manager()
+        if tm_.task_info and tm_.task_info["yan_stalker_sakharov_psi_helmet_upgrade"] then
+            tm_:set_task_completed("yan_stalker_sakharov_psi_helmet_upgrade")
+        end
+        tm_:give_task("turn_off_brain_machine")
+        tm_:give_task("turn_off_brain_scorcher")
+        share_psi_helmet("good")
+        if not XrrIsHost() and a then
+            local host_id = xrr_pending_npc_lock_host_id()
+            if host_id and host_id > 0 then
+                self_bought.good = true
+                XrrAlife():SendQuestAccept("__yan_good_helmet", host_id)
+            end
+        end
+    end
+
+    -- MLR — ball artefact spawn is host-only.
+    dialogs_mlr.give_task_fanat_training_2 = function(first_speaker, second_speaker)
+        if not XrrIsHost() then
+            local host_id = xrr_pending_npc_lock_host_id()
+            if host_id and host_id > 0 then
+                XrrAlife():SendQuestAccept("__mlr_fanat_training_2", host_id)
+            end
+            return
+        end
+        task_manager.get_task_manager():give_task("task_fanat_training_2")
+        local sim = alife()
+        for i = 1, 65534 do
+            local se_obj = sim:object(i)
+            if se_obj and se_obj:name() == "secret_fanat" then
+                alife_create_item("af_ball", se_obj)
+                break
+            end
+        end
+    end
+
+    -- Replaces xrr_patch_task_guards' override too, dropping its synced-target check.
+    task_functor.yan_ecolog_semenov_task_target_1 = function(task_id, field, p, tsk)
+        if not (db.actor and tsk) then return end
+        if not XrrIsHost() then return tsk.current_target end
+        local squad = get_story_squad("yan_ecolog_semenov_squad")
+        if squad and (tsk.stage >= 1 or squad.dist_to_actor and squad.dist_to_actor > 50) then
+            return squad.id
+        end
+    end
+
+    -- A nil speaker means the host's copy is free — the peer already paid.
+    _G.xrr_story_quest_handlers["__yan_bad_helmet"] = function(npc_host_id)
+        dialogs_yantar.give_player_bad_psi_helmet(nil, nil)
+    end
+    _G.xrr_story_quest_handlers["__yan_good_helmet"] = function(npc_host_id)
+        dialogs_yantar.give_player_good_psi_helmet(nil, nil)
+    end
+    _G.xrr_story_quest_handlers["__mlr_fanat_training_2"] = function(npc_host_id)
+        dialogs_mlr.give_task_fanat_training_2(db.actor, db.actor)
+    end
+end

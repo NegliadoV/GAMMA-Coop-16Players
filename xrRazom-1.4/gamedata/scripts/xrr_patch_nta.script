@@ -1,0 +1,589 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  New Tasks - iTheon: task triggers test db.actor alone; mod spawns crash peers.
+  The Living Fire's revenge and finale each need one owner.
+]]
+
+local _applied = false
+
+-- save_state stores the table itself, so a scratch table hands back the live
+-- reference. Fetched per use: load_state swaps the table on save load.
+local function live_state(mod, key)
+    local t = {}
+    mod.save_state(t)
+    return t[key]
+end
+
+-- The mod's spawn points and area centres are upvalues of the functions that
+-- read them; extract by name rather than copying coordinates that rot.
+local function upvalue(fn, name)
+    local i = 1
+    while true do
+        local n, v = debug.getupvalue(fn, i)
+        if not n then return nil end
+        if n == name then return v, i end
+        i = i + 1
+    end
+end
+
+-- "No look direction"; must stay >= the engine's XRR_TP_NO_DIR.
+local TP_NO_DIR = 1.0e10
+
+-- TELEPORT_ALL's C++ gate picks recipients within xrr_teleport_radius of
+-- origin_obj (0 = whole level), so a far-away teammate is not dragged along.
+local function party_teleport(dest, origin_obj)
+    if not origin_obj then return end
+    if XrrIsHosted() and XrrPlayers() and get_console_cmd(1, "xrr_sync_teleport") then
+        local o = origin_obj:position()
+        XrrPlayers():SendTeleportAll(dest.x, dest.y, dest.z, TP_NO_DIR,
+                                     o.x, o.y, o.z, origin_obj:game_vertex_id())
+    elseif db.actor and origin_obj:id() == db.actor:id() then
+        nta_utils.teleport_visual()
+        db.actor:set_actor_position(dest)
+    end
+end
+
+-- Only players who entered the radius are pulled back when they leave; one who
+-- never entered is never dragged in.
+local function make_area_anchor()
+    local inside = {}
+    return {
+        tick = function(center, dest, radius)
+            local r2 = radius * radius
+            local players = xrr_patch_common.alive_players()
+            for i = 1, #players do
+                local obj = players[i]
+                if obj:position():distance_to_sqr(center) <= r2 then
+                    inside[obj:id()] = true
+                elseif inside[obj:id()] then
+                    party_teleport(dest, obj)
+                end
+            end
+        end,
+        reset = function() inside = {} end,
+    }
+end
+
+local function install_party_range_helpers()
+    local orig_air = nta_utils.actor_in_range
+    if type(orig_air) == "function" then
+        nta_utils.actor_in_range = function(vec, dist)
+            if not XrrIsHosted() then return orig_air(vec, dist) end
+            return xrr_patch_common.nearest_player_dist_sqr(vec) < dist * dist
+        end
+    else
+        log("[xrRazom] NTA: nta_utils.actor_in_range missing — wrap skipped")
+    end
+
+    local orig_eir = nta_utils.entity_in_range
+    if type(orig_eir) == "function" then
+        nta_utils.entity_in_range = function(id, dist, vec)
+            -- An explicit vec is not an actor check — original semantics.
+            if vec or not XrrIsHosted() then return orig_eir(id, dist, vec) end
+            local se_obj = alife_object(id)
+            if not se_obj then return false end
+            local npc = se_obj.commander_id and alife_object(se_obj:commander_id()) or se_obj
+            return xrr_patch_common.nearest_player_dist_sqr(npc.position) < dist * dist
+        end
+    else
+        log("[xrRazom] NTA: nta_utils.entity_in_range missing — wrap skipped")
+    end
+end
+
+-- Both transitions test db.actor inline, out of reach of the range helpers; when
+-- the original did not move the stage, re-run them with party proximity.
+local function install_house_of_horrors()
+    local hoh = tasks_house_of_horrors
+    local configs = house_of_horrors_configs
+    local fname = "house_of_horrors_task_status_functor"
+    local orig = task_status_functor and task_status_functor[fname]
+    if not (hoh and configs and type(orig) == "function") then
+        log("[xrRazom] NTA: house_of_horrors functor missing — overlay skipped")
+        return
+    end
+
+    task_status_functor[fname] = function(tsk, task_id)
+        local pre = tsk and tsk.stage
+        orig(tsk, task_id)
+        if not (XrrIsHosted() and tsk and db.actor) then return end
+        if tsk.stage ~= pre then return end
+
+        local st = live_state(hoh, "house_of_horrors_task_data")
+        local near_sqr = xrr_patch_common.nearest_player_dist_sqr
+        if tsk.stage == 0 then
+            if nta_utils.actor_on_level(nta_utils.levels.swamp)
+                and nta_utils.is_dark_night()
+                and near_sqr(configs.house_location.vector) < 25 * 25 then
+                printf("[xrRazom][nta] house_of_horrors: party trigger, stage 0 -> 1")
+                hoh.play_whispers()
+                st.hanged_man_id = nta_utils.spawn_helper(configs.hanged_man_location)
+                tsk.stage = 1
+            end
+        elseif tsk.stage == 1 then
+            if near_sqr(configs.hanged_man_location.vector) < 3 * 3 then
+                printf("[xrRazom][nta] house_of_horrors: party trigger, stage 1 -> 2")
+                hoh.explode_hanged_man()
+                hoh.play_screams()
+                st.board_id = nta_utils.spawn_helper(configs.board_location)
+                st.zombie_id = nta_utils.spawn_helper(configs.zombie_location)
+                nta_utils.spawn_helper(configs.dog_location)
+                tsk.stage = 2
+            end
+        end
+    end
+end
+
+-- No Step Back / Hold the Ground: any player arms the wave trigger, and the
+-- defense holds while any player is still on the battleground.
+local function install_defense(s)
+    local mod = s.mod
+    local orig = task_status_functor and task_status_functor[s.fname]
+    if not (mod and type(orig) == "function") then
+        log("[xrRazom] NTA: " .. s.fname .. " missing — skipped")
+        return
+    end
+    local spawn_points = upvalue(orig, "spawn_points")
+    local middle       = upvalue(orig, "middle_of_battleground")
+    local zone_name    = s.zone_upv and upvalue(orig, s.zone_upv)
+    local smart_name   = s.smart_upv and upvalue(orig, s.smart_upv)
+    if not (spawn_points and middle and (zone_name or smart_name)) then
+        log("[xrRazom] NTA: " .. s.fname .. " upvalues not found — skipped")
+        return
+    end
+
+    local function trigger_pos()
+        if zone_name then
+            local z = db.zone_by_name[zone_name]
+            return z and z:position()
+        end
+        local se = SIMBOARD and SIMBOARD:get_smart_by_name(smart_name)
+        local o = se and level.object_by_id(se.id)
+        return o and o:position()
+    end
+
+    task_status_functor[s.fname] = function(tsk, task_id)
+        if not XrrIsHosted() then return orig(tsk, task_id) end
+        if not (db.actor and tsk) then return end
+        local stage = tsk.stage
+        local near = xrr_patch_common.nearest_player_dist_sqr
+        local st = live_state(mod, s.mdata)
+
+        if stage == 0 then
+            local pos = trigger_pos()
+            if nta_utils.actor_on_level(s.level) and pos
+                and near(pos) < s.trig_r * s.trig_r then
+                printf("[xrRazom][nta] %s: party trigger, stage 0 -> 1", s.fname)
+                mod.spawn(s.spawn_idx[1], spawn_points[s.spawn_idx[1]])
+                mod.spawn(s.spawn_idx[2], spawn_points[s.spawn_idx[2]])
+                xrr_with_news_broadcast(dynamic_news_helper.send_tip, game.translate_string(s.tip_start),
+                    game.translate_string(s.tip_name), nil, nil, s.tip_icon, nil, 'npc')
+                tsk.stage = 1
+            end
+        end
+
+        if stage == 1 then
+            if not nta_utils.actor_on_level(s.level)
+                or near(middle) > s.hold_r * s.hold_r then return 'fail' end
+            if st and st.killed_squads == 10 then
+                CreateTimeEvent(0, s.tip_done, 2, function()
+                    xrr_with_news_broadcast(dynamic_news_helper.send_tip, game.translate_string(s.tip_done),
+                        game.translate_string(s.tip_name), nil, nil, s.tip_icon, nil, 'npc')
+                    return true
+                end)
+                tsk.stage = 2
+            end
+        end
+    end
+end
+
+local function install_defense_twins()
+    install_defense({
+        mod = tasks_no_step_back, fname = "no_step_back_task_status_functor",
+        mdata = "no_step_back_task_data", level = nta_utils.levels.limansk,
+        trig_r = 5, hold_r = 91, spawn_idx = { 1, 2 },
+        zone_upv  = "limansk_house_before_bridge",
+        tip_start = 'no_step_back_on_position_message',
+        tip_done  = 'no_step_back_defended_position_message',
+        tip_name  = "cit_killers_merc_trader_stalker_name",
+        tip_icon  = 'ui_inGame2_merc_trade',
+    })
+    install_defense({
+        mod = tasks_hold_the_ground, fname = "hold_the_ground_task_status_functor",
+        mdata = "hold_the_ground_task_data", level = nta_utils.levels.garbage,
+        trig_r = 15, hold_r = 200, spawn_idx = { 1, 3 },
+        smart_upv = "flea_market",
+        tip_start = 'hold_the_ground_on_position_message',
+        tip_done  = 'hold_the_ground_defended_position_message',
+        tip_name  = "bar_petrenko_name",
+        tip_icon  = 'ui_inGame2_petrenko',
+    })
+end
+
+-- Only the tunnel trigger tests db.actor; the kill tracking is host-correct.
+local function install_big_game()
+    local mod = tasks_big_game
+    local fname = "big_game_task_status_functor"
+    local orig = task_status_functor and task_status_functor[fname]
+    if not (mod and big_game_configs and type(orig) == "function") then
+        log("[xrRazom] NTA: big_game functor missing — skipped")
+        return
+    end
+    local smart_name = upvalue(orig, "tunnel_smart_terrain")
+    if not smart_name then
+        log("[xrRazom] NTA: big_game upvalues not found — skipped")
+        return
+    end
+
+    task_status_functor[fname] = function(tsk, task_id)
+        local pre = tsk and tsk.stage
+        local ret = orig(tsk, task_id)
+        if not (XrrIsHosted() and tsk and db.actor) then return ret end
+        if pre == 0 and tsk.stage == 0 then
+            local smart = SIMBOARD and SIMBOARD.smarts_by_names[smart_name]
+            if smart and nta_utils.actor_on_level(nta_utils.levels.jupiter)
+                and xrr_patch_common.nearest_player_dist_sqr(smart.position) < 35 * 35 then
+                printf("[xrRazom][nta] big_game: party trigger, stage 0 -> 1")
+                local st = live_state(mod, "big_game_task_data")
+                nta_utils.mass_spawn_helper(big_game_configs.small_giants_spots, st.small_giants_ids)
+                tsk.stage = 1
+            end
+        end
+        return ret
+    end
+end
+
+-- The mod teleports db.actor, so a peer's trigger would yank the host. The kidnap
+-- targets the artifact's holder by parent_id: actor_on_item_take fires only locally.
+local function install_baba_yaga()
+    local mod = tasks_baba_yaga
+    local cfg = baba_yaga_configs
+    local fname = "baba_yaga_task_status_functor"
+    local orig = task_status_functor and task_status_functor[fname]
+    if not (mod and cfg and type(orig) == "function"
+            and type(mod.teleport) == "function") then
+        log("[xrRazom] NTA: baba_yaga functor missing — skipped")
+        return
+    end
+
+    -- The registered actor_on_item_take can't be swapped, but its inner
+    -- `teleport` resolves through the module table at call time — redirect that.
+    local orig_teleport = mod.teleport
+    mod.teleport = function()
+        if XrrIsHosted() and db.actor then
+            party_teleport(cfg.teleport_to_location.vector, db.actor)
+        else
+            orig_teleport()
+        end
+    end
+
+    local anchor = make_area_anchor()
+    local HUT_R = 35
+
+    task_status_functor[fname] = function(tsk, task_id)
+        if not XrrIsHosted() then return orig(tsk, task_id) end
+        if not (db.actor and tsk) then return end
+        local stage = tsk.stage
+        local near = xrr_patch_common.nearest_player_dist_sqr
+        local st = live_state(mod, "baba_yaga_task_data")
+        if not st then return end
+
+        if stage == 0 then
+            anchor.reset()
+            if nta_utils.actor_on_level(nta_utils.levels.garbage)
+                and near(cfg.art_location.vector) < 25 * 25
+                and nta_utils.is_dark_night() then
+                printf("[xrRazom][nta] baba_yaga: party trigger, stage 0 -> 1")
+                cfg.art_location.section = cfg.art_sections[math.random(#cfg.art_sections)]
+                st.art_id = nta_utils.spawn_helper(cfg.art_location)
+                tsk.stage = 1
+            end
+        end
+
+        if stage == 1 then
+            if not st.was_teleported then
+                local origin = xrr_patch_common.player_holding(st.art_id)
+                if not origin and near(cfg.art_location.vector) > 50 * 50 then
+                    origin = xrr_patch_common.nearest_player_obj(cfg.art_location.vector)
+                end
+                if origin then
+                    printf("[xrRazom][nta] baba_yaga: kidnap, origin id=%s", tostring(origin:id()))
+                    st.was_teleported = true
+                    party_teleport(cfg.teleport_to_location.vector, origin)
+                    mod.spawn()
+                    tsk.stage = 2
+                end
+            end
+            if st.hag_id then tsk.stage = 2 end
+        end
+
+        if stage == 2 then
+            anchor.tick(cfg.teleport_to_location.vector, cfg.teleport_to_location.vector, HUT_R)
+            if not st.hag_id then tsk.stage = 3 end
+        end
+    end
+end
+
+-- Same db.actor teleports as Baba Yaga. The mod's own explosion loop stays inert
+-- (its explosion_planned is never set); ours targets the player nearest the arena.
+local function install_mirage()
+    local mod = tasks_mirage
+    local cfg = mirage_configs
+    local fname = "mirage_task_status_functor"
+    local orig = task_status_functor and task_status_functor[fname]
+    if not (mod and cfg and type(orig) == "function"
+            and type(mod.teleport) == "function") then
+        log("[xrRazom] NTA: mirage functor missing — skipped")
+        return
+    end
+    local iron_forest = upvalue(mod.teleport, "iron_forest_smart")
+    if not iron_forest then
+        log("[xrRazom] NTA: mirage upvalues not found — skipped")
+        return
+    end
+
+    local function arena_dest()
+        local se = SIMBOARD and SIMBOARD:get_smart_by_name(iron_forest)
+        return se and se.position
+    end
+
+    local anchor = make_area_anchor()
+    -- Not persisted, like the mod's explosion_loop_started: a reload restarts the loop.
+    local expl_started = false
+    local expl_particles, expl_sound
+    local expl_i = 0
+
+    local function start_explosions()
+        local target = xrr_patch_common.nearest_player_obj(cfg.teleport_activator_center_point)
+            or db.actor
+        if not target then return end
+        local pos  = vector():set(target:position())
+        local lvid = target:level_vertex_id()
+        local gvid = target:game_vertex_id()
+        expl_particles = expl_particles or particles_object("anomaly2\\bold_idle")
+        expl_sound = expl_sound or xr_sound.get_safe_sound_object("anomaly\\gravi_rumble1")
+        expl_particles:play_at_pos(pos)
+        expl_sound:play_at_pos(db.actor, pos)
+        expl_i = expl_i + 1
+        CreateTimeEvent(0, "xrr_mirage_explosion_" .. expl_i, 6, function()
+            expl_particles:stop()
+            expl_sound:stop()
+            nta_utils.spawn_at_position("immediate_anomaly_explosion", pos, lvid, gvid, false)
+            local s = live_state(mod, "mirage_task_data")
+            if s and #s.enemy_ids ~= 0 then start_explosions() end
+            return true
+        end)
+    end
+
+    task_status_functor[fname] = function(tsk, task_id)
+        if not XrrIsHosted() then return orig(tsk, task_id) end
+        if not (db.actor and tsk) then return end
+        local stage = tsk.stage
+        local near = xrr_patch_common.nearest_player_dist_sqr
+        local st = live_state(mod, "mirage_task_data")
+        if not st then return end
+
+        if stage == 0 then
+            anchor.reset()
+            if nta_utils.actor_on_level(nta_utils.levels.zaton)
+                and near(cfg.first_spawn_activator) < cfg.first_spawn_activation_distance ^ 2 then
+                printf("[xrRazom][nta] mirage: party trigger, stage 0 -> 1")
+                mod.spawn_mirages(cfg.first_spawn_spots)
+                tsk.stage = 1
+            end
+            -- Anti-skip: whoever reaches the second activator early is sent off.
+            if nta_utils.actor_on_level(nta_utils.levels.zaton) then
+                local dest = arena_dest()
+                local early = dest and xrr_patch_common.nearest_player_obj(cfg.second_spawn_activator)
+                if early and early:position():distance_to_sqr(cfg.second_spawn_activator)
+                        < cfg.second_spawn_activation_distance ^ 2 then
+                    party_teleport(dest, early)
+                end
+            end
+        end
+
+        if stage == 1 and near(cfg.second_spawn_activator) < cfg.second_spawn_activation_distance ^ 2 then
+            mod.spawn_mirages(cfg.second_spawn_spots)
+            tsk.stage = 2
+        end
+        if stage == 2 and near(cfg.third_spawn_activator) < cfg.third_spawn_activation_distance ^ 2 then
+            mod.spawn_mirages(cfg.third_spawn_spots)
+            tsk.stage = 3
+        end
+        if stage == 3 and near(cfg.sidor_spawn_activator) < cfg.sidor_spawn_activation_distance ^ 2 then
+            mod.spawn_sidor(tsk)
+            tsk.stage = 4
+        end
+        if stage == 5 and #st.enemy_ids == 0 then
+            mod.spawn_burer()
+            tsk.stage = 6
+        end
+        if stage == 6 then
+            if not expl_started then
+                expl_started = true
+                start_explosions()
+            end
+            if #st.enemy_ids == 0 then tsk.stage = 7 end
+        end
+
+        if stage > 0 and stage < 4 then
+            mod.update_mirages_visual()
+            mod.give_mirages_weapon()
+        end
+        if stage > 0 and stage < 7 then
+            local dest = arena_dest()
+            if dest then
+                anchor.tick(cfg.teleport_activator_center_point, dest, cfg.teleport_activation_distance)
+            end
+        end
+    end
+end
+
+-- The stash functor advances only when db.actor holds the quest item; any
+-- player holding it counts here.
+local function install_stash_tasks()
+    local mod = tasks_nta_stash
+    local fname = "nta_stash_task_status_functor"
+    local orig = task_status_functor and task_status_functor[fname]
+    if not (mod and type(orig) == "function") then
+        log("[xrRazom] NTA: " .. fname .. " missing — skipped")
+        return
+    end
+
+    task_status_functor[fname] = function(tsk, task_id)
+        local ret = orig(tsk, task_id)
+        if not (XrrIsHosted() and tsk and tsk.stage == 0) then return ret end
+        local st = live_state(mod, "nta_stash_task_data")
+        local entry = st and st[task_id]
+        if entry and xrr_patch_common.player_holding(entry.target_id) then
+            printf("[xrRazom][nta] stash task %s: item held by a player, stage 0 -> 1", task_id)
+            tsk.stage = 1
+        end
+        return ret
+    end
+end
+
+-- The mod's spawn choke point: spawn_helper and mass_spawn_helper call it bare,
+-- so it resolves through the module table. Peer mirrors run [death] effects and
+-- before-hit too, and alife_create returns nil there.
+local function install_peer_spawn_guard()
+    local orig = nta_utils.spawn_at_position
+    if type(orig) ~= "function" then
+        log("[xrRazom] NTA: nta_utils.spawn_at_position missing — peer guard skipped")
+        return
+    end
+    nta_utils.spawn_at_position = function(...)
+        if XrrIsClient() then return nil end
+        return orig(...)
+    end
+end
+
+local PROMETHEUS_SID = "the_living_fire_prometheus"
+
+local function install_living_fire()
+    local mod = tasks_the_living_fire
+    local orig_hit  = mod and mod.npc_on_before_hit
+    local orig_kill = mod and mod.prometheus_kill_actor
+    if not (type(orig_hit) == "function" and type(orig_kill) == "function") then
+        log("[xrRazom] NTA: the_living_fire hooks missing — skipped")
+        return
+    end
+    local _, latch_i = upvalue(orig_hit, "hit_already")
+    if not latch_i then
+        log("[xrRazom] NTA: the_living_fire hit_already not found — latch not cleared")
+    end
+
+    -- The host skips a peer's revenge: its time event fires after the identity
+    -- swap ends and would burn the host. The peer skips the finale: the host owns
+    -- the release, explosions and info.
+    local function skip(shit)
+        local finale = has_alife_info("the_living_fire_endgame_finale")
+        if XrrIsClient() then return finale end
+        local who = shit.draftsman
+        if not (who and XrrPlayers():IsPlayerDummy(who:id())) then return false end
+        if not finale then return true end
+        if level.object_by_id(shit.weapon_id) then return false end
+        printf("![xrRazom][nta] living fire: peer weapon %s unresolved", tostring(shit.weapon_id))
+        return true
+    end
+
+    local function wrapped(npc, shit, bone_id)
+        if npc:id() ~= get_story_object_id(PROMETHEUS_SID) then return end
+        if skip(shit) then
+            -- What the mod does to every hit on him before branching; the heal
+            -- undoes damage an earlier listener applied by script.
+            shit.power = 0
+            npc:set_health_ex(1)
+            return
+        end
+        return orig_hit(npc, shit, bone_id)
+    end
+    -- The registry keys on the function value; the module write covers a later
+    -- registration by the mod itself.
+    mod.npc_on_before_hit = wrapped
+    UnregisterScriptCallback("npc_on_before_hit", orig_hit)
+    RegisterScriptCallback("npc_on_before_hit", wrapped)
+
+    -- The mod's sequence with a real death: set_health_ex(0) only downs a player
+    -- in a session. Not every death rebuilds the VM, so the latch is cleared here.
+    mod.prometheus_kill_actor = function()
+        if not (XrrIsHosted() or XrrIsConnected()) then return orig_kill() end
+        nta_utils.spawn_attached_sound([[characters_voice\human\greh_1\fight\attack\attack_4]])
+        CreateTimeEvent(0, "the_living_fire_prometheus_revenge", 2, function()
+            local cfg = nta_utils.obj_position_to_spawn_config_partial(db.actor)
+            cfg.section, cfg.is_anomaly = "zone_zhar", true
+            cfg.vector.y = cfg.vector.y - 1
+            nta_utils.spawn_helper(cfg)
+            nta_utils.spawn_attached_sound([[new_tasks_addon\zhar_blow]])
+            CreateTimeEvent(0, "the_living_fire_prometheus_revenge_player_death", 0.2, function()
+                db.actor:kill(db.actor)
+                if latch_i then debug.setupvalue(orig_hit, latch_i, false) end
+                return true
+            end)
+            return true
+        end)
+    end
+end
+
+local QUAKE_CAM_ID = 3   -- nta_utils' earthquake_cam_eff
+
+-- Only the host's task functor runs the quake. The mod removes its looped shake
+-- after 6 s on a timer of its own, which the relay has to mirror.
+local function install_living_fire_quake()
+    local mod = tasks_the_living_fire
+    local orig = mod and mod.earthquake_effect
+    if type(orig) ~= "function" then
+        log("[xrRazom] NTA: the_living_fire earthquake_effect missing — relay skipped")
+        return
+    end
+    mod.earthquake_effect = function(...)
+        orig(...)
+        if not XrrIsHosted() then return end
+        local fx = xrr_patch_effects
+        fx.relay_sound([[new_tasks_addon\blowout_boom_02_old]])
+        fx.relay_sound([[new_tasks_addon\earthquake_old]])
+        fx.relay_cam([[camera_effects\earthquake.anm]], QUAKE_CAM_ID, true)
+        CreateTimeEvent(0, "xrr_nta_quake_stop", 6, function()
+            fx.relay_stop_cam(QUAKE_CAM_ID)
+            return true
+        end)
+    end
+end
+
+function on_game_start()
+    if _applied then return end
+    if not nta_utils then return end   -- mod not installed
+    _applied = true
+    install_party_range_helpers()
+    install_house_of_horrors()
+    install_defense_twins()
+    install_big_game()
+    install_baba_yaga()
+    install_mirage()
+    install_stash_tasks()
+    install_peer_spawn_guard()
+    install_living_fire()
+    install_living_fire_quake()
+    log("[xrRazom] NTA (New Tasks - iTheon): party-aware task patches installed")
+end

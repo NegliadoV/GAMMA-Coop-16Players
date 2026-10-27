@@ -1,0 +1,142 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Quest-state (de)serialization for the QUEST_LIST_REQUEST/RESPONSE payload.
+]]
+
+-- Pstor variable collection
+
+function collect_task_variables(task_id, out)
+    if not (task_id and db.actor) then return end
+    local actor_st = db.storage[db.actor:id()]
+    if actor_st and actor_st.pstor then
+        for var_name, val in pairs(actor_st.pstor) do
+            if string.find(tostring(var_name), "^" .. task_id) then
+                local mtype = type(val)
+                if mtype ~= "function" and mtype ~= "userdata" then
+                    out[var_name] = val
+                end
+            end
+        end
+    end
+    local sec = utils_data.load_var(db.actor, task_id .. "_fetch")
+    if sec then
+        out[task_id .. "_fetch"]       = sec
+        out[task_id .. "_fetch_count"] = utils_data.load_var(db.actor, task_id .. "_fetch_count")
+    end
+    local task_data = utils_data.load_var(db.actor, task_id)
+    if task_data and type(task_data) == "table" then
+        local target_id = tonumber(task_data.target_id or task_data.item_2_id
+                                   or task_data.squad_id or "65535")
+        local se_obj = target_id and target_id ~= 65535 and alife_object(target_id)
+        if se_obj then
+            task_data.target_position = { se_obj.position.x, se_obj.position.y, se_obj.position.z }
+        end
+        out[task_id] = task_data
+    end
+end
+
+-- Var blob (line-oriented TSV)
+
+function serialize_quest_vars(vars)
+    if not vars or not next(vars) then return "" end
+    local parts = {}
+    for k, v in pairs(vars) do
+        local t = type(v)
+        if t == "string" then
+            parts[#parts + 1] = tostring(k) .. "\ts\t" .. v
+        elseif t == "number" then
+            parts[#parts + 1] = tostring(k) .. "\tn\t" .. tostring(v)
+        elseif t == "boolean" then
+            parts[#parts + 1] = tostring(k) .. "\tb\t" .. (v and "1" or "0")
+        elseif t == "table" then
+            local ok, js = pcall(utils_data.write_to_ini_str, v)
+            if ok and js then
+                parts[#parts + 1] = tostring(k) .. "\tt\t" .. js
+            end
+        end
+    end
+    return table.concat(parts, "\n")
+end
+
+function deserialize_quest_vars(blob)
+    if not blob or blob == "" then return end
+    for line in blob:gmatch("[^\n]+") do
+        local key, vtype, val = line:match("^(.+)\t(.)\t(.*)$")
+        if key and vtype then
+            if vtype == "s" then
+                utils_data.save_var(db.actor, key, val)
+            elseif vtype == "n" then
+                utils_data.save_var(db.actor, key, tonumber(val))
+            elseif vtype == "b" then
+                utils_data.save_var(db.actor, key, val == "1")
+            elseif vtype == "t" then
+                local ok, tbl = pcall(utils_data.read_from_ini_str, val)
+                if ok and tbl and type(tbl) == "table" then
+                    -- Ids in the table are shared host ids — no translation.
+                    utils_data.save_var(db.actor, key, tbl)
+                end
+            end
+        end
+    end
+end
+
+-- Offer-message blob (host-rendered iconed task previews)
+-- Tab/newline-separated: translated UI strings carry a literal "\n", never a real one.
+
+function serialize_quest_msgs(msgs)
+    if not msgs or not next(msgs) then return "" end
+    local parts = {}
+    for tid, m in pairs(msgs) do
+        parts[#parts + 1] = table.concat({
+            tostring(tid), m.caption or "", m.text or "", m.icon or "", m.templ or ""
+        }, "\t")
+    end
+    return table.concat(parts, "\n")
+end
+
+function deserialize_quest_msgs(blob)
+    local out = {}
+    if not blob or blob == "" then return out end
+    for line in blob:gmatch("[^\n]+") do
+        local tid, caption, text, icon, templ =
+            line:match("^([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t(.*)$")
+        if tid and tid ~= "" then
+            out[tid] = {
+                caption = caption,
+                text    = text,
+                icon    = icon,
+                templ   = (templ ~= "" and templ) or "iconed_answer_item",
+            }
+        end
+    end
+    return out
+end
+
+-- Combined quest data blob
+-- \3 (ETX) separates sections since var/message text may contain "|".
+function serialize_quest_data(available, ongoing, vars, msgs)
+    return table.concat({
+        table.concat(available or {}, ","),
+        table.concat(ongoing or {}, ","),
+        serialize_quest_vars(vars),
+        serialize_quest_msgs(msgs),
+    }, "\3")
+end
+
+function deserialize_quest_data(blob)
+    if not blob or blob == "" then return {}, {}, "", {} end
+    -- avail / ongoing / var_blob carry no \3; msg_blob is the greedy tail.
+    local a_str, o_str, v_str, m_str = blob:match("^([^\3]*)\3([^\3]*)\3([^\3]*)\3(.*)$")
+    if not a_str then return {}, {}, "", {} end
+    local available = {}
+    if a_str ~= "" then
+        for id in a_str:gmatch("[^,]+") do available[#available + 1] = id end
+    end
+    local ongoing = {}
+    if o_str ~= "" then
+        for id in o_str:gmatch("[^,]+") do ongoing[#ongoing + 1] = id end
+    end
+    return available, ongoing, v_str or "", deserialize_quest_msgs(m_str or "")
+end

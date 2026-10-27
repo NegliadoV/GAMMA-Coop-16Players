@@ -1,0 +1,289 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+
+  Anomaly Magazines Redux: container verbs the peer's alife gate refuses run on the host,
+  and so does Interaction Dot Marks' eject from a weapon on the ground.
+]]
+
+local VERB_EJECT        = "mags:eject"
+local VERB_UNLOAD       = "mags:unload"
+local VERB_DROP         = "mags:drop"
+local VERB_EJECT_GROUND = "mags:eject_ground"
+
+local _applied = false
+
+local _orig_eject, _orig_unload_ammo, _orig_fast_unload, _orig_fast_load, _orig_drag
+local _orig_ground_eject
+
+local function container_of(obj)
+	local p = obj and obj:parent()
+	if not p or p:id() == AC_ID then return nil end
+	return p
+end
+
+-- 0 = inventory box, 1 = corpse; nil (live NPC, avatar, host actor) is refused.
+local function container_kind(cont)
+	if not cont or cont:id() == AC_ID then return nil end
+	if IsInvbox(cont) then return 0 end
+	if (IsStalker(cont) or IsMonster(cont)) and not cont:alive() then return 1 end
+	return nil
+end
+
+local function host_refuse(verb, why, id)
+	printe("![xrRazom][mags] %s: %s (%s) — refused", verb, why, tostring(id))
+end
+
+local function host_resolve(obj_id, verb)
+	local obj = obj_id and level.object_by_id(obj_id)
+	if not obj then
+		host_refuse(verb, "item not live host-side", obj_id)
+		return nil
+	end
+	local cont = container_of(obj)
+	local kind = container_kind(cont)
+	if not kind then
+		host_refuse(verb, "item is not inside a box or corpse", obj_id)
+		return nil
+	end
+	return obj, cont, kind
+end
+
+local function host_settle(cont, kind)
+	XrrWorld():BroadcastContainerContents(cont:id(), kind)
+end
+
+-- The mod writes an ejected magazine's rounds from a 0-delay time event, but the
+-- magazine's creation reaches the peers before it fires; run it inline instead.
+local function with_eject_timer_inline(fn, ...)
+	local orig_cte = magazines.create_time_event
+	magazines.create_time_event = function(ev, act, delay, f, ...)
+		if f == magazines.timer_eject_magazine then return f(...) end
+		return orig_cte(ev, act, delay, f, ...)
+	end
+	local ok, err = pcall(fn, ...)
+	magazines.create_time_event = orig_cte
+	if not ok then error(err, 0) end
+end
+
+local function host_eject(obj_id)
+	local wpn, cont, kind = host_resolve(obj_id, VERB_EJECT)
+	if not wpn then return end
+	with_eject_timer_inline(_orig_eject, wpn)
+	host_settle(cont, kind)
+end
+
+-- Not the func_unload_ammo dispatcher: its per-round fallback spawns onto db.actor,
+-- the HOST's pockets.
+local function host_unload(obj_id)
+	local mag, cont, kind = host_resolve(obj_id, VERB_UNLOAD)
+	if not mag then return end
+	-- A weapon also carries loaded rounds; unloading one would empty it without
+	-- ejecting its magazine.
+	if not magazine_binder.is_magazine(mag) then
+		host_refuse(VERB_UNLOAD, "not a magazine", obj_id)
+		return
+	end
+	local data = magazine_binder.get_data(mag:id())
+	if not (type(data) == "table" and data.loaded and #data.loaded > 0) then
+		host_refuse(VERB_UNLOAD, "magazine is empty host-side", obj_id)
+		return
+	end
+	_orig_fast_unload(mag)
+	host_settle(cont, kind)
+end
+
+-- One verb for the whole drag-drop family; the mod's dispatcher decides which it was.
+local function host_drag(item_id, state, args)
+	local item, cont, kind = host_resolve(item_id, VERB_DROP)
+	if not item then return end
+
+	-- Without this a peer could name the HOST's equipped weapon as the target.
+	local target = tonumber(args) and level.object_by_id(tonumber(args))
+	if not (target and target:parent() and target:parent():id() == cont:id()) then
+		host_refuse(VERB_DROP, "drop target is not in the same container", args)
+		return
+	end
+
+	-- The dispatcher opens with do_interrupt(), which would cancel the host's own reload.
+	if magazines.action_in_progress() then
+		host_refuse(VERB_DROP, "host is mid-action", item_id)
+		return
+	end
+
+	-- A corpse selects the slow ammo→magazine variant, a multi-second loop gated on
+	-- the HOST's movement and keys; take the atomic path instead.
+	if IsAmmo(item) and magazine_binder.is_magazine(target) then
+		local caliber  = magazine_binder.get_magazine_caliber(target)
+		local accepted = caliber and invert_table(caliber) or {}
+		if not accepted[item:section()] then
+			host_refuse(VERB_DROP, "ammo does not fit that magazine", item_id)
+			return
+		end
+		_orig_fast_load(target, item)
+	else
+		_orig_drag(item, target, EDDListType.iDeadBodyBag, EDDListType.iDeadBodyBag)
+	end
+	host_settle(cont, kind)
+end
+
+-- Dot Marks mints the magazine into db.actor, which under the identity swap is
+-- the requester's avatar; the weapon's unload and its no_mag entry stay the host's.
+local function host_ground_eject(obj_id, state, args, sender)
+	local avatar = xrr_use_intent.requester_avatar(sender)
+	if not avatar then
+		host_refuse(VERB_EJECT_GROUND, "requester has no live avatar", obj_id)
+		return
+	end
+	local wpn = level.object_by_id(obj_id)
+	if not (wpn and not wpn:parent()) then
+		host_refuse(VERB_EJECT_GROUND, "weapon is not on the ground host-side", obj_id)
+		return
+	end
+	local ok, err = pcall(with_eject_timer_inline, XrrPlayerIdentityCall, avatar,
+		_orig_ground_eject, obj_id)
+	if not ok then
+		printe("![xrRazom][mags] %s %s failed: %s", VERB_EJECT_GROUND, tostring(obj_id), tostring(err))
+		return
+	end
+	-- Every peer's copy of the weapon still holds the magazine in its rider.
+	XrrWorld():MarkSeObjectDirty(obj_id)
+end
+
+local function peer_eject(weapon)
+	if not (XrrIsClient() and container_of(weapon)) then return _orig_eject(weapon) end
+	xrr_use_intent.request{ verb = VERB_EJECT, obj_id = weapon:id(), state = 1 }
+end
+
+-- Corpses too, not just boxes: there the per-round path succeeds locally and pays
+-- the peer for a magazine the HOST owns.
+local function peer_unload_ammo(obj)
+	if not (XrrIsClient() and container_of(obj)) then return _orig_unload_ammo(obj) end
+	xrr_use_intent.request{ verb = VERB_UNLOAD, obj_id = obj:id(), state = 1 }
+end
+
+-- Both slots in the loot panel is the mod's container branch, the only one that
+-- touches host-owned entities; actor-side drags stay local.
+local function peer_drag_drop(item, weapon, from_slot, to_slot)
+	if XrrIsClient() and item and weapon
+		and from_slot == EDDListType.iDeadBodyBag
+		and to_slot   == EDDListType.iDeadBodyBag then
+		xrr_use_intent.request{
+			verb   = VERB_DROP,
+			obj_id = item:id(),
+			state  = 1,
+			args   = tostring(weapon:id()),
+		}
+		return
+	end
+	return _orig_drag(item, weapon, from_slot, to_slot)
+end
+
+-- A copy of the eject body, not a call into it, so peer_eject never sees it.
+local function ground_eject(id)
+	local wpn = id and level.object_by_id(id)
+	local on_ground = wpn and not wpn:parent()
+	if on_ground and XrrIsClient() then
+		xrr_use_intent.request{ verb = VERB_EJECT_GROUND, obj_id = id, state = 1 }
+		return
+	end
+	local mag_id = _orig_ground_eject(id)
+	-- A peer picking the weapon up keeps its own copy's rider, magazine included.
+	if on_ground and XrrIsHosted() then XrrWorld():MarkSeObjectDirty(id) end
+	return mag_id
+end
+
+-- The mod grants these from new_game_equippment, which a peer never runs;
+-- under the identity swap they mint into the avatar.
+local function host_starter_mags(avatar_id)
+	local avatar = level.object_by_id(avatar_id)
+	if not (avatar and mags_patches and mags_patches.default_mags) then return end
+	local ok, err = pcall(XrrPlayerIdentityCall, avatar, mags_patches.default_mags)
+	if not ok then
+		printe("![xrRazom][mags] starter mags for avatar %s failed: %s", tostring(avatar_id), tostring(err))
+	end
+end
+
+-- The loadout names magazines by id, which a rejoin keeps only when the gear
+-- restore re-adopts the item. Not at load_state: a transition's fires before the
+-- engine has loaded any object. The mod aliases these very tables.
+local function peer_check_loadout()
+	if not XrrIsConnected() then return end
+	local m_data = alife_storage_manager.get_state()
+	local carried = m_data.carried_mags
+	if type(carried) ~= "table" then return end
+	local storage = m_data.mags_storage
+	for id in pairs(carried) do
+		local se = alife_object(id)
+		if not (se and se.parent_id == 0 and magazine_binder.is_magazine(se:section_name())) then
+			carried[id] = nil
+		elseif type(storage) == "table" and storage[id] then
+			-- The rider's entry is current; the blob's copy is as old as its last send.
+			carried[id] = storage[id]
+		end
+	end
+end
+
+local function install()
+	_orig_eject       = magazines.eject_magazine
+	_orig_unload_ammo = magazines.func_unload_ammo
+	_orig_fast_unload = magazines.fast_unload_magazine
+	_orig_fast_load   = magazines.fast_load_magazine
+	_orig_drag        = magazines.on_item_drag_dropped
+
+	xrr_use_intent.register(VERB_EJECT, function(id) host_eject(id) end)
+	if _orig_fast_unload then
+		xrr_use_intent.register(VERB_UNLOAD, function(id) host_unload(id) end)
+	end
+	if _orig_drag and _orig_fast_load then
+		xrr_use_intent.register(VERB_DROP, host_drag)
+	end
+
+	-- The RMB functor and mags_patches hold eject_magazine by VALUE, so each is replaced.
+	magazines.eject_magazine = peer_eject
+	if mags_patches then mags_patches.eject = peer_eject end
+	custom_functor_autoinject.add_functor("mags_load",
+		magazines.check_eject_magazine, magazines.check_eject_magazine,
+		nil, peer_eject, true)
+
+	if _orig_unload_ammo and _orig_fast_unload then
+		magazines.func_unload_ammo = peer_unload_ammo
+	end
+
+	if ui_hud_dotmarks and ui_hud_dotmarks.eject_mag_from_ground then
+		_orig_ground_eject = ui_hud_dotmarks.eject_mag_from_ground
+		xrr_use_intent.register(VERB_EJECT_GROUND, host_ground_eject)
+		ui_hud_dotmarks.eject_mag_from_ground = ground_eject
+	end
+
+	-- Mags Reloaded's tooltip logs through print_err, which mags_patches never
+	-- imports, so its missing-data recovery crashed instead of recovering.
+	if mags_patches and mags_patches.print_err == nil and magazines.print_err then
+		mags_patches.print_err = magazines.print_err
+	end
+
+	-- set_data is the mod's own setter: it re-aliases carried_mags[id] when the
+	-- magazine is in the vest, and a nil is what the mod itself passes on delete.
+	xrr_item_mdata.declare("mags_storage", {
+		apply = function(id, v) magazine_binder.set_data(id, v) end,
+	})
+	xrr_peer_mdata.register("carried_mags")
+end
+
+function on_game_start()
+	if not (magazines and magazine_binder and custom_functor_autoinject
+		and magazines.eject_magazine and magazine_binder.set_data) then return end
+
+	if not _applied then
+		_applied = true
+		install()
+	end
+
+	-- Every game start: the mod re-registers its handler each load while the
+	-- registry (keyed on the function object) survives.
+	if _orig_drag then
+		UnregisterScriptCallback("ActorMenu_on_item_drag_drop", _orig_drag)
+		RegisterScriptCallback("ActorMenu_on_item_drag_drop", peer_drag_drop)
+	end
+	RegisterScriptCallback("xrr_on_peer_new_character", host_starter_mags)
+	RegisterScriptCallback("actor_on_first_update", peer_check_loadout)
+end

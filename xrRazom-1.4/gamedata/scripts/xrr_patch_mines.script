@@ -1,0 +1,123 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  txr_mines: planted explosives are host-authoritative. A peer's plant_bomb
+  forwards to the host, and peers see the blast through the world-item channel.
+]]
+
+local FUSE_TIME       = 5
+local MIN_FORGET_TIME = 60 * 10
+local MAX_FORGET_TIME = 60 * 30
+
+local EXPLOSIVE_SECTION_LOOKUP = {
+    mine_new    = "mine_new_blow",
+    ied_rpg_new = "rpg_new_blow",
+    ied_new     = "ied_new_blow",
+}
+
+local FX_BY_SECTION = {
+    mine_new    = "mine",
+    ied_rpg_new = "ied_rpg",
+    ied_new     = "ied",
+}
+
+local function tss()
+    return game.get_game_time():diffSec(level.get_start_time())
+end
+
+local function host_create_planted_mine(section, mode, delay, pos, lvid, gvid)
+    local planted_section = EXPLOSIVE_SECTION_LOOKUP[section]
+    if not planted_section then
+        printe("![xrRazom][mines] unknown source section [%s]", tostring(section))
+        return
+    end
+
+    local se = alife_create(planted_section, pos, lvid, gvid)
+    if not se then return end
+
+    local time_factor = level.get_time_factor()
+    local now         = tss()
+    local exp_time    = now + (delay or FUSE_TIME) * time_factor
+
+    -- Witnesses gate faction-relation attribution on the blast.
+    local witnesses = {}
+    for i in pairs(db.OnlineStalkers) do
+        local id  = db.OnlineStalkers[i]
+        local npc = level.object_by_id(id)
+        if npc and IsStalker(npc) and npc:alive() and npc:see(db.actor) then
+            witnesses[id] = now + math.random(MIN_FORGET_TIME, MAX_FORGET_TIME) * time_factor
+        end
+    end
+
+    txr_mines._mines[se.id] = {
+        exp_time  = exp_time,
+        mode      = mode,
+        witnesses = witnesses,
+        active    = true,
+    }
+end
+
+function on_game_start()
+    if not txr_mines then
+        printe("![xrRazom][mines] txr_mines module not loaded — skipping patch")
+        return
+    end
+
+    function txr_mines.plant_bomb(obj, mode, delay)
+        local section = obj:section()
+        local sfx     = FX_BY_SECTION[section]
+        if sfx then actor_effects.play_item_fx(sfx) end
+
+        local pos  = db.actor:position()
+        local lvid = db.actor:level_vertex_id()
+        local gvid = db.actor:game_vertex_id()
+
+        -- Vanilla releases the source item before planting.
+        alife_release(obj)
+
+        if XrrIsHost() then
+            host_create_planted_mine(section, mode, delay, pos, lvid, gvid)
+        else
+            XrrWorld():SendPeerMinePlant(section, mode, delay or FUSE_TIME,
+                                         pos.x, pos.y, pos.z, lvid, gvid)
+        end
+    end
+
+    -- Vanilla looks trigger_mine up by name at call time, so a field wrap lands.
+    local vanilla_trigger_mine = txr_mines.trigger_mine
+    txr_mines.trigger_mine = function(mine_id)
+        if not XrrIsHost() then return end
+        return vanilla_trigger_mine(mine_id)
+    end
+
+    -- Vanilla mine_killer releases every world mine on the first tick after load.
+    local vanilla_mine_killer = txr_mines.mine_killer
+    if vanilla_mine_killer then
+        txr_mines.mine_killer = function()
+            if not XrrIsHost() then return end
+            return vanilla_mine_killer()
+        end
+    end
+
+    -- No update callback fires for a peer avatar; feed each one through by hand.
+    RegisterScriptCallback("actor_on_update", function()
+        if not XrrIsHost() then return end
+        if next(txr_mines._mines) == nil then return end
+        local players = XrrPlayers()
+        for i = 1, players:GetPeerCount() do
+            local id     = players:GetPeerLocalIdAt(i)
+            local avatar = id ~= 0 and level.object_by_id(id) or nil
+            if avatar then
+                txr_mines.generic_on_update(avatar)
+            end
+        end
+    end)
+end
+
+-- No Lua caller: the engine calls this on the host when a peer's plant arrives.
+function _G.OnPeerMinePlant(section, mode, delay, x, y, z, lvid, gvid)
+    if not XrrIsHost() then return end
+    if not txr_mines then return end
+    host_create_planted_mine(section, mode, delay, vector():set(x, y, z), lvid, gvid)
+end

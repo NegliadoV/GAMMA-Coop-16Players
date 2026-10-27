@@ -1,0 +1,40 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  haru_skills.creature_on_before_hit writes the LOCAL player's skill store and
+  scales melee by the local strength stat, so under xrr_patch_common's before-hit
+  identity swap a peer's melee would feed the HOST's skills. The host declines a
+  peer's hit and applies the melee factor that peer measured on its own skills.
+]]
+
+local SCALE_KEY = "haru_skills"
+
+function on_game_start()
+    local orig = haru_skills and haru_skills.creature_on_before_hit
+    if type(orig) ~= "function" then return end
+
+    local function wrapped(npc, shit, bone_id, flags)
+        local drafts = shit and shit.draftsman
+        if drafts and XrrPlayers():IsPlayerDummy(drafts:id()) then
+            shit.power = shit.power * XrrPlayers():RelayedHitScale(SCALE_KEY)
+            return
+        end
+        if not (XrrSessionActive and not XrrHosting) then
+            return orig(npc, shit, bone_id, flags)
+        end
+        local before = shit.power
+        orig(npc, shit, bone_id, flags)
+        if before > 0 and shit.power ~= before then
+            XrrPlayers():DeclareHitScale(SCALE_KEY, shit.power / before)
+        end
+    end
+
+    -- The registry keys on the function VALUE; the module-field write is inert.
+    haru_skills.creature_on_before_hit = wrapped
+    UnregisterScriptCallback("npc_on_before_hit", orig)
+    RegisterScriptCallback("npc_on_before_hit", wrapped)
+    UnregisterScriptCallback("monster_on_before_hit", orig)
+    RegisterScriptCallback("monster_on_before_hit", wrapped)
+    log("[xrRazom][skills] haru_skills: peer hits declined, their melee factor relayed")
+end

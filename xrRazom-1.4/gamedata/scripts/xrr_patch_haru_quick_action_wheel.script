@@ -1,0 +1,48 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Quick Action Wheel: the layout (m_data.haru_qaw) rides the peer m_data blob
+  whole. Magazine and equip entries name an item by id, which a rejoin keeps
+  only when the gear restore re-adopts it; an entry whose id lost its item is
+  dropped at the first update.
+]]
+
+local function held_by_actor(id, sec)
+	local se = type(id) == "number" and alife_object(id)
+	return se and se.parent_id == 0 and se:section_name() == sec
+end
+
+-- Edits the table m_data.haru_qaw.tabs points at, which the wheel's own
+-- load_state aliases. Not at load_state: a transition's fires before the engine
+-- has loaded any object, so every id would read as lost.
+local function drop_lost_entries()
+	if not XrrIsConnected() then return end
+	local qaw = alife_storage_manager.get_state().haru_qaw
+	local tm = haru_quick_action_wheel_mcm.TAB_MANAGER
+	if type(qaw) ~= "table" or type(qaw.tabs) ~= "table" or not (tm and tm.classes) then return end
+
+	local dropped = 0
+	for _, tab in pairs(qaw.tabs) do
+		if type(tab) == "table" then
+			for i = #tab, 1, -1 do
+				local item = tab[i]
+				local cls = type(item) == "table" and tm.classes[item.class]
+				if cls and cls.is_obj and not held_by_actor(item.id, item.section) then
+					if tab.__ids and item.id then tab.__ids[item.id] = nil end
+					table.remove(tab, i)
+					dropped = dropped + 1
+				end
+			end
+		end
+	end
+	if dropped > 0 then
+		printf("[xrRazom][QAW] %s wheel entries dropped: their item did not keep its id", tostring(dropped))
+	end
+end
+
+function on_game_start()
+	if not haru_quick_action_wheel_mcm then return end
+	xrr_peer_mdata.register("haru_qaw")
+	RegisterScriptCallback("actor_on_first_update", drop_lost_entries)
+end

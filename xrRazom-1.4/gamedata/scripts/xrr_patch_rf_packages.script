@@ -1,0 +1,170 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  RF Receiver Hidden Packages: the spawning half CTDs on a peer, so the host
+  spawns the package and a peer runs only the hunting half.
+]]
+
+local PACKAGE_PREFIX = "quest_tb_package_"
+local POLL_MS        = 2000
+
+local _poll_tg = 0
+
+-- Lowercase: the mixed-case on-disk name would load a second copy of the module.
+local function TB() return tb_rf_receiver_packages end
+
+local function is_package(se)
+    return se ~= nil
+       and string.find(se:section_name(), PACKAGE_PREFIX, 1, true) ~= nil
+end
+
+-- Peer
+
+local _tracked  = nil
+local _examined = {}   -- [target id] = is a package; alife_object logs on an unresolved id
+
+local function clear_local_package()
+    local tb = TB()
+    _tracked = nil
+    tb.tb_package_active   = false
+    tb.tb_target_item      = 0
+    tb.tb_package_in_level = "empty"
+    tb.tb_reminder         = "empty"
+    tb.tb_scan_time        = 4000
+    item_radio.tb_in_range     = false
+    item_radio.tb_sound_object = false
+    item_radio.tb_flash_time   = 0
+end
+
+-- Mirrors the host's package into the mod's own variables so its untouched hunting path runs.
+local function peer_sync_package()
+    local tb      = TB()
+    local targets = item_radio.RF_targets
+
+    if _tracked then
+        if targets[_tracked] then return end
+        clear_local_package()
+    end
+
+    for id in pairs(_examined) do
+        if not targets[id] then _examined[id] = nil end
+    end
+
+    for id, target in pairs(targets) do
+        if _examined[id] ~= false then
+            local se = alife_object(id)
+            _examined[id] = is_package(se)
+            -- No freq: the mod's own ±1 MHz compare would do arithmetic on nil.
+            if _examined[id] and target.freq then
+                _tracked               = id
+                tb.tb_target_item      = id
+                tb.tb_freq             = target.freq
+                tb.tb_package_in_level = alife():level_name(
+                    game_graph():vertex(se.m_game_vertex_id):level_id())
+                tb.tb_package_active   = true
+                -- The ambush is the host's; this also keeps the mod's actor_on_update off an unguarded deref.
+                tb.tb_badguy_spawned   = true
+                tb.tb_scan_time        = 4000
+                printf("[xrRazom][rf-pkg] tracking host package id=%s freq=%s level=%s",
+                       tostring(id), tostring(target.freq), tb.tb_package_in_level)
+                return
+            end
+        end
+    end
+end
+
+-- Reimplemented, not wrapped: the mod's reward branch reads invobj.id off
+-- alife_create_item, which yields only a server object on a peer.
+local function peer_on_item_take(item)
+    local tb  = TB()
+    local sec = item:section()
+
+    if item:id() == tb.tb_target_item and tb.tb_package_active then
+        item_radio.clear_target(tb.tb_target_item)
+        clear_local_package()
+    end
+
+    local n = string.match(sec, "^" .. PACKAGE_PREFIX .. "(%d+)$")
+    if not n then return end
+
+    local reward = "quest_package_" .. n
+    if not alife_create_item(reward, db.actor) then return end
+    tb.tb_bonus_items = (tb.tb_bonus_items or 0) + 1
+
+    if ui_mcm and ui_mcm.get("RF_package_patch/unpacking") == "automatic" then
+        CreateTimeEvent(0, "xrr_rf_pkg_unpack", 0.5, function()
+            local spawned = db.actor:object(reward)
+            if spawned then itms_manager.use_package_random(spawned) end
+            return true
+        end)
+    end
+    alife_release(item)
+end
+
+local function apply_peer()
+    local tb  = TB()
+    local NOP = function() end
+
+    -- Spawning half: called by name inside the module, so replacing the field suffices.
+    tb.tb_radio_thing       = function() return false end
+    tb.failsafepackagespawn = function() return false end
+    tb.spawn_some_badguys   = NOP
+    tb.checkrelationchange  = function() return true end   -- true ends the time event
+
+    -- Reminders are the host's give_game_news, broadcast to us already.
+    tb.remindaboutpackage   = function() return true end
+
+    -- Cancelling is a world action the host owns; the peer loses the PDA entry.
+    if custom_functor_autoinject then
+        custom_functor_autoinject.remove_functor("pda_package_cancel")
+    end
+
+    UnregisterScriptCallback("actor_on_item_take", tb.actor_on_item_take)
+    RegisterScriptCallback("actor_on_item_take", peer_on_item_take)
+
+    RegisterScriptCallback("actor_on_update", function()
+        local tg = time_global()
+        if tg < _poll_tg then return end
+        _poll_tg = tg + POLL_MS
+        peer_sync_package()
+    end)
+end
+
+-- Host
+
+-- A peer's pickup never fires the host's actor_on_item_take.
+local function host_on_peer_item_take(avatar_id, item_id)
+    local tb = TB()
+    if not (tb.tb_package_active and item_id == tb.tb_target_item) then return end
+
+    printf("[xrRazom][rf-pkg] host package id=%s collected by peer avatar %s — closing",
+           tostring(item_id), tostring(avatar_id))
+    item_radio.clear_target(item_id)
+    RemoveTimeEvent(item_id, "remind_about_radio_package")
+    tb.tb_package_active   = false
+    tb.tb_badguy_spawned   = false
+    tb.tb_target_item      = 0
+    tb.tb_reminder         = "empty"
+    tb.tb_package_in_level = "empty"
+    tb.tb_scan_time        = 4000
+    item_radio.tb_in_range     = false
+    item_radio.tb_sound_object = false
+    item_radio.tb_flash_time   = 0
+end
+
+local function apply_host()
+    RegisterScriptCallback("xrr_on_peer_item_take", host_on_peer_item_take)
+    -- The peer NOPs these, so their news is the party's.
+    local tb = TB()
+    for _, name in ipairs({ "tb_radio_thing", "failsafepackagespawn",
+                            "checkrelationchange", "remindaboutpackage" }) do
+        xrr_share_news_from(tb[name])
+    end
+end
+
+function on_game_start()
+    if not (tb_rf_receiver_packages and item_radio) then return end
+    printf("[xrRazom][rf-pkg] patch applied (%s)", XrrIsClient() and "peer" or "host")
+    if XrrIsClient() then apply_peer() else apply_host() end
+end

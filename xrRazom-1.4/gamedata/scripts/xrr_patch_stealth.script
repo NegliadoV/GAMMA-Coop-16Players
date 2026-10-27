@@ -1,0 +1,28 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Module: Stealth Overhaul (xcvb, GAMMA) — avatar visibility parity.
+
+  Its visual_memory_manager.get_visible_value memory branch requires an
+  IsStalker/IsMonster `who`, so NPC vision memory never accumulates against
+  an avatar. Gated on stealth_mcm: the base-game version has no such gap.
+]]
+
+function on_game_start()
+    if not stealth_mcm then return end
+    local vmm = visual_memory_manager
+    local orig = vmm and vmm.get_visible_value
+    if type(orig) ~= "function" then return end
+
+    -- The engine looks this functor up by name on every call; no re-registration.
+    vmm.get_visible_value = function(npc, who, ...)
+        if who and XrrPlayers():IsPlayerDummy(who:id()) then
+            local ok, result = XrrAvatarAwareCall(orig, npc, who, ...)
+            if ok then return result end
+            -- fall through on error: the engine needs a float back
+        end
+        return orig(npc, who, ...)
+    end
+    log("[xrRazom][stealth] avatar visibility parity installed")
+end

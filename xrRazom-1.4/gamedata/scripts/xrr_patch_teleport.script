@@ -1,0 +1,84 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  xr_effects.teleport_actor moves only the triggering player; the host
+  broadcasts one teleport that every machine within range applies. A restrictor's
+  teleport goes to that restrictor's audience instead.
+]]
+
+local _orig_teleport_actor = nil
+
+-- Heading sentinel for "no look path"; must match XRR_TP_NO_DIR engine-side.
+local TP_NO_DIR = 1.0e10
+
+-- A bad path name falls back to the original effect instead of half-applying.
+local function resolve_dest(p)
+    return pcall(function()
+        local point = patrol(p[1])
+        local dest  = point:point(0)
+        if p[2] ~= nil then
+            local heading = -patrol(p[2]):point(0):sub(dest):getH()
+            return dest, heading, true
+        end
+        return dest, 0, false
+    end)
+end
+
+local function teleport_actor_wrapper(actor, npc, p)
+    -- Ahead of the radius sync's toggle: the audience is not an option.
+    local mine = xrr_patch_restrictor_logic.deliver("teleport_actor", npc, p)
+    if mine ~= nil then
+        if mine then return _orig_teleport_actor(actor, npc, p) end
+        return
+    end
+
+    if not get_console_cmd(1, "xrr_sync_teleport") or not (XrrIsHosted() or XrrIsConnected())
+       or not db.actor or not XrrPlayers() or not (p and p[1]) then
+        return _orig_teleport_actor(actor, npc, p)
+    end
+
+    local ok, dest, heading, has_dir = resolve_dest(p)
+    if not ok or not dest then
+        return _orig_teleport_actor(actor, npc, p)
+    end
+
+    -- The pre-teleport position and level drive every recipient's radius gate.
+    local o       = db.actor:position()
+    local gvid    = db.actor:game_vertex_id()
+    local send_h  = has_dir and heading or TP_NO_DIR
+
+    if XrrIsHost() then
+        XrrPlayers():SendTeleportAll(dest.x, dest.y, dest.z, send_h,
+                                        o.x, o.y, o.z, gvid)
+    else
+        XrrPlayers():SendTeleportRequest(dest.x, dest.y, dest.z, send_h,
+                                            o.x, o.y, o.z, gvid)
+    end
+    -- No _orig: the host's broadcast moves this actor too, via OnTeleportApply.
+end
+
+-- No Lua caller: the engine calls this once its level / radius / dedup gate passed.
+function OnTeleportApply(x, y, z, heading, has_dir)
+    if not db.actor then return end
+    local pos = vector():set(x, y, z)
+    -- Spreads a stacked party; kept to ±0.5 m so a spot near a level changer
+    -- is not nudged across it.
+    pos.x = pos.x + (math.random() - 0.5) * 1.0
+    pos.z = pos.z + (math.random() - 0.5) * 1.0
+    db.actor:set_actor_position(pos)
+    if has_dir then
+        db.actor:set_actor_direction(heading)
+    end
+end
+_G.OnTeleportApply = OnTeleportApply
+
+function on_game_start()
+    if not (xr_effects and type(xr_effects.teleport_actor) == "function") then
+        log("[xrRazom] teleport sync: xr_effects.teleport_actor missing — skipped")
+        return
+    end
+    _orig_teleport_actor = xr_effects.teleport_actor
+    xr_effects.teleport_actor = teleport_actor_wrapper
+    log("[xrRazom] teleport sync: wrapped xr_effects.teleport_actor")
+end

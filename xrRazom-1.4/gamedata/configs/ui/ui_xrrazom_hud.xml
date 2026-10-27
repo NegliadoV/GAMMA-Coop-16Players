@@ -1,0 +1,17 @@
+<w>
+	<!-- Party panel. The container itself is cloned from the ui_hud.xml
+	     companion_list node at runtime (shared row grid with the companion
+	     column); this peer_list node only groups our slot additions. -->
+	<peer_list x="0" y="0" width="90" height="606" stretch="1">
+		<!-- Shaded name caption spanning the portrait width, aligned with the
+		     portrait bottom (portrait is 5,4 80x51 → bottom at y=55). -->
+		<nameplate_bg x="5" y="43" width="80" height="12" stretch="1">
+			<texture r="0" g="0" b="0" a="140">ui_xrr_solid</texture>
+		</nameplate_bg>
+		<nameplate x="8" y="43" width="74" height="12" stretch="1">
+			<text complex_mode="0" r="230" g="230" b="230" align="l" vert_align="c" font="letterica16"/>
+		</nameplate>
+		<!-- Health bar is the vanilla companion_list:slot:health node (cloned in
+		     xrr_peer_hud.script), so it is not redefined here. -->
+	</peer_list>
+</w>

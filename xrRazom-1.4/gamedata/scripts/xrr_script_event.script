@@ -1,0 +1,37 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+
+  Mod-facing SCRIPT_EVENT: a named event sent to one player, the host, or every
+  other player, running local code on the receiver only. No answer channel, and
+  any machine may receive one, so dispatch is not host-gated.
+]]
+
+local registry = {}
+
+-- handler(args, sender): sender is "host" or a decimal netid string, never self.
+function register(name, handler)
+    if registry[name] then
+        printf("[xrRazom][evt] event '%s' re-registered (overwrite)", name)
+    end
+    registry[name] = handler
+end
+
+-- Engine-called on an inbound event. An unregistered name is a drop, not an
+-- error: HELLO's fingerprint covers configs, not scripts.
+function dispatch(name, args, sender)
+    local handler = registry[name]
+    if not handler then
+        printe("![xrRazom][evt] unknown event '%s' from %s — dropped",
+            tostring(name), tostring(sender))
+        return
+    end
+    handler(args, sender)
+end
+
+-- target: nil / "" = every other player, "host", or a netid string. Returns
+-- false solo or when refused (oversized name/args, bad target).
+function send(name, target, args)
+    return XrrPlayers():SendScriptEvent(target or "", name, args or "")
+end
+
+_G.OnScriptEvent = dispatch

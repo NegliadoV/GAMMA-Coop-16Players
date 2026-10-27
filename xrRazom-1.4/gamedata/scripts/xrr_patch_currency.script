@@ -1,0 +1,124 @@
+--[[ xrRazom: currency-unit patch (RU -> st_xrr_currency)
+  " RU" is a literal concatenated at each display site with no engine choke
+  point, so each site is wrapped and its output rewritten (idempotently).
+]]
+
+local function rebrand(s)
+	if type(s) ~= "string" then return s end
+	return (s:gsub(" RU", " " .. xrr_currency.suffix()))
+end
+
+local function restamp(wnd)
+	if wnd then wnd:SetText(rebrand(wnd:GetText())) end
+end
+
+-- For free-form prose (item descriptions), where a bare " RU" would also eat
+-- the start of a capitalised word. Only a unit trailing a number is money.
+local function rebrand_amount(s)
+	if type(s) ~= "string" then return s end
+	return (s:gsub("(%d) RU%f[%A]", "%1 " .. xrr_currency.suffix()))
+end
+
+-- In-game screens
+local _applied = false
+
+function on_game_start()
+	if _applied then return end
+	_applied = true
+
+	if ui_inventory and ui_inventory.UIInventory then
+		local UIInv = ui_inventory.UIInventory
+
+		local _UpdateCharacter = UIInv.UpdateCharacter
+		function UIInv:UpdateCharacter()
+			_UpdateCharacter(self)
+			restamp(self.player_money)
+			restamp(self.npc_up_money)
+			restamp(self.npc_money)
+		end
+
+		local _TMode_UpdatePrice = UIInv.TMode_UpdatePrice
+		function UIInv:TMode_UpdatePrice(ele_txt, ele_btn, bag)
+			_TMode_UpdatePrice(self, ele_txt, ele_btn, bag)
+			restamp(ele_txt)
+		end
+	end
+
+	if pda and pda.get_stat then
+		local _get_stat = pda.get_stat
+		pda.get_stat = function(index) return rebrand(_get_stat(index)) end
+	end
+
+	if utils_ui and utils_ui.UICellItem then
+		local _Check_TradeMode = utils_ui.UICellItem.Check_TradeMode
+		function utils_ui.UICellItem:Check_TradeMode(obj, sec)
+			local r = _Check_TradeMode(self, obj, sec)
+			if self.flags then
+				self.flags.value_str = rebrand(self.flags.value_str)
+			end
+			return r
+		end
+	end
+
+	if utils_ui and utils_ui.UIInfoUpgr then
+		local _Update = utils_ui.UIInfoUpgr.Update
+		function utils_ui.UIInfoUpgr:Update(upgr, prereq, installed)
+			_Update(self, upgr, prereq, installed)
+			restamp(self.cost)
+		end
+	end
+
+	if ui_companion_inv and ui_companion_inv.UICompanionInv then
+		local _Reset = ui_companion_inv.UICompanionInv.Reset
+		function ui_companion_inv.UICompanionInv:Reset(npc)
+			_Reset(self, npc)
+			restamp(self.player_money)
+			restamp(self.npc_money)
+		end
+	end
+
+	-- These functors are resolved by name from the module table at call time, so
+	-- a table-field swap is honoured.
+	if inventory_upgrades then
+		if inventory_upgrades.prereq_functor_a then
+			local _orig = inventory_upgrades.prereq_functor_a
+			inventory_upgrades.prereq_functor_a = function(...) return rebrand(_orig(...)) end
+		end
+		if inventory_upgrades.question_repair_item then
+			local _orig = inventory_upgrades.question_repair_item
+			inventory_upgrades.question_repair_item = function(...) return rebrand(_orig(...)) end
+		end
+	end
+end
+
+local _applied_late = false
+
+-- Must wrap outermost over the zz_* mods' build_desc_header chain, which
+-- on_game_start (filename order) would install after xrr_*.
+function apply_late()
+	if _applied_late then return end
+	_applied_late = true
+
+	if ui_item and ui_item.build_desc_header then
+		local _build_desc_header = ui_item.build_desc_header
+		function ui_item.build_desc_header(obj, sec, str)
+			return rebrand_amount(_build_desc_header(obj, sec, str))
+		end
+	end
+end
+
+-- Main-menu screens
+local _applied_menu = false
+
+function apply_menu()
+	if _applied_menu then return end
+	_applied_menu = true
+
+	if ui_mm_faction_select and ui_mm_faction_select.UINewGame then
+		local _UpdateMoney = ui_mm_faction_select.UINewGame.UpdateMoney
+		function ui_mm_faction_select.UINewGame:UpdateMoney()
+			_UpdateMoney(self)
+			restamp(self.text_money)
+		end
+	end
+end

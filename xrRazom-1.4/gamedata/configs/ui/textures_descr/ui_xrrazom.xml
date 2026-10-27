@@ -1,0 +1,15 @@
+<w>
+	<file name="ui\ui_xrr_hud">
+		<texture id="ui_xrr_solid" x="0" y="0" width="8" height="8" />
+	</file>
+	<!-- Send-money inventory button: envelope from the xrRazom icon atlas
+	     (regenerate with tools/gen_ui_icons.py — layout documented there).
+	     CUI3tButton::InitTexture always appends _e/_d/_t/_h, so all four state
+	     ids must exist; hover/pressed use the bright row. -->
+	<file name="ui\xrr_icons">
+		<texture id="ui_xrr_money_send_e" x="0" y="0"  width="52" height="32" />
+		<texture id="ui_xrr_money_send_d" x="0" y="0"  width="52" height="32" />
+		<texture id="ui_xrr_money_send_t" x="0" y="32" width="52" height="32" />
+		<texture id="ui_xrr_money_send_h" x="0" y="32" width="52" height="32" />
+	</file>
+</w>

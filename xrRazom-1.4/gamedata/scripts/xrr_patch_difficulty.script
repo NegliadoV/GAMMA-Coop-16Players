@@ -1,0 +1,87 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Difficulty (game/eco factors, trader condition) is host-owned: the host
+  re-pushes it on any change, and a peer's setters and options panels are locked.
+]]
+
+local _installed = false
+
+-- Safe at file scope: base scripts load before xrRazom.
+local orig_set_game = game_difficulties and game_difficulties.set_game_factor
+local orig_set_eco  = game_difficulties and game_difficulties.set_eco_factor
+
+-- One options Apply fires one setter per changed factor plus on_option_change —
+-- debounce to a single send.
+local _dirty_at = nil
+local FLUSH_DELAY_MS = 250
+
+local function is_session_peer()
+    return XrrIsConnected and XrrIsConnected()
+end
+
+local function is_session_host()
+    return XrrIsHosted and XrrIsHosted()
+end
+
+local function mark_dirty()
+    _dirty_at = time_global()
+end
+
+function set_game_factor_from_host(key, val)
+    if orig_set_game then orig_set_game(key, val) end
+end
+
+function set_eco_factor_from_host(key, val)
+    if orig_set_eco then orig_set_eco(key, val) end
+end
+
+local function wrapped_set_game(key, val)
+    if is_session_peer() then return end
+    orig_set_game(key, val)
+    if is_session_host() then mark_dirty() end
+end
+
+local function wrapped_set_eco(key, val)
+    if is_session_peer() then return end
+    orig_set_eco(key, val)
+    if is_session_host() then mark_dirty() end
+end
+
+-- Catches the trader condition slider, which writes alife state with no setter.
+local function on_option_change()
+    if is_session_host() then mark_dirty() end
+end
+
+local function actor_on_update()
+    if not _dirty_at then return end
+    if time_global() - _dirty_at < FLUSH_DELAY_MS then return end
+    _dirty_at = nil
+    if is_session_host() then
+        XrrNet():ResyncDifficulty()
+        log("[xrRazom] difficulty: host settings changed — re-pushed to peers")
+    end
+end
+
+-- ui_options only: ui_mcm has no difficulty groups.
+local function lock_difficulty_panel(curr_tree)
+    return (curr_tree.id == "gameplay_diff" or curr_tree.id == "economy_diff")
+           and is_session_peer()
+end
+
+function on_game_start()
+    if _installed then return end
+    if not (orig_set_game and orig_set_eco) then
+        log("[xrRazom] difficulty: game_difficulties setters missing — patch skipped")
+        return
+    end
+    game_difficulties.set_game_factor = wrapped_set_game
+    game_difficulties.set_eco_factor  = wrapped_set_eco
+    xrr_ui_option_lock.install(ui_options, "UIOptions", lock_difficulty_panel,
+                               "ui_xrr_diff_host_owned")
+    RegisterScriptCallback("on_option_change", on_option_change)
+    RegisterScriptCallback("actor_on_update", actor_on_update)
+    _installed = true
+    log("[xrRazom] difficulty: session-rule patch installed (host push + peer block)")
+end

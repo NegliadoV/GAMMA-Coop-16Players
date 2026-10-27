@@ -1,0 +1,617 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  PDA rankings and NPC PDA messages: the host computes them, peers render the host's view.
+]]
+
+-- Ranking state (peer-side cache)
+local _orig_calculate_rankings = pda.calculate_rankings
+local _orig_coc_can_show  = pda.coc_rankings_can_show
+local _orig_coc_set_name  = pda.coc_rankings_set_name
+local _orig_coc_set_desc  = pda.coc_rankings_set_description
+local _orig_coc_set_hint  = pda.coc_rankings_set_hint
+local _orig_coc_set_icon  = pda.coc_rankings_set_icon
+local _orig_coc_show_brd  = pda.coc_rankings_show_border
+
+local _ranking_cache = {}   -- { [index] = { name, rank, comm, rep, icon, rank_name, rep_name, is_actor } }
+local _ranking_place = 9999
+local _ranking_count = 0
+local _ranking_last_request = 0
+local RANKING_COOLDOWN_MS = 5000
+-- UIRankingsCoC queries set_name/set_description only when a row is (re)added; the sole
+-- refresh lever is can_show. _forced_dirty drops the actor row for one frame so it re-renders.
+local _ranking_got_reply = false
+local _forced_dirty = false
+
+-- Avatar rows go through the CLIENT object: the avatar CSE serves none of the
+-- trader/creature luabind methods (rank/character_name resolve nil and crash).
+local function avatar_entry_obj(id)
+    if not id or id == 0 then return nil end
+    local players = XrrPlayers()
+    if not (players and players:IsPlayerDummy(id)) then return nil end
+    return level.object_by_id(id)
+end
+
+-- NPC PDA state (peer-side cache)
+local _orig_register_pda = ui_pda_npc_tab and ui_pda_npc_tab.register_pda
+local _orig_use_view     = ui_pda_npc_tab and ui_pda_npc_tab.use_view
+local _orig_on_select_msg = ui_pda_npc_tab and ui_pda_npc_tab.pda_npc_tab
+    and ui_pda_npc_tab.pda_npc_tab.OnSelectMessage
+
+local _pda_cache = {} -- [host_item_id] = info table
+
+-- Binary blob helpers
+local function blob_w_u8(t, v)   t[#t+1] = string.char(v) end
+local function blob_w_u16(t, v)  t[#t+1] = string.char(v % 256, math.floor(v / 256) % 256) end
+local function blob_w_u32(t, v)
+    t[#t+1] = string.char(v % 256, math.floor(v / 256) % 256,
+                           math.floor(v / 65536) % 256, math.floor(v / 16777216) % 256)
+end
+local function blob_w_i16(t, v)
+    if v < 0 then v = v + 65536 end
+    blob_w_u16(t, v)
+end
+local function blob_w_str(t, s)
+    s = s or ""
+    local len = #s
+    blob_w_u16(t, len)
+    if len > 0 then t[#t+1] = s end
+end
+
+local _blob_pos = 1
+local _blob_data = ""
+
+local function blob_r_init(data)
+    _blob_data = data
+    _blob_pos = 1
+end
+local function blob_r_u8()
+    local v = string.byte(_blob_data, _blob_pos)
+    _blob_pos = _blob_pos + 1
+    return v
+end
+local function blob_r_u16()
+    local lo = string.byte(_blob_data, _blob_pos)
+    local hi = string.byte(_blob_data, _blob_pos + 1)
+    _blob_pos = _blob_pos + 2
+    return lo + hi * 256
+end
+local function blob_r_u32()
+    local b1 = string.byte(_blob_data, _blob_pos)
+    local b2 = string.byte(_blob_data, _blob_pos + 1)
+    local b3 = string.byte(_blob_data, _blob_pos + 2)
+    local b4 = string.byte(_blob_data, _blob_pos + 3)
+    _blob_pos = _blob_pos + 4
+    return b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+end
+local function blob_r_i16()
+    local v = blob_r_u16()
+    if v >= 32768 then v = v - 65536 end
+    return v
+end
+local function blob_r_str()
+    local len = blob_r_u16()
+    if len == 0 then return "" end
+    local s = string.sub(_blob_data, _blob_pos, _blob_pos + len - 1)
+    _blob_pos = _blob_pos + len
+    return s
+end
+
+local function pack_ranking_response(actor_place, entries)
+    local t = {}
+    blob_w_u16(t, actor_place)
+    blob_w_u8(t, #entries)
+    for i = 1, #entries do
+        local e = entries[i]
+        blob_w_str(t, e.name)
+        blob_w_u32(t, e.rank)
+        blob_w_str(t, e.comm)
+        blob_w_i16(t, e.rep)
+        blob_w_str(t, e.icon)
+        blob_w_str(t, e.rank_name)
+        blob_w_str(t, e.rep_name)
+        blob_w_u8(t, e.is_actor and 1 or 0)
+    end
+    return table.concat(t)
+end
+
+local function unpack_ranking_response(blob)
+    blob_r_init(blob)
+    local actor_place = blob_r_u16()
+    local count = blob_r_u8()
+    local entries = {}
+    for i = 1, count do
+        entries[i] = {
+            name      = blob_r_str(),
+            rank      = blob_r_u32(),
+            comm      = blob_r_str(),
+            rep       = blob_r_i16(),
+            icon      = blob_r_str(),
+            rank_name = blob_r_str(),
+            rep_name  = blob_r_str(),
+            is_actor  = (blob_r_u8() == 1),
+        }
+    end
+    return actor_place, entries
+end
+
+local function pack_pda_info(host_item_id, info)
+    local t = {}
+    blob_w_u32(t, host_item_id)
+    blob_w_str(t, info.state or "default")
+
+    local c = info.contact or {}
+    blob_w_str(t, c.name or "")
+    blob_w_str(t, c.comm or "stalker")
+    blob_w_str(t, c.icon or "ui\\ui_noise")
+    blob_w_str(t, c.rank or "novice")
+    blob_w_i16(t, c.repu or 0)
+
+    local msgs = info.msg or {}
+    blob_w_u8(t, #msgs)
+    for i = 1, #msgs do
+        local m = msgs[i]
+        blob_w_str(t, m.topic_title or "")
+        blob_w_str(t, m.pic or "")
+
+        local parts = m.topic or {}
+        blob_w_u8(t, #parts)
+        for j = 1, #parts do
+            blob_w_str(t, parts[j])
+        end
+
+        local flags = 0
+        if m.stash then flags = flags + 1 end
+        if m.route then flags = flags + 2 end
+        if m.rf_freq then flags = flags + 4 end
+        blob_w_u8(t, flags)
+
+        if m.stash then blob_w_u32(t, m.stash) end
+        if m.route then
+            blob_w_str(t, m.route[1] or "")
+            blob_w_str(t, m.route[2] or "")
+        end
+        if m.rf_freq then
+            blob_w_str(t, m.rf_map or "")
+            blob_w_u32(t, m.rf_freq)
+        end
+
+        blob_w_str(t, m.msg_date or "")
+        blob_w_str(t, m.fname or "")
+        blob_w_str(t, m.lname or "")
+        blob_w_str(t, m.c1_fname or "")
+        blob_w_str(t, m.c1_lname or "")
+        blob_w_str(t, m.c2_fname or "")
+        blob_w_str(t, m.c2_lname or "")
+        blob_w_str(t, m.base or "")
+        blob_w_str(t, m.leader or "")
+        blob_w_str(t, m.trader or "")
+        blob_w_str(t, m.mechanic or "")
+        blob_w_str(t, m.map or "")
+        blob_w_str(t, m.pointer or "")
+        blob_w_str(t, m.directional or "")
+        blob_w_str(t, m.enemy or "")
+    end
+    return table.concat(t)
+end
+
+local function unpack_pda_info(blob)
+    blob_r_init(blob)
+    local host_item_id = blob_r_u32()
+    local state = blob_r_str()
+
+    local contact = {
+        name = blob_r_str(),
+        comm = blob_r_str(),
+        icon = blob_r_str(),
+        rank = blob_r_str(),
+        repu = blob_r_i16(),
+    }
+
+    local msg_count = blob_r_u8()
+    local msgs = {}
+    for i = 1, msg_count do
+        local m = {}
+        m.topic_title = blob_r_str()
+        m.pic = blob_r_str()
+
+        local part_count = blob_r_u8()
+        m.topic = {}
+        for j = 1, part_count do
+            m.topic[j] = blob_r_str()
+        end
+
+        local flags = blob_r_u8()
+        if flags % 2 >= 1 then m.stash = blob_r_u32() end
+        if math.floor(flags / 2) % 2 >= 1 then
+            m.route = { blob_r_str(), blob_r_str() }
+        end
+        if math.floor(flags / 4) % 2 >= 1 then
+            m.rf_map  = blob_r_str()
+            m.rf_freq = blob_r_u32()
+        end
+
+        m.msg_date    = blob_r_str()
+        m.fname       = blob_r_str()
+        m.lname       = blob_r_str()
+        m.c1_fname    = blob_r_str()
+        m.c1_lname    = blob_r_str()
+        m.c2_fname    = blob_r_str()
+        m.c2_lname    = blob_r_str()
+        m.base        = blob_r_str()
+        m.leader      = blob_r_str()
+        m.trader      = blob_r_str()
+        m.mechanic    = blob_r_str()
+        m.map         = blob_r_str()
+        m.pointer     = blob_r_str()
+        m.directional = blob_r_str()
+        m.enemy       = blob_r_str()
+
+        msgs[i] = m
+    end
+
+    return host_item_id, { state = state, contact = contact, msg = msgs }
+end
+
+function on_game_start()
+    -- Vanilla calculate_rankings filters its CSE sweep on IsStalker, which
+    -- excludes avatars. Run it untouched, then insert each avatar into the
+    -- visible slice by rank; vanilla's forced actor slot at size+1 is left alone.
+    local vanilla_calculate_rankings = _orig_calculate_rankings
+    _orig_calculate_rankings = function()
+        vanilla_calculate_rankings()
+        local players = XrrPlayers()
+        local n = players and players:GetPeerCount() or 0
+        if n == 0 then return end
+        local list = pda.coc_ranking_list
+        if type(list) ~= "table" then return end
+        local size = pda.get_rankings_array_size() or 100
+
+        local function rank_of(id)
+            if id == AC_ID then return db.actor and db.actor:character_rank() or 0 end
+            local av = avatar_entry_obj(id)
+            if av then return av:character_rank() or 0 end
+            local se = alife_object(id)
+            return se and se:rank() or 0
+        end
+
+        local ids = {}
+        for k = 1, size do
+            if list[k] == nil then break end
+            ids[k] = list[k]
+        end
+        for i = 1, n do
+            local cid = players:GetPeerLocalIdAt(i)
+            local obj = cid and cid > 0 and cid ~= 65535 and level.object_by_id(cid) or nil
+            if obj and obj:alive() then
+                local r = obj:character_rank() or 0
+                local pos = #ids + 1
+                for k = 1, #ids do
+                    if r > rank_of(ids[k]) then pos = k break end
+                end
+                if pos <= size then
+                    table.insert(ids, pos, cid)
+                    if pda.actor_rank_place and pos <= pda.actor_rank_place then
+                        pda.actor_rank_place = pda.actor_rank_place + 1
+                    end
+                end
+            end
+        end
+        for k = 1, size do list[k] = ids[k] end
+    end
+
+    pda.calculate_rankings = function()
+        if XrrIsHost() then return _orig_calculate_rankings() end
+        local now = time_global()
+        if now - _ranking_last_request < RANKING_COOLDOWN_MS then return end
+        _ranking_last_request = now
+        local xpda = XrrPda()   -- not `pda`: this file patches the vanilla pda module
+        if xpda and db.actor then
+            xpda:SendRankingRequest(db.actor:character_rank())
+        end
+    end
+
+    RegisterScriptCallback("actor_on_first_update", function()
+        if XrrIsClient() then
+            CreateTimeEvent("xrr", "xrr_ranking_prefetch", 3, function()
+                if db.actor and XrrIsConnected() then
+                    pda.calculate_rankings()
+                end
+                return true
+            end)
+        end
+    end)
+
+    pda.coc_rankings_can_show = function(index)
+        if XrrIsHost() then return _orig_coc_can_show(index) end
+        if index == pda.get_rankings_array_size() + 1 then
+            -- Actor's forced slot: hidden until the host reply lands.
+            if not _ranking_got_reply then return false end
+            if _forced_dirty then _forced_dirty = false return false end
+            return true
+        end
+        return index <= _ranking_count
+    end
+
+    -- Non-nil for a row the vanilla renderers can't serve off the CSE.
+    local function host_avatar_row(index)
+        return avatar_entry_obj(pda.coc_ranking_list and pda.coc_ranking_list[index])
+    end
+
+    pda.coc_rankings_set_name = function(index)
+        if XrrIsHost() then
+            local av = host_avatar_row(index)
+            if av then return strformat("%s. %s", index, av:character_name()) end
+            return _orig_coc_set_name(index)
+        end
+        local max_top = pda.get_rankings_array_size()
+        if index == max_top + 1 then
+            return strformat("%s. %s", _ranking_place, db.actor and db.actor:character_name() or "")
+        end
+        local e = _ranking_cache[index]
+        if not e then return "" end
+        return strformat("%s. %s", e.is_actor and _ranking_place or index, e.name)
+    end
+
+    pda.coc_rankings_set_description = function(index)
+        local max_top = pda.get_rankings_array_size()
+        local e
+        if XrrIsHost() then
+            local av = host_avatar_row(index)
+            if not av then return _orig_coc_set_desc(index) end
+            e = {
+                rank      = av:character_rank(),
+                rank_name = ranks.get_obj_rank_name(av),
+                rep       = av:character_reputation(),
+                rep_name  = string.gsub(utils_obj.get_reputation_name(av:character_reputation()), "st_reputation_", ""),
+                comm      = av:character_community(),
+            }
+        elseif index == max_top + 1 then
+            if not db.actor then return "" end
+            e = {
+                rank      = db.actor:character_rank(),
+                rank_name = ranks.get_obj_rank_name(db.actor),
+                rep       = db.actor:character_reputation(),
+                rep_name  = string.gsub(utils_obj.get_reputation_name(db.actor:character_reputation()), "st_reputation_", ""),
+                comm      = db.actor:character_community(),
+            }
+        else
+            e = _ranking_cache[index]
+        end
+        if not e then return "" end
+        local my_comm = db.actor and db.actor:character_community() or "stalker"
+        local fc = game_relations.is_factions_enemies(my_comm, e.comm) and "%c[255,255,1,1]"
+               or game_relations.is_factions_friends(my_comm, e.comm) and "%c[255,1,255,1]"
+               or "%c[255,255,255,1]"
+        local rc = (e.rep or 0) <= -500 and "%c[255,255,1,1]"
+               or (e.rep or 0) >= 500 and "%c[255,1,255,1]"
+               or "%c[255,255,255,1]"
+        local rn = e.rank_name or "novice"
+        local rpn = e.rep_name or "neutral"
+        return strformat([[ %s \n %s \n %s]],
+            game.translate_string("ui_st_community") .. ": " .. fc .. game.translate_string(e.comm or "stalker") .. "%c[default]",
+            game.translate_string("ui_st_rank") .. ": %c[255,215,215,215]" .. game.translate_string("st_rank_" .. rn)
+                .. " %c[255,110,110,255]" .. (e.rank or 0) .. "%c[default]",
+            game.translate_string("ui_st_reputation") .. ": " .. rc .. game.translate_string("st_reputation_" .. rpn) .. "%c[default]")
+    end
+
+    pda.coc_rankings_set_hint = function(index)
+        if XrrIsHost() then
+            -- The vanilla hint is avatar-safe except its DEV_DEBUG profile_name probe.
+            if host_avatar_row(index) then return "" end
+            return _orig_coc_set_hint(index)
+        end
+        return ""
+    end
+
+    pda.coc_rankings_set_icon = function(index)
+        if XrrIsHost() then
+            local av = host_avatar_row(index)
+            if av then return av:character_icon() or "ui\\ui_noise" end
+            return _orig_coc_set_icon(index)
+        end
+        local max_top = pda.get_rankings_array_size()
+        if index == max_top + 1 then
+            return db.actor and db.actor:character_icon() or "ui\\ui_noise"
+        end
+        local e = _ranking_cache[index]
+        if e and e.is_actor then
+            return db.actor and db.actor:character_icon() or "ui\\ui_noise"
+        end
+        return e and e.icon or "ui\\ui_noise"
+    end
+
+    pda.coc_rankings_show_border = function(index)
+        if XrrIsHost() then return _orig_coc_show_brd(index) end
+        local max_top = pda.get_rankings_array_size()
+        if index == max_top + 1 then return true end
+        local e = _ranking_cache[index]
+        return e and e.is_actor or false
+    end
+
+    -- NPC PDA messages
+    if ui_pda_npc_tab and _orig_register_pda then
+        ui_pda_npc_tab.register_pda = function(npc, pda_sec, pda_id)
+            _orig_register_pda(npc, pda_sec, pda_id)
+            if not XrrIsHost() then return end
+            local info = se_load_var(pda_id, nil, "info")
+            if not info then return end
+            local xpda = XrrPda()
+            if not xpda then return end
+            local blob = pack_pda_info(pda_id, info)
+            xpda:SendPdaInfo(blob, #blob)
+            _pda_cache[pda_id] = info
+        end
+    end
+
+    if ui_pda_npc_tab and _orig_use_view then
+        ui_pda_npc_tab.use_view = function(obj)
+            if obj and not XrrIsHost() then
+                local id = obj:id()
+                local info = se_load_var(id, nil, "info")
+                if not info then
+                    local cached = _pda_cache[id]
+                    if cached then
+                        se_save_var(id, nil, "info", cached)
+                    else
+                        local contact = {
+                            name = game.translate_string("st_dyn_news_unknown_contact"),
+                            comm = "stalker", icon = "ui\\ui_noise", rank = "novice", repu = 0
+                        }
+                        se_save_var(id, nil, "info", { state = "default", contact = contact, msg = {} })
+                    end
+                end
+            end
+            _orig_use_view(obj)
+        end
+    end
+
+    -- Peer: relay a PDA stash reveal so the host assigns the box's content. The
+    -- local vanilla reveal runs unchanged — its own marker plus a content roll
+    -- the peer discards. msg.stash is a static all.spawn id, shared by both worlds.
+    if ui_pda_npc_tab and ui_pda_npc_tab.pda_npc_tab and _orig_on_select_msg then
+        ui_pda_npc_tab.pda_npc_tab.OnSelectMessage = function(self)
+            if not XrrIsConnected() then return _orig_on_select_msg(self) end
+            -- Capture before the original: it flips stash_read.
+            local msg
+            if self.message_list and self.message_list:GetSize() > 0 then
+                local item = self.message_list:GetSelectedItem()
+                local indx = item and item.indx
+                local m = indx and self.msg and self.msg[indx]
+                if m and m.stash and not m.stash_read then msg = m end
+            end
+            _orig_on_select_msg(self)
+            if not (msg and msg.stash_read) then return end
+            -- Relay only if the local reveal placed a marker; the spot type
+            -- rides along so the host's marker matches it.
+            local spot_type
+            if level.map_has_object_spot(msg.stash, "treasure_searched") ~= 0 then
+                spot_type = "treasure_searched"
+            elseif level.map_has_object_spot(msg.stash, "treasure") ~= 0 then
+                spot_type = "treasure"
+            end
+            if not spot_type then return end
+            local hint = "%c[255,255,160,0]" .. game.translate_string(msg.topic_title or "")
+                      .. "\\n%c[default]\\n%c[160,100,100,200]"
+                      .. game.translate_string("st_stash_of") .. " "
+                      .. (self.contact and self.contact.name or "")
+            local xpda = XrrPda()
+            if xpda then xpda:SendPdaStashReveal(msg.stash, spot_type, hint) end
+        end
+    end
+end
+
+-- Callbacks from C++
+
+function on_ranking_request(conn, actor_rank)
+    if not XrrIsHost() then return end
+    _orig_calculate_rankings()
+    local list = pda.get_coc_ranking_list()
+    local max_top = pda.get_rankings_array_size() or 100
+    local sim = alife()
+    if not sim then return end
+
+    local entries = {}
+    for i = 1, max_top do
+        local id = list[i]
+        if not id then break end
+        local av = avatar_entry_obj(id)
+        if av then
+            entries[#entries + 1] = {
+                name      = av:character_name(),
+                rank      = av:character_rank(),
+                comm      = av:character_community(),
+                rep       = av:character_reputation(),
+                icon      = av:character_icon() or "ui\\ui_noise",
+                rank_name = ranks.get_obj_rank_name(av),
+                rep_name  = string.gsub(utils_obj.get_reputation_name(av:character_reputation()), "st_reputation_", ""),
+                is_actor  = false,
+            }
+        else
+            local se = (id == 0) and sim:actor() or sim:object(id)
+            if se then
+                local is_me = (id == 0)
+                entries[#entries + 1] = {
+                    name      = is_me and db.actor:character_name() or se:character_name(),
+                    rank      = is_me and db.actor:character_rank() or se:rank(),
+                    comm      = is_me and db.actor:character_community() or se:community(),
+                    rep       = is_me and db.actor:character_reputation() or se:reputation(),
+                    icon      = is_me and (db.actor:character_icon() or "ui\\ui_noise") or (se:character_icon() or "ui\\ui_noise"),
+                    rank_name = is_me and ranks.get_obj_rank_name(db.actor) or ranks.get_se_obj_rank_name(se),
+                    rep_name  = string.gsub(utils_obj.get_reputation_name(
+                        is_me and db.actor:character_reputation() or se:reputation()), "st_reputation_", ""),
+                    is_actor  = false,
+                }
+            end
+        end
+    end
+
+    -- Peer's exact place over the full stalker set + avatars, not just the packed
+    -- slice. sim:object(i) skips the host actor, so count it explicitly; the
+    -- requester's own avatar mirrors its rank, so the strict > never counts it.
+    local place = 1
+    if db.actor and db.actor:character_rank() > actor_rank then place = place + 1 end
+    for i = 1, 65534 do
+        local se = sim:object(i)
+        if se then
+            local av = avatar_entry_obj(i)
+            if av then
+                if av:alive() and (av:character_rank() or 0) > actor_rank then
+                    place = place + 1
+                end
+            elseif IsStalker(nil, se:clsid()) and se:alive()
+               and se:community() ~= "zombied" and se:community() ~= "trader"
+               and not story_objects.story_id_by_object_id[se.id]
+               and se:rank() > actor_rank then
+                place = place + 1
+            end
+        end
+    end
+
+    local blob = pack_ranking_response(place, entries)
+    local xpda = XrrPda()
+    if xpda then xpda:SendRankingResponse(conn, blob, #blob) end
+end
+
+function on_ranking_response(blob)
+    if XrrIsHost() then return end
+    local place, entries = unpack_ranking_response(blob)
+    _ranking_place = place
+    _ranking_count = #entries
+    _ranking_cache = {}
+    for i = 1, #entries do
+        _ranking_cache[i] = entries[i]
+    end
+    -- Arm the forced-slot row: it may show now, and re-render once with this data.
+    _ranking_got_reply = true
+    _forced_dirty = true
+end
+
+function on_pda_info(blob)
+    if XrrIsHost() then return end
+    local host_item_id, info = unpack_pda_info(blob)
+    _pda_cache[host_item_id] = info
+    local se = alife_object(host_item_id)
+    if se then
+        se_save_var(host_item_id, nil, "info", info)
+    end
+end
+
+-- Host half of a peer's stash reveal: assigns the authoritative content.
+function on_pda_stash_reveal(box_id, spot_type, hint)
+    if not XrrIsHost() then return end
+    if not (treasure_manager and treasure_manager.caches) then return end
+    -- false = known treasure box, not yet generated. Anything else is a dupe
+    -- reveal, an already-looted box, or a garbage wire id.
+    if treasure_manager.caches[box_id] ~= false then
+        log("[xrRazom][PDA] stash reveal rejected: box=" .. tostring(box_id)
+            .. " state=" .. tostring(treasure_manager.caches[box_id]))
+        return
+    end
+    if not (spot_type and spot_type ~= "") then spot_type = "treasure" end
+    local ret = treasure_manager.set_random_stash(spot_type, hint, nil, box_id)
+    log("[xrRazom][PDA] stash reveal: box=" .. tostring(box_id)
+        .. " spot=" .. tostring(spot_type)
+        .. " content=" .. (ret and "assigned" or "EMPTY"))
+end

@@ -1,0 +1,259 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Host half of host-authored MCM config: which third-party keys the host owns,
+  and pushing their values to peers. Declared, never inferred; undeclared keys stay local.
+]]
+
+-- prefix → "host" | "local"; longest matching prefix wins, so
+-- declare("drx_da","host") + declare("drx_da/debug_mode","local") compose.
+local AUTHORITY = {}
+
+-- The keys currently pushed; also the diff base for a re-collect.
+local _authored = {}
+local _collected = false
+local _installed = false
+
+-- Debounced: one settings change can fire several late declarations.
+local _dirty_at = nil
+local FLUSH_DELAY_MS = 250
+
+-- MCM option types carrying a stored value (ui_mcm's allowed_type minus
+-- "preset"). key_bind is listed only so the walk can count it as skipped.
+local SETTING_TYPES = {
+    check = true, list = true, input = true,
+    radio_h = true, radio_v = true, track = true, key_bind = true,
+}
+
+function declare(prefix, authority)
+    if type(prefix) ~= "string" or prefix == "" then return end
+    if authority ~= "host" and authority ~= "local" then
+        log("[xrRazom] mcm authority: bad authority '" .. tostring(authority) ..
+            "' for prefix " .. prefix)
+        return
+    end
+    AUTHORITY[prefix] = authority
+    if _collected then _dirty_at = time_global() end
+end
+
+-- Prefixes match whole path components: "drx_da" covers "drx_da/anything" but
+-- never "drx_da_loadout/...".
+local function resolve(path)
+    local best, best_len = nil, -1
+    for prefix, authority in pairs(AUTHORITY) do
+        local n = prefix:len()
+        if n > best_len and path:sub(1, n) == prefix
+           and (path:len() == n or path:sub(n + 1, n + 1) == "/") then
+            best, best_len = authority, n
+        end
+    end
+    return best
+end
+
+-- Seed list
+-- Dynamic Anomalies Overhaul: density, cleanup and spawn chance shape the world.
+declare("drx_da", "host")
+-- ... but three of its keys are per-machine, not world state:
+declare("drx_da/debug_mode",         "local")  -- log verbosity only
+declare("drx_da/save_after_cleanup", "local")  -- fires a local `save` console command
+-- A COMMAND wearing a checkbox: DAO writes the flag back to false, and that
+-- reset write is exactly what the peer's store gate drops.
+declare("drx_da/delete_dynamic_anomalies", "local")
+
+-- Limb-injury thresholds and penalty strength: a difficulty rule.
+declare("body_health_system", "host")
+declare("body_health_system/TEXT_BASED_PATCH", "local")  -- text HUD vs texture HUD
+declare("body_health_system/new_voice_sounds", "local")  -- pain voice lines
+
+declare("craft_from_stashes", "host")   -- what counts as "in reach" when crafting
+declare("customsquadsize",    "host")   -- companion cap; squads are host-owned
+declare("dit",                "host")   -- tool wear per disassembly, knife requirement
+declare("dit/consume_warning", "local") -- confirmation prompt
+
+declare("dph_loot_cond",      "host")   -- corpse loot condition + ammo multiplier
+declare("outfitdrop",         "host")   -- corpse outfit/helmet drop chances
+declare("outfitdrop/debug",   "local")
+
+declare("fftd", "host")                 -- fast-travel cost, gating, gear damage, clock cost
+declare("fftd/gen/squad_tp_mod",          "local")  -- radio_h, NOT auto-skipped: keybind modifier
+declare("fftd/gen/show_zone_status_icon", "local")
+declare("fftd/gen/nice_round_numbers",    "local")
+declare("fftd/gen/show_distdur",          "local")
+declare("fftd/gen/debuglogs_enabled",     "local")
+declare("fftd/gen/verbose_enabled",       "local")
+
+declare("extra_level_transitions", "host")
+-- Same command-wearing-a-checkbox shape as drx_da/delete_dynamic_anomalies.
+declare("extra_level_transitions/delete_level_transitions", "local")
+
+declare("milpda/progressive", "host")   -- PDA-access progression rules
+declare("new_tasks_addon",    "host")   -- task replayability + auto-assignment
+declare("pda_taskboard",      "host")   -- scan radius, companions-give-tasks
+
+declare("perk_based_artefacts",            "host")
+declare("perk_based_artefacts/debug_mode", "local")
+declare("item_artefact",                     "host")  -- second page from the same mod
+declare("item_artefact/enable_condition_bar","local") -- UI only
+
+declare("exo",       "host")            -- exo drain rates, battery drop chance
+declare("exo/debug", "local")
+
+declare("meat_spoiling", "host")        -- raw/cooked expiry hours
+declare("smooth_prog",   "host")        -- upgrade + repair pricing
+
+declare("skill_system", "host")         -- skill XP multipliers
+declare("skill_system/modifier", "local")  -- radio_h keybind modifier
+declare("skill_system/debug",    "local")
+
+declare("yasc", "host")                 -- where saving is allowed (mod's own id typo)
+declare("yasc/enableNotifications", "local")
+
+-- Autolooter's delete-leftovers releases corpses: shared world state. What a
+-- looter picks up, strips or disassembles stays each player's own.
+declare("auto_looter/delete_body",   "host")
+declare("auto_looter/delete_armor",  "host")
+declare("auto_looter/delete_weapon", "host")
+declare("auto_looter/delete_misc",   "host")
+
+-- Collection (host side)
+
+-- A peer must never push: its map is whatever the host sent. Solo fills the map
+-- anyway — it has to be ready before a peer joins.
+local function may_push()
+    return not (XrrIsConnected and XrrIsConnected())
+end
+
+local function walk(gr, prefix, out)
+    for i = 1, #gr do
+        local node = gr[i]
+        if type(node) == "table" and node.id then
+            local path = prefix == "" and node.id or (prefix .. "/" .. node.id)
+            if node.gr then
+                walk(node.gr, path, out)
+            elseif SETTING_TYPES[node.type] then
+                out[#out + 1] = { path = path, opt = node }
+            end
+        end
+    end
+end
+
+function push_authored(getter, path, key)
+    local ok, v = pcall(getter, path)
+    if not ok then return false end
+    local mcm = XrrMcm()
+    local t = type(v)
+    if t == "boolean" then
+        mcm:AuthoritySetBool(key, v)
+    elseif t == "number" then
+        mcm:AuthoritySetNumber(key, v)
+    elseif t == "string" then
+        mcm:AuthoritySetString(key, v)
+    else
+        return false
+    end
+    return true
+end
+
+local function push(path)
+    return push_authored(ui_mcm.get, path, path)
+end
+
+-- Walk the TREE, not the stored section: a key the host has never opened has no
+-- store line yet, and ui_mcm.get returns (and persists) its default.
+local function collect()
+    if not (ui_mcm and XrrNet) then return end
+    if #ui_mcm.options == 0 then
+        if not ui_mcm.init_opt_base then return end
+        ui_mcm.init_opt_base()
+    end
+
+    local found = {}
+    walk(ui_mcm.options, "", found)
+
+    local prev, now = _authored, {}
+    local n, skipped = 0, 0
+    for i = 1, #found do
+        local e = found[i]
+        if resolve(e.path) == "host" then
+            -- Overrides any declaration: key_bind is per-machine, and cmd-backed
+            -- options live in user.ltx, which this must never touch.
+            if e.opt.type == "key_bind" or e.opt.cmd then
+                skipped = skipped + 1
+            elseif push(e.path) then
+                now[e.path] = true
+                n = n + 1
+            end
+        end
+    end
+
+    local mcm = XrrMcm()
+    local dropped = 0
+    for path in pairs(prev) do
+        if not now[path] then
+            mcm:AuthorityRemove(path)
+            dropped = dropped + 1
+        end
+    end
+
+    _authored = now
+    _collected = true
+    mcm:AuthorityFlush()
+    log("[xrRazom] mcm authority: collected " .. n .. " keys (" .. skipped ..
+        " skipped key_bind/cmd)" .. (dropped > 0 and (", " .. dropped .. " un-declared") or ""))
+end
+
+-- Re-push on host change
+
+-- One Apply fires this once with the changed-key set; no debounce needed.
+local function on_mcm_option_change(changed)
+    if not (may_push() and type(changed) == "table") then return end
+    local n = 0
+    for id in pairs(changed) do
+        if _authored[id] and push(id) then n = n + 1 end
+    end
+    -- No session check: the flush knows whether there is one to send to.
+    if n > 0 then XrrMcm():AuthorityFlush() end
+end
+
+local function actor_on_update()
+    if not _dirty_at then return end
+    if time_global() - _dirty_at < FLUSH_DELAY_MS then return end
+    _dirty_at = nil
+    if may_push() then collect() end
+end
+
+-- Peer UI lock
+
+-- Panel granularity: a mixed panel over-locks its excluded keys' controls, but
+-- their values stay the peer's own — the store overlay is the correctness mechanism.
+local function should_lock(curr_tree, path)
+    if not (XrrIsConnected and XrrIsConnected()) then return false end
+    if not (path and curr_tree and curr_tree.gr) then return false end
+    local mcm = XrrMcm()
+    for i = 1, #curr_tree.gr do
+        local id = curr_tree.gr[i].id
+        if id and mcm:OverlayTag(path .. "/" .. id) >= 0 then return true end
+    end
+    return false
+end
+
+function apply()
+    if _installed then return end
+    if not XrrNet then return end
+
+    if may_push() then collect() end
+
+    if ui_mcm then
+        RegisterScriptCallback("mcm_option_change", on_mcm_option_change)
+        xrr_ui_option_lock.install(ui_mcm, "UI_MCM", should_lock, "ui_xrr_mcm_host_owned")
+    end
+    RegisterScriptCallback("actor_on_update", actor_on_update)
+
+    _installed = true
+    log("[xrRazom] mcm authority: installed (mcm=" .. tostring(ui_mcm ~= nil) .. ")")
+end
+
+-- Third-party patches declare through this global; a caller running before this
+-- module is first referenced must use xrr_mcm_authority.declare, which loads it.
+_G.XrrMcmDeclare = declare

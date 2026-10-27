@@ -1,0 +1,86 @@
+; xrRazom attachment offset overrides for proxy item props.
+;
+; xrr_hand_offset_pos / xrr_hand_offset_rot override vanilla attach_position_offset
+; / attach_angle_offset when attaching items to the player proxy. Vanilla values are
+; tuned for NPC idle pose; these are tuned for the proxy's device torso clips
+; (norm_torso_pda_idle_1, xrr_norm_torso_0_detector_idle_1, xrr_norm_torso_0_torchelo_idle_1, etc.).
+
+![device_pda_1]
+xrr_hand_offset_pos = 0.150, -0.019, 0.090
+xrr_hand_offset_rot = -17.304, -177.247, -45.934
+
+![device_pda_2]
+xrr_hand_offset_pos = 0.150, -0.019, 0.090
+xrr_hand_offset_rot = -17.304, -177.247, -45.934
+
+![device_pda_3]
+xrr_hand_offset_pos = 0.150, -0.019, 0.090
+xrr_hand_offset_rot = -17.304, -177.247, -45.934
+
+; ── Handheld detectors ──────────────────────────────────────────────────────
+; One shared in-hand offset for the whole detector family (Echo/Bear/Veles/
+; Svarog/anomaly/Geiger/RF receiver), tuned live via dbg_adjust_attachable_item.
+
+![detector_simple]
+xrr_hand_offset_pos = 0.110, -0.019, 0.000
+xrr_hand_offset_rot = -97.575, -45.436, -114.706
+
+![detector_advanced]
+xrr_hand_offset_pos = 0.110, -0.019, 0.000
+xrr_hand_offset_rot = -97.575, -45.436, -114.706
+
+![detector_elite]
+xrr_hand_offset_pos = 0.110, -0.019, 0.000
+xrr_hand_offset_rot = -97.575, -45.436, -114.706
+
+![detector_scientific]
+xrr_hand_offset_pos = 0.110, -0.019, 0.000
+xrr_hand_offset_rot = -97.575, -45.436, -114.706
+
+![detector_anomaly]
+xrr_hand_offset_pos = 0.110, -0.019, 0.000
+xrr_hand_offset_rot = -97.575, -45.436, -114.706
+
+![detector_geiger]
+xrr_hand_offset_pos = 0.110, -0.019, 0.000
+xrr_hand_offset_rot = -97.575, -45.436, -114.706
+
+![detector_radio]
+xrr_hand_offset_pos = 0.110, -0.019, 0.000
+xrr_hand_offset_rot = -97.575, -45.436, -114.706
+
+; ── Hand lights: glowsticks and the hand flashlight ─────────────────────────
+; Both are CFlashlight (D_FLALIT) in slot 8, so a drawn one reaches the proxy
+; through the detector channel, and ensure_detector hangs the item's own
+; light_section on the in-hand model — a glow for a glowstick, a beam for the
+; flashlight. Tuned live via dbg_adjust_attachable_item.
+;
+; The orange/red/blue glowsticks inherit from [device_glowstick] and need no
+; row of their own: EvaluateSection resolves a parent through its own !
+; override and memoizes the result (Xr_ini.cpp). Their light still comes from
+; each variant's own light_section, so colour and range follow the variant.
+
+![device_glowstick]
+xrr_hand_offset_pos = -0.310, 0.451, -0.120
+xrr_hand_offset_rot = -54.593, -33.977, -154.813
+
+![device_flashlight]
+xrr_hand_offset_pos = 0.104, -0.027, 0.030
+xrr_hand_offset_rot = 205.234, 111.613, -133.614
+
+; ── Binoculars ──────────────────────────────────────────────────────────────
+; Binoculars are armed as a real CWeapon on the proxy (ensure_weapon), so the
+; in-hand world-model placement comes from the weapon's position/orientation
+; (CWeapon::Load -> m_Offset, Weapon.cpp), NOT attach_* (those are read only by
+; the script_attachment path, which is_binoc explicitly skips). These keys are
+; GLOBAL to every NPC holding binocs. wpn_binoc_inv inherits from wpn_binoc.
+;
+; Vanilla: position = -0.08, -0.05, 0.05 ; orientation = 0, -90, 70
+; orientation is degrees (HPB = x/y/z); rotation applied first, then position
+; translated in the already-rotated frame (so position axes are post-rotation).
+
+![wpn_binoc]
+position					= -0.100, 0.000, 0.040
+orientation					= 145.730, -67.081, -162.811
+attach_angle_offset			= 3.080506,-1.493053,-1.202040   ;radians Angle*PI/180
+attach_position_offset		= 0.080000,0.021273,0.100000

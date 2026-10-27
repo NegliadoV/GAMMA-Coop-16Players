@@ -1,0 +1,365 @@
+<?xml version="1.0" encoding="windows-1251"?>
+<string_table>
+	<string id="ui_xrr_connect">
+		<text>Підключитись до сесії</text>
+	</string>
+	<string id="ui_xrr_server_ip">
+		<text>Server IP:Port</text>
+	</string>
+	<string id="ui_xrr_remember_ip">
+		<text>Запам'ятати адресу</text>
+	</string>
+	<string id="ui_xrr_connecting">
+		<text>Підключення...</text>
+	</string>
+	<string id="ui_xrr_connection_failed">
+		<text>Не вдалося підключитися</text>
+	</string>
+	<string id="ui_xrr_mods_mismatch">
+		<text>Ваші моди не збігаються з модами хоста. Список файлів, що відрізняються, — у лозі (appdata\logs). Обидва гравці повинні використовувати однаковий модпак.</text>
+	</string>
+	<string id="ui_xrr_version_mismatch">
+		<text>Версія xrRazom не збігається з версією хоста. Обидва гравці повинні використовувати однакову версію.</text>
+	</string>
+	<string id="ui_xrr_world_mismatch">
+		<text>Ваш ігровий світ не збігається зі світом хоста. Збірки створено з різних spawn-даних, тому той самий об'єкт отримав би різні ID на кожній машині. Обидва гравці мають використовувати однакову збірку гри.</text>
+	</string>
+	<string id="ui_xrr_duplicate_identity">
+		<text>Ваша збірка має той самий мережевий ідентифікатор, що й у хоста. Так буває, коли одну установку скопійовано з іншої. Видаліть файл appdata\xrrazom_lan_id.bin у теці гри та перезапустіть — новий ідентифікатор буде створено автоматично.</text>
+	</string>
+	<string id="ui_xrr_connection_lost">
+		<text>З'єднання з хостом втрачено</text>
+	</string>
+	<string id="ui_xrr_host_ended_session">
+		<text>Хост завершив сесію</text>
+	</string>
+	<string id="ui_xrr_no_save_data">
+		<text>Хост завантажив збереження без даних вашого персонажа</text>
+	</string>
+	<string id="ui_xrr_invalid_address">
+		<text>Невірна адреса сервера</text>
+	</string>
+	<string id="ui_xrr_diff_host_owned">
+		<text>Складність геймплею та прогресії — правила сесії, їх задає хост.</text>
+	</string>
+	<string id="ui_xrr_mcm_host_owned">
+		<text>Керується хостом під час кооперативної сесії.</text>
+	</string>
+	<string id="st_xrr_sleep_peers_far">
+		<text>Усі гравці мають бути в межах 4 метрів, щоб лягти спати.</text>
+	</string>
+	<string id="st_xrr_travel_peers_far">
+		<text>Усі гравці мають бути в межах %s метрів, щоб вирушити в дорогу.</text>
+	</string>
+	<string id="ui_xrr_travel_host_owned">
+		<text>Налаштування швидкого переміщення — правила сесії, їх задає хост.</text>
+	</string>
+	<string id="st_send_to">
+		<text>Передати</text>
+	</string>
+	<string id="st_xrr_gift_received">
+		<text>%s передав вам предмет!</text>
+	</string>
+	<!-- Money transfer (MONEY_TRANSFER) -->
+	<string id="ui_xrr_money_amount">
+		<text>Сума:</text>
+	</string>
+	<string id="ui_xrr_money_send_btn">
+		<text>Надіслати</text>
+	</string>
+	<string id="st_xrr_send_money_title">
+		<text>Надіслати гроші гравцю %s</text>
+	</string>
+	<string id="st_xrr_money_sent">
+		<text>Надіслано %s %s гравцю %s</text>
+	</string>
+	<string id="st_xrr_money_received">
+		<text>%s надіслав вам %s %s</text>
+	</string>
+	<string id="st_xrr_money_refunded">
+		<text>Переказ не вдався - %s %s повернено</text>
+	</string>
+	<string id="st_xrr_money_none">
+		<text>У вас немає грошей для надсилання</text>
+	</string>
+	<string id="st_xrr_money_no_target">
+		<text>Гравець вже покинув гру</text>
+	</string>
+	<string id="st_xrr_money_no_peers">
+		<text>Нікому надіслати гроші</text>
+	</string>
+
+	<!-- Mid-session rename (PLAYER_NAME_CHANGE) -->
+	<string id="st_xrr_renamed">
+		<text>%s тепер відомий як %s</text>
+	</string>
+	<string id="st_xrr_name_taken_active">
+		<text>Ім'я '%s' вже зайняте іншим гравцем</text>
+	</string>
+	<string id="st_xrr_name_taken_host">
+		<text>Ім'я '%s' вже зайняте хостом</text>
+	</string>
+	<string id="st_xrr_name_taken_offline">
+		<text>Ім'я '%s' належить гравцю цього світу, який зараз офлайн</text>
+	</string>
+	<string id="st_xrr_name_invalid">
+		<text>Неприпустиме ім'я гравця '%s'</text>
+	</string>
+
+	<!-- In-game currency unit (suffix after money amounts) -->
+	<string id="st_xrr_currency">
+		<text>UAH</text>
+	</string>
+
+	<!-- Keybinding (Controls options screen) -->
+	<string id="kb_grp_xrrazom">
+		<text>xrRazom Co-op</text>
+	</string>
+	<string id="kb_xrr_tag">
+		<text>Поставити / прибрати мітку</text>
+	</string>
+	<string id="kb_xrr_chat">
+		<text>Відкрити кооп-чат</text>
+	</string>
+
+	<!-- Peer faction screen -->
+	<string id="ui_xrr_name_options_hint">
+		<text>Змінюється в Налаштуваннях -> xrRazom</text>
+	</string>
+	<string id="ui_xrr_coop_options">
+		<text>Налаштування кооперативу</text>
+	</string>
+
+	<!-- Options -> xrRazom. Caption id is ui_mm_xrrazom_<page>_<option>, hover text the same + _desc. -->
+	<string id="ui_mm_menu_xrrazom">
+		<text>xrRazom Co-op</text>
+	</string>
+	<string id="ui_mm_menu_xrr_player">
+		<text>Гравець</text>
+	</string>
+	<string id="ui_mm_menu_xrr_hosting">
+		<text>Хостинг</text>
+	</string>
+	<string id="ui_mm_menu_xrr_danger">
+		<text>НЕБЕЗПЕЧНА ЗОНА -- на власний ризик</text>
+	</string>
+	<string id="ui_mm_menu_xrr_session">
+		<text>Правила сесії</text>
+	</string>
+	<string id="ui_xrr_session_host_owned">
+		<text>Це правила сесії — їх задає хост для всіх.</text>
+	</string>
+
+	<string id="ui_mm_xrrazom_xrr_player_player_name">
+		<text>Ім'я гравця</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_player_name_desc">
+		<text>Нікнейм, який бачать інші гравці. Хост перевіряє його при підключенні та при перейменуванні: зайняте ім'я відхиляється.</text>
+	</string>
+
+	<string id="ui_mm_xrrazom_xrr_player_show_marks">
+		<text>Показувати мітки гравців на КПК</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_show_marks_desc">
+		<text>Малювати позначку на мапі КПК для кожного підключеного гравця.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_show_names">
+		<text>Показувати нікнейми гравців</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_show_names_desc">
+		<text>Відображати нікнейм гравця над його аватаром у світі.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_show_players_hp">
+		<text>Показувати індикатори здоров'я інших гравців</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_show_players_hp_desc">
+		<text>Відображати список підключених гравців із тонкою смугою здоров'я у правому верхньому куті HUD.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_show_net_health">
+		<text>Показувати попередження про з'єднання</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_show_net_health_desc">
+		<text>Екранне попередження при погіршенні з'єднання (висока затримка, втрата пакетів або відсутність відповіді). Діагностика пишеться в лог навіть коли вимкнено.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_tag_duration">
+		<text>Час життя мітки (с)</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_tag_duration_desc">
+		<text>Скільки часу ваша мітка видима всім гравцям. Клавіша мітки призначається в Налаштування -> Керування (xrRazom Co-op).</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_chat_enable">
+		<text>Текстовий чат</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_chat_enable_desc">
+		<text>Увімкнути ігровий кооп-чат. Призначте клавішу чату в Налаштування -> Керування (xrRazom Co-op) і натисніть її, щоб відкрити поле вводу. Повідомлення з'являються внизу ліворуч у всіх учасників сесії.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_chat_sound">
+		<text>Звук чату</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_chat_sound_desc">
+		<text>Програвати короткий сигнал, коли надходить повідомлення від іншого гравця (ніколи для власних). Гучність залежить від налаштування гучності ефектів у грі.</text>
+	</string>
+
+	<string id="ui_mm_xrrazom_xrr_session_friendly_fire">
+		<text>Дружній вогонь</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_friendly_fire_desc">
+		<text>Дозволити гравцям завдавати шкоди одне одному. Якщо вимкнено, влучання між гравцями ігноруються.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_rescue">
+		<text>Поранення та порятунок</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_rescue_desc">
+		<text>Смертельне влучання не вбиває гравця, а залишає його пораненим: він повзає, і напарник може його врятувати. Якщо вимкнено, гравці гинуть, як в одиночній грі.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_rescue_medkit">
+		<text>Для порятунку потрібна аптечка</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_rescue_medkit_desc">
+		<text>Порятунок витрачає одну аптечку рятівника, а врятований гравець отримує її ефекти. Якщо вимкнено, аптечка для порятунку не потрібна: вона не витрачається і її ефекти не застосовуються, навіть якщо рятівник її має.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_allow_peer_save_load">
+		<text>Дозволити гравцям зберігати/завантажувати</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_allow_peer_save_load_desc">
+		<text>Дозволити підключеним гравцям надсилати запити на швидке збереження та завантаження останнього збереження на хості.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_hosting_max_players">
+		<text>Максимум гравців</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_hosting_max_players_desc">
+		<text>Максимальна кількість інших гравців, які можуть приєднатися до вашої сесії.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_sync_teleport">
+		<text>Синхронізувати телепорти квестів</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_sync_teleport_desc">
+		<text>Коли квест або діалог телепортує вас, перенести й напарників поруч до тієї ж точки. Вимкніть, щоб телепорт лишався локальним (як у ванілі).</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_teleport_radius">
+		<text>Радіус телепорту напарників (м)</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_teleport_radius_desc">
+		<text>Напарники в межах цієї відстані від вас (коли ви запускаєте телепорт) телепортуються разом із вами. 0 = усі на вашій локації. Враховується налаштування ініціатора.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_party_fast_travel">
+		<text>Вимагати весь загін для швидкого переміщення</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_party_fast_travel_desc">
+		<text>Швидке переміщення вимагає, щоб усі гравці були в межах радіуса збору (нижче). Значення хоста діє на всю сесію.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_gather_radius">
+		<text>Радіус збору загону (м)</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_gather_radius_desc">
+		<text>Швидке переміщення та книги, що прискорюють час, вимагають, щоб усі гравці були в межах цієї відстані від того, хто їх запускає. Значення хоста діє на всю сесію.</text>
+	</string>
+
+	<string id="ui_mm_xrrazom_xrr_hosting_host_session">
+		<text>Хостити сесію при запуску гри</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_hosting_host_session_desc">
+		<text>Автоматично відкривати кооперативну сесію при завантаженні гри. Необхідно, щоб інші гравці могли підключатися до вас.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_hosting_host_steam">
+		<text>Хостити через Steam ID (P2P)</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_hosting_host_steam_desc">
+		<text>Дозволяє іншим гравцям підключатися за Steam ID замість IP-адреси - підтримує обхід NAT та запрошення через Friends. Вимкніть для прямого LAN/IP-хостингу через порт нижче (бібліотека Steam все одно використовується автоматично, якщо запущено Steam).</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_hosting_host_lan_port">
+		<text>LAN-порт</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_hosting_host_lan_port_desc">
+		<text>UDP-порт для прямих LAN/IP-підключень. Використовується лише коли мережу Steam вимкнено.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_hosting_skip_mod_check">
+		<text>Пропускати перевірку модів</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_hosting_skip_mod_check_desc">
+		<text>Пускати гравців, навіть якщо їхній набір модів/конфігів відрізняється від вашого. На власний ризик: неспівпадіння модів може розсинхронізувати або обвалити сесію, і підтримка для таких сесій не надається. Розбіжність усе одно записується у ваш лог.</text>
+	</string>
+	<string id="st_xrr_mutant_body_busy">
+		<text>Хтось уже свіжує цю тушу</text>
+	</string>
+
+	<!-- Wounded / rescue teammate -->
+	<string id="st_xrr_wounded_hint">
+		<text>Ви важко поранені - напарник може вас вилікувати</text>
+	</string>
+	<string id="st_xrr_rescue_hold">
+		<text>Утримуйте [%s], щоб вилікувати</text>
+	</string>
+	<string id="st_xrr_rescue_need_medkit">
+		<text>Для порятунку потрібна аптечка</text>
+	</string>
+	<string id="st_xrr_news_down">
+		<text>%s важко поранений і потребує допомоги!</text>
+	</string>
+	<string id="st_xrr_news_rescued">
+		<text>%s вилікуваний гравцем %s</text>
+	</string>
+	<string id="st_xrr_news_recovered">
+		<text>%s знову на ногах</text>
+	</string>
+
+	<!-- Co-op save gate -->
+	<string id="st_xrr_save_refused_by_host">
+		<text>Хост зараз не може зберегти гру</text>
+	</string>
+
+	<!-- Task text floor (peer, when the host had no text either) -->
+	<string id="st_xrr_task_untitled">
+		<text>Завдання</text>
+	</string>
+	<string id="st_xrr_task_no_descr">
+		<text>Опис відсутній</text>
+	</string>
+
+	<!-- Staged join notifications (host) -->
+	<string id="ui_xrr_join_loading">
+		<text>%s підключається - триває завантаження...</text>
+	</string>
+	<string id="ui_xrr_join_creating">
+		<text>%s підключається - створює персонажа...</text>
+	</string>
+	<string id="ui_xrr_join_char_picked">
+		<text>%s обрав угруповання %s - завантажується...</text>
+	</string>
+	<string id="ui_xrr_join_joined">
+		<text>%s приєднався до сесії</text>
+	</string>
+	<string id="ui_xrr_join_rejected">
+		<text>%s не зміг підключитися: %s</text>
+	</string>
+	<string id="ui_xrr_join_left">
+		<text>%s покинув сесію</text>
+	</string>
+	<string id="ui_xrr_join_left_early">
+		<text>%s відключився, так і не увійшовши в гру</text>
+	</string>
+	<string id="ui_xrr_waiting_for_player">
+		<text>Очікування завантаження гравця %s</text>
+	</string>
+	<string id="ui_xrr_session_full">
+		<text>Сесія заповнена</text>
+	</string>
+	<string id="ui_xrr_nickname_taken">
+		<text>Це ім'я гравця вже зайняте в цій сесії</text>
+	</string>
+
+	<!-- Readiness barrier: host refused a peer's transition request -->
+	<string id="st_xrr_transition_waiting">
+		<text>Перехід відхилено: %s ще завантажується</text>
+	</string>
+
+	<!-- Co-op boot landed in fake_start with the session already gone -->
+	<string id="ui_xrr_session_lost_during_load">
+		<text>З'єднання із сесією втрачено під час завантаження - повернення до головного меню</text>
+	</string>
+
+	<!-- Boot hold: the host's gear bundle never arrived within the ceiling -->
+	<string id="ui_xrr_gear_bundle_timeout">
+		<text>Хост не надіслав дані вашого персонажа вчасно - повернення до головного меню</text>
+	</string>
+</string_table>

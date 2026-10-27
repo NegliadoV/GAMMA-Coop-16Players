@@ -1,0 +1,147 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Zone FM (ui_pda_radio_tab): each machine runs its own channel clock, so the
+  host's drives the peers' PDA tab and world speakers (one index picks both).
+]]
+
+local KIND_TRACK   = 0
+local KIND_SESSION = 1
+
+-- Holds the peer behind the host so vanilla's picker still sees a busy channel at
+-- the next transition (a delayed sound already reports playing()).
+local PEER_START_DELAY_S = 0.5
+
+local R      = nil  -- ui_pda_radio_tab
+local _ready = false
+local _names = {}   -- [ch][kind] = { filename, ... }   index → name
+local _slots = {}   -- [ch][kind] = { [name] = index }
+local _sent  = {}   -- host: [ch] = last broadcast "kind:index"
+
+-- Channel tables
+local function list_dir(path)
+    local out = {}
+    local fl = getFS():file_list_open("$game_sounds$", path,
+                                      bit_or(FS.FS_ListFiles, FS.FS_RootOnly))
+    local n = fl and fl:Size() or 0
+    for i = 1, n do
+        out[i] = fl:GetAt(i - 1):sub(1, -5)   -- drop ".ogg", as vanilla does
+    end
+    return out
+end
+
+-- Repeat vanilla's own listing to turn an index back into a filename — sound_object
+-- exposes no name. A count mismatch means the listing is not the table vanilla built.
+local function build_names()
+    for ch = 1, #R.radio_ch do
+        local tracks   = list_dir("radio\\_channel_" .. ch .. "\\")
+        local sessions = list_dir("radio\\_channel_" .. ch .. "_session\\")
+        if #tracks == #R.radio_ch[ch] and #sessions == #R.radio_session[ch] then
+            _names[ch] = { [KIND_TRACK] = tracks, [KIND_SESSION] = sessions }
+            _slots[ch] = { [KIND_TRACK] = {},     [KIND_SESSION] = {} }
+            for i, n in ipairs(tracks)   do _slots[ch][KIND_TRACK][n]   = i end
+            for i, n in ipairs(sessions) do _slots[ch][KIND_SESSION][n] = i end
+        else
+            log("[xrRazom][radio-fm] channel " .. ch .. ": listing mismatch — not synced")
+        end
+    end
+end
+
+-- get_playing_object's own precedence: a station ident masks the track.
+local function current(ch)
+    local s = R.radio_session[ch][R.radio_session_now[ch]]
+    if s and s:playing() then return KIND_SESSION, R.radio_session_now[ch] end
+    local t = R.radio_ch[ch][R.radio_now[ch]]
+    if t and t:playing() then return KIND_TRACK, R.radio_now[ch] end
+end
+
+-- snd_source keeps its last-queried _out twin until that twin ends, so stopping
+-- the twins is what forces a re-query and locks the speakers to the clock.
+local function cut_speakers(ch)
+    for i = 1, #R.radio_ch_out[ch]      do R.radio_ch_out[ch][i]:stop()      end
+    for i = 1, #R.radio_session_out[ch] do R.radio_session_out[ch][i]:stop() end
+end
+
+-- Host: observe and broadcast
+local function send_state(ch)
+    local kind, idx = current(ch)
+    if not kind then return end
+    XrrWorld():SendRadioChannelState(ch, kind, _names[ch][kind][idx])
+end
+
+local function host_tick()
+    for ch in pairs(_names) do
+        local kind, idx = current(ch)
+        local key = kind and (kind .. ":" .. idx) or ""
+        if key ~= _sent[ch] then
+            _sent[ch] = key
+            if kind then
+                log("[xrRazom][radio-fm] ch" .. ch .. " -> " .. _names[ch][kind][idx])
+                cut_speakers(ch)
+                XrrWorld():SendRadioChannelState(ch, kind, _names[ch][kind][idx])
+            end
+        end
+    end
+end
+
+-- Join catch-up: the live stream skips peers that are not ready yet.
+function broadcast_all()
+    if not (_ready and XrrIsHosted()) then return end
+    for ch in pairs(_names) do send_state(ch) end
+end
+
+-- Peer: apply
+local function force(ch, kind, idx)
+    -- Vanilla starts a track the tick it picks it: only these two can be live.
+    R.radio_ch[ch][R.radio_now[ch]]:stop()
+    R.radio_session[ch][R.radio_session_now[ch]]:stop()
+    cut_speakers(ch)
+
+    local obj
+    if kind == KIND_SESSION then
+        R.radio_session_now[ch] = idx
+        obj = R.radio_session[ch][idx]
+    else
+        R.radio_now[ch] = idx
+        obj = R.radio_ch[ch][idx]
+    end
+
+    obj:play(db.actor, PEER_START_DELAY_S, sound_object.s2d)
+    -- Volume set before play() does not stick; vanilla's next tick writes the real one.
+    obj.volume = 0
+end
+
+function on_channel_state(ch, kind, name)
+    if not _ready then return end
+    if XrrIsHost() then return end
+    if not db.actor then return end           -- join re-push can beat the actor
+    local slots = _slots[ch]
+    if not slots then return end
+    local idx = slots[kind] and slots[kind][name]
+    if not idx then return end                -- peer's track set differs here
+    local ckind, cidx = current(ch)
+    if ckind == kind and cidx == idx then return end
+    log("[xrRazom][radio-fm] ch" .. ch .. " <- " .. name)
+    force(ch, kind, idx)
+end
+
+local function on_update()
+    if _ready and XrrIsHosted() then host_tick() end
+end
+
+function on_game_start()
+    R = ui_pda_radio_tab
+    if not (R and R.radio_ch and R.radio_ch_out and R.radio_now
+            and R.radio_session and R.radio_session_out and R.radio_session_now) then
+        log("[xrRazom][radio-fm] ui_pda_radio_tab clock is still local — radio sync "
+            .. "disabled (unlocalizer_xrr_radio.ltx missing or not applied)")
+        return
+    end
+
+    build_names()
+    if not next(_names) then return end
+    _ready = true
+
+    RegisterScriptCallback("actor_on_update", on_update)
+end

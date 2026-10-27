@@ -1,0 +1,302 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Condlist-fired reward/economy effects run on the host only and are broadcast
+  to every peer; quest-mechanic items go to the player who triggered the stage.
+]]
+
+-- remove_item / remove_quest_item are deliberately absent so the crate-take's
+-- internal remove_item runs on the originator.
+local SUPPRESS_ON_PEER = {
+    "reward_money", "reward_random_money", "reward_random_money_by_dist",
+    "reward_item_cost_mult_and_remove", "drx_sl_money_task_payment",
+    "reward_exact_money",  -- 451- Ashot and Yar's own effect
+
+    "inc_faction_goodwill_to_actor", "dec_faction_goodwill_to_actor",
+    "complete_task_inc_goodwill", "fail_task_dec_goodwill",
+    "inc_goodwill_by_tasker_comm", "inc_goodwill_by_tasker_id", "dec_goodwill_by_tasker_id",
+
+    "actor_friend", "actor_neutral", "actor_enemy", "set_speaker_as_enemy",
+    "set_squad_neutral_to_actor", "set_squad_friend_to_actor", "set_squad_enemy_to_actor",
+    "set_squad_goodwill", "set_squad_goodwill_to_npc", "set_npc_sympathy",
+    "set_squad_community_goodwill", "reset_faction_goodwill",
+
+    "give_task", "set_task_completed", "set_task_failed",
+    "inc_task_stage", "dec_task_stage", "set_task_stage",
+
+    "reward_item", "reward_random_item", "reward_stash", "give_item", "give_items",
+    "give_letter", "give_actor", "relocate_item", "give_treasure",
+    "drx_sl_reward_random_rifle", "drx_sl_reward_random_artefact",
+
+    "increase_rank", "decrease_rep", "devushka_quest_one_reward",
+}
+
+-- Quest-mechanic items fire only on the client that originated the gating info.
+local CRATE_FAMILY = {
+    "lttz_ll_give_wpn_gauss_quest", "lttz_ll_give_gauss_ammo", "lttz_ll_give_strelok_pendrive",
+    "lttz_ll_give_doctor_artefact", "lttz_oa_give_decryption_radio",
+    "lttz_oa_give_special_delivery_case", "lttz_oa_give_army_isg_spy_pendrive",
+    "lttz_ll_take_wpn_gauss_quest", "lttz_ll_take_strelok_notes", "lttz_ll_take_monolith_shard",
+    "lttz_ll_take_strelok_pendrive", "lttz_ll_take_x8_documents", "lttz_ll_take_zat_b40_sarge_pda",
+    "lttz_ms_take_stitch_decoder", "lttz_ms_take_attackers_pda", "lttz_ms_take_contact_lost_pda",
+    "lttz_oa_take_decryption_radio", "lttz_oa_take_special_delivery_case",
+    "lttz_oa_take_army_isg_spy_pendrive", "lttz_oa_take_jupiter_documents",
+    "lttz_oa_take_drug_psy_blockade",
+}
+
+local function eco_rewards()  return game_difficulties.get_eco_factor("rewards")  or 1 end
+
+-- Effects whose outcome can't be serialized: relay the CALL — the items blob carries
+-- "@<effect>:<args>" and the peer's OnQuestReward re-runs the vanilla effect.
+local function relay_call(name)
+    return function(p)
+        local parts = { "@" .. name }
+        for i = 1, #p do parts[#parts + 1] = tostring(p[i]) end
+        return 0, table.concat(parts, ":")
+    end
+end
+
+-- → (money, items_blob). Random money/items re-roll per player, by design. Goodwill
+-- has no capture: the C++ goodwill setter hook shares the host's actual write.
+local REWARD_CAPTURE = {
+    reward_money = function(p)
+        return math.floor((tonumber(p[1]) or 500) * eco_rewards()), ""
+    end,
+    reward_random_money = function(p)
+        local m = eco_rewards()
+        local mn = math.floor(((tonumber(p[1]) or 500) * m) / 50)
+        local mx = math.floor(((tonumber(p[2]) or (tonumber(p[1]) or 500) + 1000) * m) / 50)
+        if mx < mn then mx = mn end
+        return math.random(mn, mx) * 50, ""
+    end,
+    reward_random_money_by_dist = function(p)
+        local var = utils_data.load_var(db.actor, p[1])
+        local lvl_task = var and var.lvl_task or level.name()
+        local lvl_target = var and var.lvl_target
+        local n = lvl_task and lvl_target
+            and txr_routes.get_shortest_path_num(lvl_task, lvl_target) or 1
+        local m = eco_rewards()
+        local mn = math.ceil(((tonumber(p[2]) or 500) * m) / 50)
+        local mx = math.ceil(((tonumber(p[3]) or ((tonumber(p[2]) or 500) + 1000)) * m) / 50)
+        if mx < mn then mx = mn end
+        local money = math.random(mn, mx) * 50
+        local sweets = math.ceil(n * money * (tonumber(p[4]) or 0.2))
+        return money + sweets, ""
+    end,
+    -- No eco_rewards(): the exact figure is why the mod declares its own effect.
+    reward_exact_money = function(p) return tonumber(p[1]) or 1, "" end,
+    reward_item        = function(p) return 0, tostring(p[1] or "") end,
+    reward_random_item = function(p)
+        if #p == 0 then return 0, "" end
+        return 0, tostring(p[math.random(#p)])
+    end,
+    give_actor = function(p) return 0, table.concat(p, ",") end,
+    give_item  = function(p) return 0, tostring(p[1] or "") end,
+    give_items = function(p) return 0, table.concat(p, ",") end,
+    give_letter = function(p) return 0, tostring(p[1] or "") end,
+    drx_sl_reward_random_rifle    = relay_call("drx_sl_reward_random_rifle"),
+    drx_sl_reward_random_artefact = relay_call("drx_sl_reward_random_artefact"),
+    increase_rank                 = relay_call("increase_rank"),
+    decrease_rep                  = relay_call("decrease_rep"),
+    devushka_quest_one_reward     = relay_call("devushka_quest_one_reward"),
+}
+
+_G.xrr_local_origin_info = _G.xrr_local_origin_info or {}
+_G.xrr_remote_info       = _G.xrr_remote_info       or {}
+
+local function on_actor_info(obj, info_id)
+    if not info_id then return end
+    local key = tostring(info_id)
+    local pda = XrrPda()
+    if pda and pda:IsApplyingRemoteInfo() then
+        _G.xrr_remote_info[key] = true              -- applied from the wire
+        return
+    end
+    if _G.xrr_in_condlist_effects then return end   -- restrictor-set / re-derived
+    _G.xrr_local_origin_info[key] = true            -- this client's dialog/action
+end
+
+-- Reads the +info gates of the condlist stashed by the pick_section wrap.
+local function crate_should_fire()
+    local cl = _G.xrr_current_condlist
+    if not cl then return true end                  -- direct dialog action, not a condlist
+    local local_o, remote_o = _G.xrr_local_origin_info, _G.xrr_remote_info
+    local any_local, any_remote = false, false
+    for i = 1, #cl do
+        local checks = cl[i][2]
+        if checks then
+            for j = 1, #checks do
+                local ip = checks[j]
+                if ip[2] == 1 then
+                    if local_o[ip[1]]  then any_local  = true end
+                    if remote_o[ip[1]] then any_remote = true end
+                end
+            end
+        end
+    end
+    if any_local then return true end
+    if XrrIsHosted() and not any_remote then return true end
+    return false
+end
+
+-- Vanilla fetch_reward_and_remove pays again through reward_random_money after
+-- task_callback's full-value grant. Expires because frar can return early.
+local _fetch_mute = { count = 0, expires = 0 }
+local _frar_wrapped = false
+local function arm_fetch_pay_mute()
+    local now = time_global()
+    if now > _fetch_mute.expires then _fetch_mute.count = 0 end
+    _fetch_mute.count = _fetch_mute.count + 1
+    _fetch_mute.expires = now + 3000
+end
+local function consume_fetch_pay_mute()
+    if _fetch_mute.count > 0 and time_global() <= _fetch_mute.expires then
+        _fetch_mute.count = _fetch_mute.count - 1
+        return true
+    end
+    _fetch_mute.count = 0
+    return false
+end
+
+-- The pcall shields fail open: a throw would abort the condlist eval on one machine only.
+local _next_err_tg = 0
+local function log_effect_err(name, err)
+    local tg = time_global()
+    if tg < _next_err_tg then return end
+    _next_err_tg = tg + 5000
+    printf("![xrRazom] patch_quest_story_effects: effect '%s' error (fail-open): %s",
+        tostring(name), tostring(err))
+end
+
+-- Runs at the error site, so the rethrown condlist error keeps its original stack.
+local function condlist_error_traceback(e)
+    return debug.traceback(e, 2)
+end
+
+function apply()
+    if not _G.xrr_qse_info_hook then
+        RegisterScriptCallback("actor_on_info_callback", on_actor_info)
+        _G.xrr_qse_info_hook = true
+    end
+
+    -- Seeded false, never nil: a nil global read is an auto_load file probe.
+    _G.xrr_in_condlist_effects         = _G.xrr_in_condlist_effects or false
+    _G.xrr_current_condlist            = _G.xrr_current_condlist or false
+    _G.xrr_suppress_condlist_info_sync = _G.xrr_suppress_condlist_info_sync or false
+
+    local _orig_pick = xr_logic.pick_section_from_condlist
+    xr_logic.pick_section_from_condlist = function(obj, npc, condlist)
+        if not XrrSessionActive then
+            return _orig_pick(obj, npc, condlist)
+        end
+        local prev_in, prev_cl, prev_sup = _G.xrr_in_condlist_effects, _G.xrr_current_condlist,
+            _G.xrr_suppress_condlist_info_sync
+        _G.xrr_in_condlist_effects = true
+        _G.xrr_current_condlist = condlist
+        _G.xrr_suppress_condlist_info_sync = false
+        -- Protected so a throw cannot leave the flag stuck true: the goodwill hook
+        -- in C++ reads it, and a stuck flag would silence all peer forwarding.
+        local ok, section = xpcall(_orig_pick, condlist_error_traceback, obj, npc, condlist)
+        _G.xrr_in_condlist_effects = prev_in
+        _G.xrr_current_condlist = prev_cl
+        _G.xrr_suppress_condlist_info_sync = prev_sup
+        if not ok then error(section, 0) end
+        return section
+    end
+
+    -- Physics-object logic still runs on the peer: its create_squad section's
+    -- self-latch +info, synced up, would close the host's `-info` gate before the
+    -- host spawns. C++ reads the flag.
+    local _of_create_squad = xr_effects.create_squad
+    if _of_create_squad then
+        xr_effects.create_squad = function(actor, npc, p)
+            if XrrIsClient() and _G.xrr_in_condlist_effects then
+                _G.xrr_suppress_condlist_info_sync = true
+            end
+            return _of_create_squad(actor, npc, p)
+        end
+    end
+
+    local wrapped, with_broadcast = 0, 0
+    for _, name in ipairs(SUPPRESS_ON_PEER) do
+        local orig = xr_effects[name]
+        if orig then
+            local capture = REWARD_CAPTURE[name]
+            xr_effects[name] = function(actor, npc, p)
+                if not (XrrIsClient() or XrrIsHosted()) then
+                    return orig(actor, npc, p)  -- solo: vanilla verbatim (incl. throw semantics)
+                end
+                if XrrIsClient() and _G.xrr_in_condlist_effects then
+                    return
+                end
+                -- A condlist-fired reward is a real one and never consumes the mute.
+                if name == "reward_random_money" and not _G.xrr_in_condlist_effects
+                   and consume_fetch_pay_mute() then
+                    printf("[xrRazom][quest] fetch vanilla pay muted (task_callback grant is the payment)")
+                    return
+                end
+                -- Reward effects call other wrapped effects; only the outermost may
+                -- capture, or the reward counts twice.
+                local nested = _G.xrr_in_reward_effect
+                _G.xrr_in_reward_effect = true
+                local ok, err = pcall(orig, actor, npc, p)
+                _G.xrr_in_reward_effect = nested
+                if not ok then
+                    log_effect_err(name, err)
+                    return  -- effect didn't run on host: don't broadcast a reward
+                end
+                if capture and not nested and XrrIsHosted() and _G.xrr_in_condlist_effects then
+                    local cok, money, items = pcall(capture, p or {})
+                    if not cok then
+                        log_effect_err(name .. ":capture", money)
+                    elseif _G.xrr_completing_task_id then
+                        -- on_complete replay: sent afterwards as ONE combined QUEST_REWARD.
+                        xrr_quest_reward.accum_add(money, items)
+                    elseif (money and money > 0) or (items and items ~= "") then
+                        XrrAlife():SendQuestReward("restrictor", money or 0, items or "")
+                    end
+                end
+            end
+            wrapped = wrapped + 1
+            if capture then with_broadcast = with_broadcast + 1 end
+        end
+    end
+
+    -- Once-guarded: a double wrap would double-arm the mute count.
+    if not _frar_wrapped then
+        local _orig_frar = xr_effects.fetch_reward_and_remove
+        if _orig_frar then
+            _frar_wrapped = true
+            xr_effects.fetch_reward_and_remove = function(actor, npc, p)
+                if XrrIsHosted() and _G.xrr_completing_task_id then
+                    arm_fetch_pay_mute()
+                end
+                return _orig_frar(actor, npc, p)
+            end
+        end
+    end
+
+    -- Outside a condlist (a dialog action) it fires for whoever is in the dialog.
+    local crate_wrapped = 0
+    for _, name in ipairs(CRATE_FAMILY) do
+        local orig = xr_effects[name]
+        if orig then
+            xr_effects[name] = function(actor, npc, p)
+                if not (XrrIsClient() or XrrIsHosted()) then
+                    return orig(actor, npc, p)  -- solo: vanilla verbatim (incl. throw semantics)
+                end
+                if _G.xrr_in_condlist_effects and not crate_should_fire() then
+                    return
+                end
+                local ok, err = pcall(orig, actor, npc, p)
+                if not ok then log_effect_err(name, err) end
+            end
+            crate_wrapped = crate_wrapped + 1
+        end
+    end
+
+    log("[xrRazom] patch_quest_story_effects: peer-suppress " .. tostring(wrapped)
+        .. "/" .. tostring(#SUPPRESS_ON_PEER) .. ", host-broadcast " .. tostring(with_broadcast)
+        .. ", crate-to-triggerer " .. tostring(crate_wrapped) .. "/" .. tostring(#CRATE_FAMILY))
+end

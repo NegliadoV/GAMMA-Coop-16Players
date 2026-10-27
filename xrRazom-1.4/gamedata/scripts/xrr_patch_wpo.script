@@ -1,0 +1,316 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Weapon Parts Overhaul: a peer's field strip / part swap dupes parts of a host-owned weapon.
+]]
+
+local VERB         = "wpo:fieldstrip"
+local VERB_REPLACE = "wpo:replace_part"
+local NOOP = function() end
+
+local orig_fieldstrip
+local orig_try_replace_part
+local routed_replace        -- our drag-replace; take_then_replace re-enters it
+local pending_strips = {}   -- weapon id → { names = {...}, all = bool }, this frame's calls
+
+local function wpo()      return zzzz_arti_jamming_repairs end
+local function jamming()  return arti_jamming end
+
+local function strippable(parts, part_name)
+    if part_name then
+        local con = parts[part_name]
+        return con ~= nil and con ~= -1
+    end
+    for section, con in pairs(parts) do
+        if con ~= -1 and wpo().is_part(section) and not jamming().is_barrel(section) then
+            return true
+        end
+    end
+    return false
+end
+
+-- Not mag_support.is_mag_loaded for Mags Redux: it reads the empty "no_mag"
+-- entry an eject leaves as loaded. The precedence is mag_support's own.
+local function holds_magazine(wpn)
+    if magazines and not wuut_mags then
+        return magazine_binder.get_mag_loaded(wpn:id()) ~= nil
+    end
+    return mag_support and mag_support.is_mag_loaded(wpn)
+end
+
+-- remove_part mints into db.actor, which under the identity swap is the
+-- requester's avatar: the parts are host-authored straight into it.
+xrr_use_intent.register(VERB, function(obj_id, state, args, sender)
+    local avatar = xrr_use_intent.requester_avatar(sender)
+    if not avatar then
+        printf("[xrRazom][wpo] fieldstrip %s: requester %s has no live avatar",
+               tostring(obj_id), tostring(sender))
+        return
+    end
+
+    local wpn = level.object_by_id(obj_id)
+    if not wpn then
+        printf("[xrRazom][wpo] fieldstrip %s: weapon is gone", tostring(obj_id))
+        return
+    end
+    local cont = wpn:parent()   -- nil: a weapon on the ground
+
+    -- The strip's own unload would spawn rounds, or a magazines mod's magazine,
+    -- into a holder a ground weapon has not got; a loaded one here is a stale view.
+    if not cont and (wpn:get_ammo_in_magazine() > 0 or holds_magazine(wpn)) then
+        printf("[xrRazom][wpo] fieldstrip %s: still loaded on the ground — refused", tostring(obj_id))
+        return
+    end
+
+    -- Empty args = every part. A stale name is dropped here: act_fieldstrip
+    -- strips every part when a name misses.
+    local names = (args ~= "") and str_explode(args, ",") or nil
+    if names then
+        local parts = item_parts.get_parts_con(wpn)
+        local held = {}
+        for _, n in ipairs(names) do
+            if parts and parts[n] and parts[n] ~= -1 then held[#held + 1] = n end
+        end
+        if #held == 0 then return end
+        names = held
+    end
+
+    -- Under the swap send_tip would address the avatar; the requester tips on resolve.
+    local orig_tip = news_manager.send_tip
+    news_manager.send_tip = NOOP
+
+    local ok, err = true, nil
+    if names then
+        for _, n in ipairs(names) do
+            ok, err = pcall(XrrPlayerIdentityCall, avatar, orig_fieldstrip, obj_id, n)
+            if not ok then break end
+        end
+    else
+        ok, err = pcall(XrrPlayerIdentityCall, avatar, orig_fieldstrip, obj_id, nil)
+    end
+
+    news_manager.send_tip = orig_tip
+
+    if not ok then
+        printe("![xrRazom][wpo] fieldstrip %s failed: %s", tostring(obj_id), tostring(err))
+    end
+end)
+
+-- The peer refunds itself the slot condition it read, so the swap applies only
+-- while this blob still holds that value.
+xrr_use_intent.register(VERB_REPLACE, function(obj_id, state, args, sender)
+    local field = str_explode(args, "|")
+    local sec, pcon, prev = field[1], tonumber(field[2]), tonumber(field[4])
+    local wpn = level.object_by_id(obj_id)
+    if not (sec and pcon and prev and wpn) then return end
+
+    local parts = item_parts.get_parts_con(wpn)
+    if not (parts and parts[sec]) then
+        printf("[xrRazom][wpo] replace %s: no '%s' slot on %s", tostring(obj_id), tostring(sec),
+               tostring(wpn:section()))
+        return
+    end
+    if parts[sec] ~= prev then
+        printf("[xrRazom][wpo] replace %s: '%s' is %s here, %s for the requester — refused",
+               tostring(obj_id), tostring(sec), tostring(parts[sec]), tostring(prev))
+        return
+    end
+
+    parts[sec] = pcon
+    item_parts.set_parts_con(obj_id, parts)
+
+    -- Vanilla unloads after every swap; on the host the unload seam passes it
+    -- through and the emptied magazine reaches the peers as item state.
+    if mag_support and mag_support.using_mags and mag_support.using_mags()
+       and mag_support.is_mag_loaded(wpn) then
+        mag_support.eject_mag(wpn)
+    else
+        wpn:force_unload_magazine(true)
+    end
+
+    -- Vanilla's wear for the swap; the tool only narrows the range.
+    local wcon = wpn:condition()
+    if wcon > 0.6 then
+        local range = (field[3] == "1") and 3 or 13
+        wpn:set_condition(wcon - (math.random(3, 3 + range) / 100))
+    end
+end)
+
+local NOTICE_COOLDOWN_MS = 1500
+local next_notice = 0
+
+-- Rate-limited: a strip-all names every part, and Autolooter sweeps a whole corpse.
+local function tip(text, suffix)
+    if not db.actor then return end
+    local now = time_global()
+    if now < next_notice then return end
+    next_notice = now + NOTICE_COOLDOWN_MS
+
+    local msg = game.translate_string(text)
+    if suffix then msg = msg .. " " .. ui_item.get_sec_name(suffix) end
+    news_manager.send_tip(db.actor, msg, nil, "swiss_knife", 6000)
+end
+
+-- A pure read of replicated state, as request() requires: the host broadcasts
+-- set_parts_con's se_data write as ITEM_STATE on its own.
+local function strip_landed(names)
+    return function(wpn_id)
+        local wpn = level.object_by_id(wpn_id)
+        if not wpn then return true end   -- gone: nothing left to wait for
+        local parts = item_parts.get_parts_con(wpn)
+        if not parts then return nil end
+        if names then
+            for _, n in ipairs(names) do
+                if strippable(parts, n) then return nil end
+            end
+            return true
+        end
+        if strippable(parts, nil) then return nil end
+        return true
+    end
+end
+
+-- Keyed on the slot CHANGING: a part whose condition already equals the slot's
+-- would resolve before the request is sent, paying for a swap never made.
+local function replace_landed(sec, prev)
+    return function(wpn_id)
+        local wpn = level.object_by_id(wpn_id)
+        if not wpn then return nil end   -- weapon gone: never resolve, keep the part
+        local parts = item_parts.get_parts_con(wpn)
+        if not parts or parts[sec] == prev then return nil end
+        return true
+    end
+end
+
+-- Runs only once the host's mutation is visible here, so a refusal costs nothing.
+-- An occupied slot hands its old condition back through the same object, as vanilla.
+local function finish_replace(part_id, prev, sec)
+    local part = level.object_by_id(part_id)
+    if not part then return end
+    if prev == -1 then
+        alife_release_id(part_id)
+    else
+        part:set_condition(prev / 100)
+    end
+    jamming().reset_cgd()
+    tip("st_news_parts_success", sec)
+end
+
+local TAKE_POLL_S     = 0.1
+local TAKE_TIMEOUT_MS = 5000
+
+-- Only its owner can consume the dragged part: take it via the ordinary TAKE
+-- route, then re-run the drag. A lost race costs nothing.
+local function take_then_replace(wpn, part, using_tool)
+    local from = part:parent()
+    if not (from and db.actor) then return end
+
+    local wpn_id, part_id = wpn:id(), part:id()
+    from:transfer_item(part, db.actor)
+
+    local t0 = time_global()
+    CreateTimeEvent("xrr_wpo", "take_" .. part_id, TAKE_POLL_S, function()
+        local p, w = level.object_by_id(part_id), level.object_by_id(wpn_id)
+        if not (p and w) then return true end
+
+        local owner = p:parent()
+        if owner and owner:id() == db.actor:id() then
+            local parts = item_parts.get_parts_con(w)
+            if parts then routed_replace(w, parts, p, using_tool) end
+            return true
+        end
+        if time_global() - t0 > TAKE_TIMEOUT_MS then return true end
+
+        ResetTimeEvent("xrr_wpo", "take_" .. part_id, TAKE_POLL_S)
+        return false
+    end)
+end
+
+local function install()
+    local w, j = wpo(), jamming()
+    if not w then return end   -- no WPO in this install: nothing to patch
+    if not (type(w.act_fieldstrip) == "function"
+            and j and type(j.try_replace_part) == "function") then
+        log("[xrRazom][wpo] INSTALL WARNING: WPO's shape changed — not patched")
+        return
+    end
+
+    -- Never restored: both wrappers fall through off-session.
+    orig_fieldstrip = w.act_fieldstrip
+
+    -- act_fieldstrip runs once per part in a loop, and request()'s in-flight guard
+    -- keys on (verb, obj_id): a frame's calls go out as one request naming every part.
+    local function flush_strip(id)
+        local p = pending_strips[id]
+        pending_strips[id] = nil
+        if not p then return true end
+        local names = (not p.all) and p.names or nil
+        xrr_use_intent.request{
+            verb     = VERB,
+            obj_id   = id,
+            args     = names and table.concat(names, ",") or "",
+            resolve  = strip_landed(names),
+            on_ready = function() tip("st_news_fieldstrip") end,
+        }
+        return true
+    end
+
+    w.act_fieldstrip = function(id, part_name)
+        -- A weapon on the ground routes too: a peer's parts write on a
+        -- free-standing item never reaches the host.
+        local wpn = level.object_by_id(id)
+        local ground = XrrSessionActive and not XrrHosting and wpn and not wpn:parent()
+        if not (ground or xrr_is_host_owned(id)) then
+            return orig_fieldstrip(id, part_name)
+        end
+        local p = pending_strips[id]
+        if not p then
+            p = { names = {} }
+            pending_strips[id] = p
+            CreateTimeEvent("xrr_wpo", "strip_" .. id, 0, function() return flush_strip(id) end)
+        end
+        if part_name then p.names[#p.names + 1] = part_name else p.all = true end
+    end
+
+    -- The drop handler fires for ANY pair of bags, so the part can be the host's
+    -- as well as the weapon.
+    orig_try_replace_part = j.try_replace_part
+    routed_replace = function(wpn, parts, part, using_tool)
+        local part_theirs = part and xrr_is_host_owned(part:id())
+        local wpn_theirs  = wpn and xrr_is_host_owned(wpn:id())
+        if not (wpn and part and parts and (part_theirs or wpn_theirs)) then
+            return orig_try_replace_part(wpn, parts, part, using_tool)
+        end
+
+        local sec = part:section()
+        if j.is_barrel(sec) then
+            tip("st_news_parts_barrel")   -- vanilla refuses barrels outright
+            return
+        end
+
+        if part_theirs then
+            take_then_replace(wpn, part, using_tool)
+            return
+        end
+
+        -- Read before the host is asked: -1 = empty slot, the dragged part is spent;
+        -- otherwise the condition the peer gets back.
+        local prev     = parts[sec]
+        local part_id  = part:id()
+        local pcon     = math.floor(part:condition() * 100)
+
+        xrr_use_intent.request{
+            verb     = VERB_REPLACE,
+            obj_id   = wpn:id(),
+            args     = sec .. "|" .. pcon .. "|" .. (using_tool and "1" or "0") .. "|" .. prev,
+            resolve  = replace_landed(sec, prev),
+            on_ready = function() finish_replace(part_id, prev, sec) end,
+        }
+    end
+    j.try_replace_part = routed_replace
+end
+
+-- At FILE SCOPE (pass 1), the reverse of the usual capture-late rule:
+-- tpa_patch_repairs copies act_fieldstrip in its on_game_start, which runs before ours.
+install()

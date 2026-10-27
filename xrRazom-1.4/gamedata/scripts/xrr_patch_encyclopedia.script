@@ -1,0 +1,172 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Shared PDA encyclopedia: every unlock fans out through the host.
+]]
+
+local _orig_unlock_note    = nil
+local _orig_unlock_article = nil
+
+local function is_note(section)
+    return string.find(section, "encyclopedia__notes", 1, true) ~= nil
+end
+
+-- The only authority: a mod wrapper (Voiced Actor Refined) can throw after the
+-- vanilla unlock landed, so the unlock fn's return proves nothing.
+local function is_unlocked(section)
+    local enc = ui_pda_encyclopedia_tab
+    if is_note(section) then return enc.is_unlocked_note(section) == true end
+    return enc.is_unlocked_article(section) == true
+end
+
+local mutes = {}
+local function noop() end
+
+-- A mod that announces unlocks by its own route registers that function here too.
+function mute_during_apply(tbl, key)
+    mutes[#mutes + 1] = { tbl = tbl, key = key }
+end
+
+-- The unlock fns have no silent flag; unstubbed, set_article re-inits the PDA UI per entry.
+local function silently(fn)
+    for i = 1, #mutes do
+        local m = mutes[i]
+        m.saved, m.tbl[m.key] = m.tbl[m.key], noop
+    end
+    local ok, err = pcall(fn)
+    for i = #mutes, 1, -1 do
+        local m = mutes[i]
+        m.tbl[m.key], m.saved = m.saved, nil
+    end
+    return ok, err
+end
+
+local function unlock_and_verify(section, orig, mute)
+    if not orig then return false end
+    if is_unlocked(section) then return false end
+
+    local ok, err
+    if mute then
+        ok, err = silently(function() orig(section) end)
+    else
+        ok, err = pcall(orig, section)
+    end
+
+    if is_unlocked(section) then return true end
+    if not ok then
+        log("![xrRazom][ency] unlock failed: " .. tostring(section) .. ": " .. tostring(err))
+    end
+    return false
+end
+
+-- The originals, never the wrappers, so an inbound apply does not re-announce.
+local function apply_section(section, silent)
+    if is_note(section) then
+        return unlock_and_verify(section, _orig_unlock_note, silent)
+    end
+    return unlock_and_verify(section, _orig_unlock_article, true)
+end
+
+local function announce(section)
+    if section and XrrPda() and (XrrIsHosted() or XrrIsConnected()) then
+        XrrPda():SendEncyclopediaUnlocked(tostring(section))
+    end
+end
+
+local function unlock_note_wrapper(section)
+    local res = unlock_and_verify(section, _orig_unlock_note, false)
+    if res then announce(section) end
+    return res
+end
+
+local function unlock_article_wrapper(section)
+    local res = unlock_and_verify(section, _orig_unlock_article, false)
+    if res then announce(section) end
+    return res
+end
+
+-- Engine → Lua handlers
+
+-- Notes keep the vanilla PDA-note notification; articles apply silently.
+function OnEncyclopediaUnlocked(section)
+    if not (section and section ~= "") then return end
+    local res = apply_section(section, false)
+    log("[xrRazom][ency] OnEncyclopediaUnlocked: " .. tostring(section)
+        .. (res == true and " (new)" or " (no-op)"))
+end
+
+-- Join bulk, peer side (fully silent).
+function OnEncyclopediaBulk(sections)
+    if not sections then return end
+    local applied = 0
+    for i = 1, #sections do
+        local section = sections[i]
+        if section and section ~= "" then
+            if apply_section(section, true) == true then
+                applied = applied + 1
+            end
+        end
+    end
+    log("[xrRazom][ency] OnEncyclopediaBulk: applied "
+        .. tostring(applied) .. "/" .. tostring(#sections) .. " section(s)")
+end
+
+-- No Lua caller: the engine calls this to build the join bulk. The unlocked
+-- tables are module locals with no enumerator, hence the walk over the ltx.
+function xrr_collect_encyclopedia()
+    local out = {}
+    local enc = ui_pda_encyclopedia_tab
+    if not enc then return out end
+
+    local ini = ini_file("plugins\\encyclopedia.ltx")
+    if not (ini and ini:section_exist("encyclopedia")) then return out end
+
+    local cat_count = ini:line_count("encyclopedia") or 0
+    for i = 0, cat_count - 1 do
+        local _, cat = ini:r_line("encyclopedia", i, "", "")
+        if cat and cat ~= "" and ini:section_exist(cat) then
+            local n = ini:line_count(cat) or 0
+            for j = 0, n - 1 do
+                local _, section = ini:r_line(cat, j, "", "")
+                if section and section ~= "" then
+                    local unlocked
+                    if is_note(section) then
+                        unlocked = enc.is_unlocked_note(section)
+                    else
+                        unlocked = enc.is_unlocked_article(section)
+                    end
+                    if unlocked then
+                        out[#out + 1] = section
+                    end
+                end
+            end
+        end
+    end
+    return out
+end
+
+-- Lifecycle
+
+function on_game_start()
+    local enc = ui_pda_encyclopedia_tab
+    if not (enc and type(enc.unlock_note) == "function"
+                and type(enc.unlock_article) == "function"
+                and type(enc.is_unlocked_note) == "function"
+                and type(enc.is_unlocked_article) == "function") then
+        log("[xrRazom] encyclopedia sync: unlock/predicate fns missing — skipped")
+        return
+    end
+    mute_during_apply(actor_menu, "set_notification")
+    mute_during_apply(enc, "set_article")
+    _orig_unlock_note    = enc.unlock_note
+    _orig_unlock_article = enc.unlock_article
+    -- The module env is this table, so the tab's own internal calls hit the wrappers too.
+    enc.unlock_note      = unlock_note_wrapper
+    enc.unlock_article   = unlock_article_wrapper
+    log("[xrRazom] encyclopedia sync: wrapped unlock_note + unlock_article")
+end
+
+_G.OnEncyclopediaUnlocked   = OnEncyclopediaUnlocked
+_G.OnEncyclopediaBulk       = OnEncyclopediaBulk
+_G.xrr_collect_encyclopedia = xrr_collect_encyclopedia

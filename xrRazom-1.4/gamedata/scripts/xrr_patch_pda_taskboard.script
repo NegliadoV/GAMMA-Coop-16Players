@@ -1,0 +1,99 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+
+  Custom iTheon's PDA Taskboard (lizzardman): its offer capture fakes a conversation
+  with each NPC, which a peer cannot run, so a peer's rows come from the host.
+]]
+
+local _applied = false
+
+local _orig_refresh_clicked = nil
+local _orig_prepare_task    = nil
+local _orig_get_details     = nil
+
+-- Mirrors pda_taskboard's own actually_is_sim, a module local the host cannot
+-- read and must match to generate these NPCs' tasks as sim.
+local ACTUALLY_IS_SIM = {
+    "bar_visitors_garik_stalker_guard",
+    "bar_visitors_zhorik_stalker_guard2",
+    "bar_arena_guard",
+    "bar_dolg_general_zoneguard_stalker",
+    "mil_smart_terrain_7_7_freedom_bodyguard_stalker",
+    "mil_smart_terrain_7_7_freedom_bodyguard2_stalker",
+}
+
+-- Refresh: availability comes off the wire, not local generation
+
+local function on_refresh_clicked(self)
+    if not XrrIsClient() then return _orig_refresh_clicked(self) end
+
+    self.task_list:RemoveAll()
+
+    local ids = {}
+    for _, npc in pairs(pda_taskboard.get_nearby_npcs()) do
+        ids[#ids + 1] = npc:id()
+    end
+
+    -- Replaces the original's fixed 0.05s draw timer: the data the peer's
+    -- generate_available_tasks rebuilds from doesn't exist until the host answers.
+    xrr_request_task_availability(ids, function()
+        pda_taskboard.refresh_tasks()
+        self:DrawCategoryList()
+    end)
+end
+
+-- Row text: the host's capture, not a local re-run
+
+local function prepare_task(task_data)
+    if not XrrIsClient() then return _orig_prepare_task(task_data) end
+    -- on_job_descr is skipped: world side effects per task of every scanned NPC. Never
+    -- fake get_currently_processed_npc_id to finish the render: it is read game-wide.
+    xrr_peer_render_fetch_preview(task_data.task_id)
+    task_data.task_description = xrr_peer_task_long_description(task_data.task_id)
+end
+
+local function get_details(task_info)
+    if XrrIsClient() then
+        -- A details_id is not proof the details arrived: the mod replays the
+        -- stolen queue a frame later, and only while the PDA is still shown.
+        local d = task_info.details_id and _orig_get_details(task_info)
+        if d then return d end
+        local m = xrr_peer_task_offer_preview(task_info.task_id)
+        if m then
+            return {
+                task_title   = m.caption,
+                task_details = m.text,
+                task_icon    = m.icon,
+            }
+        end
+        -- No host capture (igi tasks, categories that post no iconed message).
+    end
+    return _orig_get_details(task_info)
+end
+
+-- Wiring
+
+function on_game_start()
+    if _applied then return end
+    if not (pda_taskboard and ui_pda_taskboard_tab and ui_pda_taskboard_tab.pda_taskboard_tab) then
+        return
+    end
+    _applied = true
+
+    -- By table entry, not callback: the board's window is built lazily, after on_game_start.
+    _orig_refresh_clicked = ui_pda_taskboard_tab.pda_taskboard_tab.OnBtnRefreshClicked
+    ui_pda_taskboard_tab.pda_taskboard_tab.OnBtnRefreshClicked = on_refresh_clicked
+
+    _orig_prepare_task = pda_taskboard.prepare_task
+    pda_taskboard.prepare_task = prepare_task
+
+    _orig_get_details = pda_taskboard.get_details
+    pda_taskboard.get_details = get_details
+
+    _G.xrr_task_sim_overrides = _G.xrr_task_sim_overrides or {}
+    for i = 1, #ACTUALLY_IS_SIM do
+        _G.xrr_task_sim_overrides[ACTUALLY_IS_SIM[i]] = true
+    end
+
+    printf("[xrRazom][taskboard] patch applied")
+end

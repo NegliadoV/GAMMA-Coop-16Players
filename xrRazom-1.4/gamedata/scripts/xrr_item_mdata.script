@@ -1,0 +1,252 @@
+--[[
+  xrRazom — per-item m_data riders: state a mod keeps at m_data[key][item_id]
+  rather than se_object[id], replicated inside the item's own blob.
+]]
+
+-- Per-ITEM m_data keys, filled at on_game_start. `apply(id, value)` runs after
+-- the entry is stored, for a setter with side effects; value is nil on a delete.
+manifest = {}
+
+function declare(key, opts)
+	for _, d in ipairs(manifest) do
+		if d.key == key then
+			d.apply = (opts and opts.apply) or d.apply
+			return
+		end
+	end
+	manifest[#manifest + 1] = { key = key, apply = opts and opts.apply }
+end
+
+local MAX_DEPTH = 8      -- matches the C++ writer and the sibling codecs
+local POLL_MS   = 1000
+
+local primed_for       -- the m_data table save_state was fired against
+local baseline = {}    -- id -> { key -> sig }: what the other side holds
+local rebuild  = true  -- next pass re-seeds the inventory without voicing
+local next_poll = 0
+local warned   = {}    -- undeclared inbound keys already named
+local _applied = false
+
+local function in_session()
+	return XrrIsHosted() or XrrIsConnected()
+end
+
+local function by_key(key)
+	for _, d in ipairs(manifest) do
+		if d.key == key then return d end
+	end
+end
+
+-- Content, not identity: Powered Exos mutates the table it just stored.
+-- Order-sensitive, which costs at worst a spurious voice, never a missed one.
+local function sig(v, depth)
+	if type(v) ~= "table" then return tostring(v) end
+	if depth <= 0 then return "#" end
+	local n = #v
+	if n > 0 and next(v, n) == nil then
+		local plain = true
+		for i = 1, n do
+			local t = type(v[i])
+			if t ~= "string" and t ~= "number" then plain = false; break end
+		end
+		if plain then return table.concat(v, ",") end
+	end
+	local acc = {}
+	for k, sub in pairs(v) do
+		acc[#acc + 1] = tostring(k) .. "=" .. sig(sub, depth - 1)
+	end
+	return table.concat(acc, ";")
+end
+
+local function store(m, d, id, value)
+	local tbl = m[d.key]
+	if tbl then
+		tbl[id] = value
+	elseif value ~= nil then
+		-- Never minted to hold a nil: a declaration whose mod is absent here
+		-- would otherwise gain an empty orphan table in this machine's save.
+		m[d.key] = { [id] = value }
+	end
+	if d.apply then
+		local ok, err = pcall(d.apply, id, value)
+		if not ok then
+			printe("![xrRazom][ItemMData] apply hook for %s failed: %s", d.key, tostring(err))
+		end
+	end
+	-- Seeded even for an item outside this inventory: a stored set is what the
+	-- other side holds, and voicing it back could only overwrite a newer one.
+	local b = baseline[id]
+	if not b then b = {}; baseline[id] = b end
+	b[d.key] = sig(value, MAX_DEPTH)
+end
+
+local function primed()
+	return primed_for ~= nil and alife_storage_manager.get_state() == primed_for
+end
+
+-- Over the manifest, not over `set`: the set is the item's complete declared
+-- state, so a key the sender omitted is written as nil — the delete.
+local function apply_set(m, id, set)
+	for _, d in ipairs(manifest) do
+		local v = set[d.key]
+		if v ~= nil then v = xrr_mdata_decode(v, MAX_DEPTH) end
+		store(m, d, id, v)
+	end
+end
+
+-- A mod that only just aliased its table at load_state publishes it over
+-- m_data at save_state; carry the inbound entries across so they survive
+-- that overwrite.
+local function prime(m)
+	local before = {}
+	for _, d in ipairs(manifest) do before[d.key] = m[d.key] end
+
+	SendScriptCallback("save_state", m)
+	primed_for = m
+	rebuild = true
+
+	local merged = 0
+	for _, d in ipairs(manifest) do
+		local ours, pub = before[d.key], m[d.key]
+		if ours and pub ~= ours then
+			if pub then
+				for id, v in pairs(ours) do pub[id] = v; merged = merged + 1 end
+			else
+				m[d.key] = ours
+			end
+		end
+	end
+
+	-- Logged here, not at declare(), so a solo game stays silent.
+	local keys = {}
+	for _, d in ipairs(manifest) do keys[#keys + 1] = d.key end
+	printf("[xrRazom][ItemMData] primed on [%s]%s", table.concat(keys, ", "),
+		merged > 0 and strformat("; %s pre-prime entries merged", tostring(merged)) or "")
+end
+
+-- Call before a load_state fire, so each mod aliases a table the riders reach.
+function xrr_item_mdata_ensure_tables(m)
+	for _, d in ipairs(manifest) do
+		if m[d.key] == nil then m[d.key] = {} end
+	end
+end
+
+-- `nil`, never an empty table, when there is nothing to say: an empty set
+-- means everything here is gone.
+function xrr_item_mdata_capture(id)
+	if #manifest == 0 or not (in_session() and primed()) then return nil end
+	local out = {}
+	for _, d in ipairs(manifest) do
+		local tbl = primed_for[d.key]
+		local v = tbl and tbl[id]
+		if v ~= nil then out[d.key] = v end
+	end
+	return out
+end
+
+-- Straight into m_data, primed or not: after the prime it IS the mod's table;
+-- before it, the prime carries the entries into whatever the mod publishes.
+function xrr_item_mdata_apply(id, set)
+	if type(set) ~= "table" then return end
+	for key in pairs(set) do
+		if not by_key(key) and not warned[key] then
+			warned[key] = true
+			printe("![xrRazom][ItemMData] inbound key %s is not declared here — dropped", key)
+		end
+	end
+	apply_set(primed() and primed_for or alife_storage_manager.get_state(), id, set)
+end
+
+-- A join served before the prime would carry no riders, and the peer's silent
+-- baseline seed would keep them missing until the host next touches each item.
+function xrr_item_mdata_ready()
+	return #manifest == 0 or primed()
+end
+
+local function poll(m)
+	local silent = rebuild
+	rebuild = false
+	db.actor:iterate_inventory(function(_, item)
+		local id = item:id()
+		local b = baseline[id]
+		-- No baseline means no set was ever stored: this machine's own creation,
+		-- or an item served before the sender's prime. First sight is a voice.
+		if not b then b = {}; baseline[id] = b end
+		local changed = false
+		for _, d in ipairs(manifest) do
+			local tbl = m[d.key]
+			local s = sig(tbl and tbl[id], MAX_DEPTH)
+			if b[d.key] ~= s then
+				b[d.key] = s
+				changed = true
+			end
+		end
+		if changed and not silent then
+			XrrWorld():MarkSeObjectDirty(id)
+		end
+	end, db.actor)
+end
+
+function actor_on_update()
+	if #manifest == 0 or not in_session() then return end
+	local tg = time_global()
+	if tg < next_poll then return end
+	next_poll = tg + POLL_MS
+
+	local m = alife_storage_manager.get_state()
+	-- The prime's save_state fire needs a live world (db.actor, surge manager).
+	if m ~= primed_for then prime(m) end
+
+	-- A listening host with nobody connected has nobody to voice to; the join
+	-- walk serves current blobs, so the first pass after a join rebuilds silently.
+	if XrrIsHost() and XrrPlayers():GetPeerCount() == 0 then
+		rebuild = true
+		return
+	end
+	poll(m)
+end
+
+-- Ids recycle and the mods prune their tables here directly, bypassing every
+-- setter: a stale signature would silently suppress the next voice.
+function server_entity_on_unregister(se_obj)
+	local id = se_obj and se_obj.id
+	if type(id) ~= "number" then return end
+	baseline[id] = nil
+end
+
+local function reset()
+	primed_for = nil
+	baseline = {}
+	rebuild = true
+	next_poll = 0   -- a rejoin inside a live VM must not wait out the throttle un-primed
+	warned = {}
+end
+
+-- Not at file scope: the module globals these read are not loaded yet there.
+-- Gated because a key declared for an absent mod taxes every item blob.
+local function declare_builtins()
+	if item_exo_device then declare("exo_devices") end                -- Powered Exos: power + PSU
+	if z_mark_switch   then declare("mark_switch_current_marks") end  -- Mark Switch / 3DSS: reticle
+	-- 3DSS 5.x: an installed canted sight exists only as this entry.
+	if scripted_canted_irons then declare("scripted_canted_irons") end
+	if magnifier_switch      then declare("magnifier_switch_bone_states") end  -- 3DSS: magnifier flip
+	if meat_spoiling   then declare("expiration_table") end           -- Meat Spoiling: spoil clock
+	-- GAMMA Mags Reloaded: an installed pouch / loader exists only as its entry.
+	if mag_pouches     then declare("pouches") end
+	if speed_loaders   then declare("speed_loaders") end
+end
+
+function on_game_start()
+	if _applied then return end
+	_applied = true
+
+	declare_builtins()
+	RegisterScriptCallback("actor_on_update", actor_on_update)
+	RegisterScriptCallback("server_entity_on_unregister", server_entity_on_unregister)
+	xrr_register_cleanup(reset)
+end
+
+_G.xrr_item_mdata_capture       = xrr_item_mdata_capture
+_G.xrr_item_mdata_apply         = xrr_item_mdata_apply
+_G.xrr_item_mdata_ready         = xrr_item_mdata_ready
+_G.xrr_item_mdata_ensure_tables = xrr_item_mdata_ensure_tables

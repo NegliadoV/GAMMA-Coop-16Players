@@ -1,0 +1,42 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  G.A.M.M.A. AI Rework: its camper/cover selectors only recognise db.actor as the
+  enemy, so for a peer avatar they run under that avatar's identity.
+]]
+
+local function wrap_selector(name)
+    local orig = schemes_ai_gamma[name]
+    if type(orig) ~= "function" then
+        printe("![xrRazom][ai_rework] schemes_ai_gamma.%s missing — peer avatars stay "
+            .. "invisible to it", name)
+        return
+    end
+
+    -- A zero-arg stub (Useful Idiots' scheme_cover) returns a constant: no swap worth buying.
+    if debug.getinfo(orig, "u").nparams == 0 then
+        log("[xrRazom][ai_rework] " .. name .. " is a stub (disabled by another mod) — not wrapping")
+        return
+    end
+
+    -- xr_conditions looks both up through the module table, so this reaches every condlist.
+    schemes_ai_gamma[name] = function(enemy, npc, actor)
+        if XrrPeerCount == 0 or not (enemy and XrrPlayers():IsPlayerDummy(enemy:id())) then
+            return orig(enemy, npc, actor)
+        end
+        -- Fail as "not the player" (false): a throw would land inside a condlist evaluation.
+        local ok, result = pcall(XrrPlayerIdentityCall, enemy, orig, enemy, npc, actor)
+        if not ok then
+            log("[xrRazom][ai_rework] " .. name .. " crashed: " .. tostring(result))
+            return false
+        end
+        return result
+    end
+end
+
+function on_game_start()
+    if not schemes_ai_gamma then return end  -- mod absent
+    wrap_selector("scheme_camper")
+    wrap_selector("scheme_cover")
+end

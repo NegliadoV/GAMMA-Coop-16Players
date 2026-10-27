@@ -1,0 +1,86 @@
+-- Heals xr_logic state saved before a binder's first update, where
+-- active_section reads back as the string "nil" and leaves the object
+-- logic-less. Not session-gated: no heal condition is reachable in a healthy save.
+
+local orig_initialize_obj = nil
+local orig_save_obj = nil
+
+-- custom_data caps at 4096 bytes, so real logic often lives in the cfg-linked ltx.
+local function resolve_logic_ini(obj)
+    local ini = obj:spawn_ini()
+    if not ini or not ini:section_exist("logic") then return ini end
+    local cfg = ini:r_string_ex("logic", "cfg")
+    if cfg and cfg ~= "" then
+        local ok, linked = pcall(ini_file, cfg)
+        if ok and linked and linked:section_exist("logic") then return linked end
+    end
+    return ini
+end
+
+-- A saved "nil" is a legitimate deactivation only if some condlist can produce
+-- it; an unreadable ini is given the benefit of the doubt.
+local function logic_can_reach_nil(ini)
+    if not ini or not ini.section_for_each then return true end
+    local reachable = false
+    ini:section_for_each(function(sec)
+        if reachable then return end
+        local n = ini:line_count(sec) or 0
+        for i = 0, n - 1 do
+            local res, key, value = ini:r_line(sec, i, "", "")
+            if value and string.find(value, "%f[%w]nil%f[%W]") then
+                reachable = true
+                return
+            end
+        end
+    end)
+    return reachable
+end
+
+local function healed_initialize_obj(obj, st, loaded, actor, stype)
+    if loaded and st.loaded_active_section == "nil" then
+        if st.loaded_section_logic == nil then
+            printf("[xrRazom] logic heal (gen1): %s — never-initialized save state, re-deriving",
+                obj and obj:name() or "?")
+            loaded = false
+        else
+            local ini = resolve_logic_ini(obj)
+            if ini and ini:section_exist("logic") and ini:line_exist("logic", "active") then
+                if not logic_can_reach_nil(ini) then
+                    printf("[xrRazom] logic heal (gen2): %s — saved 'nil' unreachable by its condlists, re-deriving",
+                        obj:name())
+                    loaded = false
+                else
+                    printf("[xrRazom] logic heal SKIP: %s — ini can express nil, honoring saved deactivation",
+                        obj:name())
+                end
+            end
+        end
+    end
+    return orig_initialize_obj(obj, st, loaded, actor, stype)
+end
+
+local function carried_save_obj(obj, packet)
+    local st = obj and db.storage[obj:id()]
+    -- Saved before initialize_obj ran: the loaded state still sits in loaded_*,
+    -- so write that out instead of a blank logic state.
+    if st and st.section_logic == nil and st.loaded_active_section ~= nil then
+        st.ini_filename   = st.loaded_ini_filename
+        st.section_logic  = st.loaded_section_logic
+        st.active_section = (st.loaded_active_section ~= "nil") and st.loaded_active_section or nil
+        st.gulag_name     = (st.loaded_gulag_name ~= "") and st.loaded_gulag_name or nil
+        orig_save_obj(obj, packet)
+        st.ini_filename, st.section_logic, st.active_section, st.gulag_name = nil, nil, nil, nil
+        return
+    end
+    return orig_save_obj(obj, packet)
+end
+
+function on_game_start()
+    if not orig_initialize_obj then
+        orig_initialize_obj = xr_logic.initialize_obj
+        xr_logic.initialize_obj = healed_initialize_obj
+        orig_save_obj = xr_logic.save_obj
+        xr_logic.save_obj = carried_save_obj
+        printf("[xrRazom] logic heal installed (initialize_obj + save_obj wraps)")
+    end
+end

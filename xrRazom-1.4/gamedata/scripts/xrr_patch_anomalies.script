@@ -1,0 +1,549 @@
+-- Anomaly sync: zone layers, artifact patrol paths, pulse strikes. Host-authoritative,
+-- sent at join and after each emission.
+
+local function collect_anomaly_zone_states()
+    local result = {}
+    local n = 0
+
+    local zone_count = 0
+    n = n + 1; result[n] = 0
+
+    local anomalies = db.anomaly_by_name
+    if anomalies then
+        for _, binder in pairs(anomalies) do
+            if binder.layers_count and binder.layers_count > 1 and binder.cur_layer then
+                local layer_num = tonumber(string.sub(binder.cur_layer,
+                    string.find(binder.cur_layer, "_") + 1))
+                if layer_num and binder.object then
+                    zone_count = zone_count + 1
+                    n = n + 1; result[n] = binder.object:id()
+                    n = n + 1; result[n] = layer_num
+                end
+            end
+        end
+    end
+    result[1] = zone_count
+
+    printf("[xrRazom][AnomalySync] collect: %s zone layers (level: %s)",
+        zone_count, level.name())
+
+    return result
+end
+
+-- Returns false when the binder isn't in db.anomaly_by_name yet — the join
+-- bulk arrives while the peer is still loading, so binders can spawn after us.
+local function try_zone_layer(zone_id, layer_num)
+    local anomalies = db.anomaly_by_name
+    if not anomalies then return false end
+
+    for name, binder in pairs(anomalies) do
+        if binder.object and binder.object:id() == zone_id then
+            if binder.layers_count and binder.layers_count > 1 then
+                local new_layer = "layer_" .. layer_num
+                local old_layer = binder.cur_layer
+                if old_layer ~= new_layer then
+                    binder.cur_layer = new_layer
+                    binder.respawn_tries = binder.respawn_tries_table[new_layer]
+                    binder.max_artefacts = binder.max_artefacts_table[new_layer]
+                    binder.applying_force_xz = binder.forces_table[new_layer].xz
+                    binder.applying_force_y = binder.forces_table[new_layer].y
+                    binder.disabled = false
+                    binder:disable_anomaly_fields()
+                    printf("[xrRazom][AnomalySync] PEER zone [%s] id=%s: %s -> %s",
+                        name, zone_id, old_layer, new_layer)
+                else
+                    printf("[xrRazom][AnomalySync] PEER zone [%s] id=%s: already %s (no change)",
+                        name, zone_id, new_layer)
+                end
+            end
+            return true
+        end
+    end
+    return false
+end
+
+local function arm_retry(name, fn)
+    ResetTimeEvent(0, name, 2)
+    CreateTimeEvent(0, name, 2, fn)
+end
+
+-- Peer pending queues are TTL-bounded: the target may never appear (released on
+-- the host first).
+local PENDING_TTL_MS = 120000
+
+local function pending_expired(entry, what)
+    if time_global() - (entry.tg or 0) <= PENDING_TTL_MS then return false end
+    printf("![xrRazom][AnomalySync] PEER %s pending entry expired after %ss, dropped (id=%s)",
+        what, PENDING_TTL_MS / 1000, tostring(entry.zone_id or entry.id))
+    return true
+end
+
+local zl_pending = {}
+
+local function apply_zl_pending()
+    local remaining = {}
+    local count = 0
+    for _, entry in ipairs(zl_pending) do
+        if not try_zone_layer(entry.zone_id, entry.layer)
+            and not pending_expired(entry, "zone-layer") then
+            count = count + 1
+            remaining[count] = entry
+        end
+    end
+    zl_pending = remaining
+    if count > 0 then
+        printf("[xrRazom][AnomalySync] PEER zone layers pending: %s waiting for binder", count)
+        return false
+    end
+    return true
+end
+
+local function on_anomaly_zone_layer(zone_id, layer_num)
+    if XrrIsHost() then return end
+
+    if try_zone_layer(zone_id, layer_num) then return end
+
+    zl_pending[#zl_pending + 1] = { zone_id = zone_id, layer = layer_num, tg = time_global() }
+    arm_retry("xrr_zone_layer_apply", apply_zl_pending)
+end
+
+local function collect_artifact_paths()
+    local result = {}
+    local n = 0
+    local count = 0
+
+    n = n + 1; result[n] = 0
+
+    local ways = bind_anomaly_zone.artefact_ways_by_id
+    local points = bind_anomaly_zone.artefact_points_by_id
+    local zones = bind_anomaly_zone.parent_zones_by_artefact_id
+
+    if ways then
+        for id, path_name in pairs(ways) do
+            local obj = level.object_by_id(id)
+            local zone = zones and zones[id]
+            if obj and zone then
+                count = count + 1
+                n = n + 1; result[n] = id
+                n = n + 1; result[n] = path_name
+                n = n + 1; result[n] = points[id] or 0
+                n = n + 1; result[n] = zone.applying_force_xz or 0
+                n = n + 1; result[n] = zone.applying_force_y or 0
+            end
+        end
+    end
+
+    result[1] = count
+    printf("[xrRazom][ArtifactSync] collect: %s artifact paths", count)
+    return result
+end
+
+local af_path_pending = {}
+
+local function make_zone_stub(force_xz, force_y)
+    local stub = {
+        applying_force_xz = force_xz,
+        applying_force_y  = force_y,
+    }
+    function stub:on_artefact_take(obj)
+        local id = (type(obj.id) == "number") and obj.id or obj:id()
+        bind_anomaly_zone.parent_zones_by_artefact_id[id] = nil
+        bind_anomaly_zone.artefact_ways_by_id[id] = nil
+        bind_anomaly_zone.artefact_points_by_id[id] = nil
+    end
+    return stub
+end
+
+local function apply_af_path_pending()
+    local remaining = {}
+    local count = 0
+    for _, entry in ipairs(af_path_pending) do
+        local obj = level.object_by_id(entry.id)
+        if obj then
+            local artefact = obj:get_artefact()
+            if artefact then
+                local fxz = entry.fxz or 0
+                local fy  = entry.fy  or 0
+                local fv = vector():set(fxz, fy, fxz)
+                artefact:FollowByPath(entry.path, entry.wp, fv)
+                bind_anomaly_zone.artefact_ways_by_id[entry.id] = entry.path
+                bind_anomaly_zone.artefact_points_by_id[entry.id] = entry.wp
+                bind_anomaly_zone.parent_zones_by_artefact_id[entry.id] = make_zone_stub(fxz, fy)
+            end
+        elseif not pending_expired(entry, "artifact-path") then
+            count = count + 1
+            remaining[count] = entry
+        end
+    end
+    af_path_pending = remaining
+    if count > 0 then
+        printf("[xrRazom][ArtifactSync] PEER path pending: %s waiting for online", count)
+        return false
+    end
+    return true
+end
+
+local function on_artifact_path(local_id, path_name, waypoint_idx, force_xz, force_y)
+    if XrrIsHost() then return end
+
+    local obj = level.object_by_id(local_id)
+    if obj then
+        local artefact = obj:get_artefact()
+        if artefact then
+            artefact:FollowByPath(path_name, waypoint_idx,
+                vector():set(force_xz, force_y, force_xz))
+            bind_anomaly_zone.artefact_ways_by_id[local_id] = path_name
+            bind_anomaly_zone.artefact_points_by_id[local_id] = waypoint_idx
+            bind_anomaly_zone.parent_zones_by_artefact_id[local_id] = make_zone_stub(force_xz, force_y)
+            return
+        end
+    end
+
+    af_path_pending[#af_path_pending + 1] = {
+        id = local_id, path = path_name, wp = waypoint_idx,
+        fxz = force_xz, fy = force_y, tg = time_global()
+    }
+    arm_retry("xrr_af_path_apply", apply_af_path_pending)
+end
+
+-- Vanilla measures its "don't switch a zone on top of the player" window from
+-- db.actor alone; only that distance test changes here, so a skipped zone still
+-- waits for the next emission.
+local _orig_dyn_update = nil
+local DYN_SAFE_DIST_SQR = 15 * 15   -- dyn_ano_safe_dist (file-local in bind_anomaly_field)
+
+local function dyn_update_peer_aware()
+    if not (XrrNet() and XrrIsHosted()) then
+        if _orig_dyn_update then return _orig_dyn_update() end
+        return true
+    end
+
+    local lvl = level.name()
+    local t = bind_anomaly_field.dyn_anomalies[lvl]
+    if not t then return true end
+
+    local skipped = 0
+    for id, state in pairs(t) do
+        local obj = level.object_by_id(id)
+        if obj and xrr_patch_common.nearest_player_dist_sqr(obj:position()) > DYN_SAFE_DIST_SQR then
+            obj:enable_anomaly()
+            if state == false then
+                obj:disable_anomaly()
+            end
+            bind_anomaly_field.add_marker(lvl, obj:section(), id, state)
+        else
+            skipped = skipped + 1
+        end
+    end
+
+    if skipped > 0 then
+        printf("[xrRazom][AnomalySync] HOST dyn update: %s zone(s) near a player / offline, left for the next emission",
+            skipped)
+    end
+    return true
+end
+
+local function on_emission_end_sync(typ, _, name)
+    if not XrrIsHost() then return end
+    if typ ~= "anomalies" then return end
+    if name ~= "emission_end" and name ~= "psi_storm_end" then return end
+    if not XrrNet() then return end
+
+    printf("[xrRazom][AnomalySync] HOST emission_end detected, scheduling sync broadcast (3s)")
+
+    CreateTimeEvent(0, "xrr_anomaly_sync_post_emission", 3, function()
+        if XrrWorld then
+            printf("[xrRazom][AnomalySync] HOST broadcasting anomaly zones sync post-emission")
+            XrrWorld():SendAnomalyZonesSync()
+        end
+        return true
+    end)
+
+    CreateTimeEvent(0, "xrr_artifact_paths_post_emission", 5, function()
+        if XrrWorld then
+            printf("[xrRazom][ArtifactSync] HOST broadcasting artifact paths post-emission")
+            XrrWorld():SendArtifactPathsSync()
+        end
+        return true
+    end)
+end
+
+-- Artifacts (low id) spawn before their zone, so item_artefact:net_spawn() finds
+-- artefact_ways_by_id still empty; the zone assigns the paths once it spawns.
+local orig_az_net_spawn = bind_anomaly_zone.anomaly_zone_binder.net_spawn
+
+local function patched_az_net_spawn(self, se_abstract)
+    local ok = orig_az_net_spawn(self, se_abstract)
+    if not ok then return false end
+
+    for id, path_name in pairs(self.artefact_ways_by_id) do
+        local obj = level.object_by_id(id)
+        if obj then
+            local artefact = obj:get_artefact()
+            if artefact then
+                local wp = bind_anomaly_zone.artefact_points_by_id[id] or 0
+                local fxz = self.applying_force_xz or 200
+                local fy  = self.applying_force_y  or 400
+                artefact:FollowByPath(path_name, wp, vector():set(fxz, fy, fxz))
+                printf("[xrRazom][AnomalyFix] retroactive FollowByPath id=%s path=%s", id, path_name)
+            end
+        end
+    end
+
+    return true
+end
+
+-- Vanilla rolls and plays the thunderbolt locally with no alife entity, so each
+-- machine rolls and broadcasts its strike position. Tuning and playback below
+-- are copied from bind_anomaly_field's file-locals — keep them in sync.
+
+local _orig_pulse_update = nil
+
+local PA_snd_distance     = 150
+local PA_snd_delay        = 5.5
+local PA_p_hit_distance   = 10
+local PA_e_hit_distance   = 20
+local PA_hit_delay        = 11.5
+local PA_article_distance = 50
+local PA_max_distance     = 150
+local PA_delay            = 2 * 60 * 1000
+local PA_chance = {
+    ["clear"] = 0, ["partly"] = 0, ["cloudy"] = 10,
+    ["rain"]  = 15, ["storm"] = 25, ["foggy"] = 0,
+}
+local PA_maps = {
+    ["k00_marsh"] = 0.5, ["k01_darkscape"] = 1,   ["k02_trucks_cemetery"] = 1,
+    ["l01_escape"] = 0.2, ["l02_garbage"] = 0.7,  ["l03_agroprom"] = 0.5,
+    ["l04_darkvalley"] = 0.5, ["l06_rostok"] = 1,  ["l07_military"] = 0.5,
+    ["l08_yantar"] = 0.7, ["l09_deadcity"] = 0.5, ["l10_red_forest"] = 1,
+    ["jupiter"] = 1, ["pripyat"] = 1, ["zaton"] = 1, ["l13_generators"] = 1.5,
+    ["l12_stancia_2"] = 1.5, ["l12_stancia"] = 1.5, ["l11_pripyat"] = 0.2,
+    ["l10_radar"] = 1, ["y04_pole"] = 0.7,
+}
+
+local pa_light     = nil
+local pa_pfx       = nil
+local pa_snd_close = nil
+local pa_snd_far   = nil
+local pa_seq       = 0   -- unique CreateTimeEvent suffix (overlapping multi-peer pulses)
+
+local function pa_ensure_assets()
+    if not pa_pfx       then pa_pfx       = particles_object("generator\\generator_accum_thunderbolt") end
+    if not pa_snd_close then pa_snd_close = sound_object("anomaly\\emi_blowout")    end
+    if not pa_snd_far   then pa_snd_far   = sound_object("anomaly\\emi_blowout_01") end
+    if not pa_light then
+        pa_light = script_light()
+        pa_light.range = 100
+        pa_light.lanim = "koster_01_electra"
+        pa_light.lanim_brightness = 0.025
+        pa_light.volumetric = true
+        pa_light.volumetric_quality = 1
+        pa_light.volumetric_distance = 0.25
+        pa_light.volumetric_intensity = 0.05
+    end
+end
+
+local function pa_sound(sound_pos)
+    local distance = distance_2d(db.actor:position(), sound_pos)
+    local snd = (distance > PA_snd_distance) and pa_snd_far or pa_snd_close
+    if snd and snd:playing() then snd:stop() end
+    if snd ~= nil then
+        snd:play_at_pos(db.actor, sound_pos)
+        snd.volume = 1
+    end
+    pa_light:set_position(sound_pos)
+    pa_light.enabled = true
+    pa_light:update()
+    return true
+end
+
+local function pa_hit(particle_pos)
+    pa_light.lanim_brightness = 0.2
+    pa_light.volumetric_distance = 1
+    pa_light.volumetric_intensity = 0.1
+
+    if GetEvent("current_safe_cover") then
+        return true
+    end
+
+    local hit_power = 0
+    local distance = distance_2d(db.actor:position(), particle_pos)
+
+    if distance < PA_article_distance then
+        SendScriptCallback("actor_on_interaction", "anomalies", nil, "pulse")
+    end
+
+    if distance < PA_p_hit_distance then
+        hit_power = math.cos(distance * math.pi / PA_p_hit_distance) + 1
+        local h = hit()
+        h.type = hit.telepatic
+        if (level_environment.is_actor_immune() or dialogs_yantar.actor_has_psi_helmet()) then
+            h.power = 0
+        else
+            h.power = surge_manager.SurgeManager:hit_power(hit_power, h.type)
+        end
+        h.impulse = 0
+        h.direction = VEC_Z
+        h.draftsman = db.actor
+        db.actor:hit(h)
+        level.remove_pp_effector(666)
+        level.add_pp_effector("psi_fade.ppe", 666, false)
+        level.set_pp_effector_factor(666, h.power)
+    end
+
+    if distance < PA_e_hit_distance then
+        hit_power = math.cos(distance * math.pi / PA_e_hit_distance) + 1
+        local h = hit()
+        h.type = hit.shock
+        if (level_environment.is_actor_immune()) then
+            h.power = 0
+        else
+            h.power = surge_manager.SurgeManager:hit_power(hit_power, h.type)
+        end
+        h.impulse = 0
+        h.direction = VEC_Z
+        h.draftsman = db.actor
+        db.actor:hit(h)
+        level.remove_pp_effector(667)
+        level.add_pp_effector("electro_fade.ppe", 667, false)
+        level.set_pp_effector_factor(667, h.power)
+    end
+
+    return true
+end
+
+local function pa_light_dim()
+    pa_light.lanim_brightness = 0.025
+    pa_light.volumetric_distance = 0.25
+    pa_light.volumetric_intensity = 0.05
+    pa_light.enabled = false
+    return true
+end
+
+local function do_pulse(particle_pos)
+    pa_ensure_assets()
+    pa_pfx:play_at_pos(particle_pos)
+
+    pa_seq = pa_seq + 1
+    local s = tostring(pa_seq)
+    CreateTimeEvent(0, "xrr_pulse_snd_" .. s, PA_snd_delay,       pa_sound,     particle_pos)
+    CreateTimeEvent(0, "xrr_pulse_hit_" .. s, PA_hit_delay,       pa_hit,       particle_pos)
+    CreateTimeEvent(0, "xrr_pulse_lgt_" .. s, PA_hit_delay + 0.5, pa_light_dim)
+end
+
+local function emit_pulse(particle_pos)
+    do_pulse(particle_pos)
+    if XrrWorld then
+        XrrWorld():SendPulseAnomaly(level.name(),
+            particle_pos.x, particle_pos.y, particle_pos.z)
+    end
+end
+
+-- Throttle state (mirrors vanilla pAno_first / pAno_tg).
+local pa_first = true
+local pa_tg    = 0
+
+-- Reimplements vanilla's pulse update so the chosen strike position can be broadcast.
+local function pulse_update_wrapper()
+    if not (XrrNet() and (XrrIsHosted() or XrrIsConnected())) then
+        if _orig_pulse_update then return _orig_pulse_update() end
+        return
+    end
+
+    if not db.actor then return end
+
+    local tg = time_global()
+    if pa_first then
+        pa_tg = tg + PA_delay
+        pa_first = false
+        return
+    end
+
+    if pa_light and pa_light.enabled then
+        pa_light:update()
+    end
+
+    if bLevelUnderground or (tg < pa_tg) then return end
+    pa_tg = tg + PA_delay
+
+    local lvl_factor = PA_maps[level.name()] or 0
+    local wthr = level_weathers.get_weather_manager():get_curr_weather()
+    local weather_chance = PA_chance[wthr] or 1
+
+    -- Every machine rolls independently — divide per-roll chance by the
+    -- participant count so the combined rate stays ≈ solo when co-located.
+    local participants = (XrrPlayers() and XrrPlayers():GetPeerCount() or 0) + 1
+    if (math.random(100) > (weather_chance * lvl_factor / participants)) then return end
+
+    local pos = db.actor:position()
+    local angle_rad    = math.rad(math.random(0, 359))
+    local ano_distance = math.random(0, PA_max_distance)
+    local particle_pos = vector():set(
+        pos.x + math.cos(angle_rad) * ano_distance,
+        pos.y + 60,
+        pos.z + math.sin(angle_rad) * ano_distance)
+
+    emit_pulse(particle_pos)
+end
+
+local function on_pulse_anomaly(level_name, x, y, z)
+    if not db.actor then return end
+    if level.name() ~= level_name then return end
+    do_pulse(vector():set(x, y, z))
+end
+
+-- The zone forgets an artefact only through game_statistics.actor_on_item_take,
+-- which a peer's pickup never fires on the host — left listed, the path stays
+-- occupied and turn_off would release the id out of the peer's inventory.
+local function on_peer_artefact_take(avatar_id, item_id)
+    local obj = level.object_by_id(item_id)
+    if not (obj and IsArtefact(obj)) then return end
+    local artefact = obj:get_artefact()
+    if artefact then artefact:FollowByPath("NULL", 0, vector():set(500, 500, 500)) end
+    local zone = bind_anomaly_zone.parent_zones_by_artefact_id[item_id]
+    if zone then
+        zone:on_artefact_take(obj)
+    else
+        bind_anomaly_zone.artefact_ways_by_id[item_id] = nil
+    end
+    printf("[xrRazom][AnomalySync] peer avatar %s took artefact %s(%s): zone %s",
+           tostring(avatar_id), obj:section(), tostring(item_id), zone and "released" or "none")
+end
+
+function apply()
+    RegisterScriptCallback("xrr_on_peer_item_take", on_peer_artefact_take)
+    _G.xrr_collect_anomaly_zone_states = collect_anomaly_zone_states
+    _G.OnAnomalyZoneLayer = on_anomaly_zone_layer
+
+    _G.xrr_collect_artifact_paths = collect_artifact_paths
+    _G.OnArtifactPath             = on_artifact_path
+
+    bind_anomaly_zone.anomaly_zone_binder.net_spawn = patched_az_net_spawn
+
+    -- pulse_anomaly_update is module-global and vanilla calls it by name, so
+    -- replacing the field takes over generation.
+    if bind_anomaly_field and type(bind_anomaly_field.pulse_anomaly_update) == "function" then
+        _orig_pulse_update = bind_anomaly_field.pulse_anomaly_update
+        bind_anomaly_field.pulse_anomaly_update = pulse_update_wrapper
+        _G.OnPulseAnomaly = on_pulse_anomaly
+    else
+        printf("[xrRazom][AnomalySync] pulse: bind_anomaly_field.pulse_anomaly_update missing — pulse sync skipped")
+    end
+
+    if bind_anomaly_field and type(bind_anomaly_field.dyn_anomalies_update) == "function" then
+        _orig_dyn_update = bind_anomaly_field.dyn_anomalies_update
+        bind_anomaly_field.dyn_anomalies_update = dyn_update_peer_aware
+    end
+
+    RegisterScriptCallback("actor_on_interaction", on_emission_end_sync)
+
+    xrr_register_cleanup(function()
+        af_path_pending = {}
+        zl_pending = {}
+        pa_first = true
+        pa_tg    = 0
+        if pa_light then pa_light.enabled = false end
+    end)
+
+    printf("[xrRazom][AnomalySync] patch applied")
+end

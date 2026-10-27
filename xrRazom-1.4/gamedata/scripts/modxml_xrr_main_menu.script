@@ -1,0 +1,65 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Main-menu seams: injects the Connect button, hands the built menu to xrr_menu.
+  Injected, not a whole-file XML copy, so another mod's menu skin survives.
+  The modxml_ prefix is load-bearing: dxml_core loads modxml_*.script by glob.
+]]
+
+-- on_xml_read keys on the aspect-resolved outer name: _16 for 16:9, bare for 4:3/21:9.
+local FILES = {
+    [ [[ui\ui_mm_main_16.xml]] ] = true,
+    [ [[ui\ui_mm_main.xml]]    ] = true,
+}
+
+-- menu_main_logout is absent on purpose (InitShniaga never reads it); the
+-- in-game lists (menu_main_single*, menu_main_mm) must not offer Connect.
+local LISTS = { "menu_main", "menu_main_last_save" }
+
+local BTN = { name = "btn",
+              attr = { name = "btn_multiplayer", caption = "ui_xrr_connect" } }
+
+-- Anchored on btn_quit so another mod's insertions don't shift ours.
+-- insertElementBefore is broken (never reaches .kids), hence insertElement + pos.
+local function inject_list(xml_obj, list_name)
+    local list = xml_obj:query(list_name)[1]
+    if not list then return false end
+
+    local pos, already_there
+    xml_obj:iterateChildren(list, function(v, i)
+        local el = xml_obj:getElement(v)
+        local name = el and el.attr and el.attr.name
+        if name == "btn_multiplayer" then
+            already_there = true
+            return true
+        end
+        if name == "btn_quit" then pos = i end
+    end)
+    -- A stale deployed whole-file XML copy may still carry the button.
+    if already_there then return false end
+
+    xml_obj:insertElement(BTN, list, pos)
+    return true
+end
+
+-- A module function, not a closure — the callback registry keys on the function object.
+function inject_button(xml_file_name, xml_obj)
+    if not FILES[xml_file_name] then return end
+
+    local injected = 0
+    for _, list_name in ipairs(LISTS) do
+        if inject_list(xml_obj, list_name) then injected = injected + 1 end
+    end
+    if injected > 0 then
+        log("[xrRazom] menu: injected btn_multiplayer into " .. xml_file_name)
+    end
+end
+
+function on_xml_read()
+    -- Vanilla exe / xrRazom dll absent: nothing to connect with, so ship no button.
+    if not get_console_cmd(0, "xrr_player_name") then return end
+
+    RegisterScriptCallback("on_xml_read", inject_button)
+    RegisterScriptCallback("main_menu_on_init", xrr_menu.on_main_menu_init)
+end

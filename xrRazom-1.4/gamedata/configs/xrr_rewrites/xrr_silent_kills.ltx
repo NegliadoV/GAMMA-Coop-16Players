@@ -1,0 +1,31 @@
+; xrRazom — stealth kills (base gameplay_silent_kills + 374- Stealth Kill
+; Detection Fix - Catspaw).
+;
+; Two files, one fix: Catspaw's mod exists only to wrap the base evaluator, and
+; a peer's stealth kill is refused by a literal id() == 0 in each of them. Split
+; across two files, either half alone would be a rewrite that changes nothing.
+;
+; The before-hit identity swap (xrr_patch_common) already points db.actor and
+; AC_ID at the peer for the whole callback, so the rest of the evaluator body —
+; active_item(), anybody_see(db.actor), closest_npc_dist — reads the peer's
+; world. Only the three literals below name id 0 directly, which no scoped swap
+; can rebind. Each file applies all-or-nothing: a miss logs INSTALL FAILED and
+; that file runs untouched, which leaves the fix inert. The peer does not judge
+; (xrr_patch_silent_kills); the credit goes to it (xrr_patch_stealth_kill_detection).
+
+; Catspaw registers its wrapper as the module-table value, and axr_main's pass 1
+; runs every module body before pass 2 calls any on_game_start — so the base
+; on_game_start registers this wrapper, and its gate is the first one a peer's
+; hit meets.
+[stealth_kill_detection]
+from_1 = "if (killer_id ~= 0) then return end"
+to_1   = "if not XrrIsPlayerId(killer_id) then return end"
+
+[gameplay_silent_kills]
+; "was this hit dealt by the player" — the evaluator's own entry gate.
+from_1 = "shit.draftsman:id() == 0"
+to_1   = "XrrIsPlayerId(shit.draftsman:id())"
+
+; "is the victim already fighting the player" — no stealth bonus if it is.
+from_2 = "npc:best_enemy():id() == 0"
+to_2   = "XrrIsPlayerId(npc:best_enemy():id())"

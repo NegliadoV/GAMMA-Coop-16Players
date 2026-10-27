@@ -1,0 +1,84 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Wait.script (GAMMA "Books Pass Time"): a book's time-skip becomes a gathered-party
+  action, its fade played party-wide so nobody sees a raw clock jump.
+]]
+
+local _orig_wait = nil
+
+local REASON_WAIT_ITEM = 2  -- must match XRR_TIME_ADV_WAIT_ITEM engine-side
+
+local FADE_PPE     = "fade_nine_sec.ppe"
+local FADE_ID      = 8551213  -- Wait.script's own local effector id
+local K_PP         = 2        -- WORLD_EFFECTOR kind — must match xrr_patch_effects
+local FADE_WIRE_ID = 8551     -- u16 wire id; peers replay at RELAY_ID_OFFSET + this
+
+local function broadcast_party_fade()
+    if XrrWorld() then
+        XrrWorld():SendWorldEffector(K_PP, FADE_PPE, FADE_WIRE_ID, 0, 0)
+    end
+end
+
+-- Peer reader: Wait's own fade is filtered out; the host's broadcast brings it back,
+-- so the whole party fades once, in step with the jump.
+local function orig_wait_fade_suppressed(obj)
+    -- Captured per call, so xrr_patch_effects' apply-time wrap stays underneath.
+    local add_pp = level.add_pp_effector
+    level.add_pp_effector = function(name, id, ...)
+        if not (name == FADE_PPE and id == FADE_ID) then
+            return add_pp(name, id, ...)
+        end
+    end
+    local ok, r = pcall(_orig_wait, obj)
+    level.add_pp_effector = add_pp
+    if not ok then
+        printf("[xrRazom] wait: orig error: %s", tostring(r))
+        return
+    end
+    return r
+end
+
+local function wrapped_wait(obj)
+    if XrrIsHosted() or XrrIsConnected() then
+        if xrr_group_action.veto_if_ungathered() then return end
+        if XrrIsClient() then
+            XrrWorld():ArmTimeForward(REASON_WAIT_ITEM)
+            local r = orig_wait_fade_suppressed(obj)
+            XrrWorld():DisarmTimeForward()
+            return r
+        end
+        -- Host reader: the mod fades the host itself; mirror to peers only
+        -- when the clock actually jumped (wait() no-ops on non-book items).
+        local t0 = game.get_game_time()
+        local r = _orig_wait(obj)
+        if game.get_game_time():diffSec(t0) >= 60 then
+            broadcast_party_fade()
+        end
+        return r
+    end
+    return _orig_wait(obj)
+end
+
+-- Host: a peer's forwarded wait skip just applied.
+local function on_time_advanced(minutes, reason)
+    if reason ~= REASON_WAIT_ITEM then return end
+    if db.actor then
+        level.add_pp_effector(FADE_PPE, FADE_ID, false)
+    end
+    broadcast_party_fade()
+end
+
+function on_game_start()
+    local w = _G["wait"]   -- the FS lowercases script stems
+    if not (w and type(w.wait) == "function") then
+        log("[xrRazom] wait: Wait.script absent — skipped")
+        return
+    end
+    if _orig_wait then return end
+    _orig_wait = w.wait
+    w.wait = wrapped_wait
+    RegisterScriptCallback("xrr_on_time_advanced", on_time_advanced)
+    log("[xrRazom] wait: wrapped wait.wait (gather veto + peer time-forward + party fade)")
+end

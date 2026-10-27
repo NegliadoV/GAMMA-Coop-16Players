@@ -1,0 +1,22 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Module: injects the other-player map spot (ui\map_spots_xrr.xml) into every
+  map_spots variant, so xrr_player_location resolves whichever aspect-ratio
+  file the engine picked. The file name is load-bearing: dxml_core globs
+  modxml_*.script at the $game_scripts$ root and calls on_xml_read on each.
+]]
+
+local targets = {
+    [ [[ui\map_spots.xml]] ]    = true,
+    [ [[ui\map_spots_16.xml]] ] = true,
+    [ [[ui\map_spots_21.xml]] ] = true,
+}
+
+function on_xml_read()
+    RegisterScriptCallback("on_xml_read", function(xml_file_name, xml_obj)
+        if not targets[xml_file_name] then return end
+        xml_obj:insertFromXMLString([[#include "ui\map_spots_xrr.xml"]])
+    end)
+end

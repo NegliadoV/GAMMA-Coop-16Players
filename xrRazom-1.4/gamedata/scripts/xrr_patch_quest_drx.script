@@ -1,0 +1,260 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  DRX Questlines: task generation and DRX effects need the host's A-Life, so a
+  peer sends them to the host as pseudo-ids and receives the resulting task.
+]]
+
+local _orig_drx_sl_give = dialogs.drx_sl_give_sl_task
+local _orig_drx_cf_give = dialogs.drx_sl_give_cf_task
+local _orig_drx_mc_give = dialogs.drx_sl_give_mechanic_task
+local _orig_drx_mc_text = dialogs.drx_sl_text_mechanic_has_ordered_task_to_give
+local _orig_drx_sl_text = dialogs.drx_sl_text_honcho_has_storyline_task_to_give
+
+local _orig_meet_random_honcho   = xr_effects and xr_effects.drx_sl_meet_random_honcho
+local _orig_decrease_sl_count    = xr_effects and xr_effects.drx_sl_decrease_sl_tasks_count
+
+-- <disable_info> runs on whoever is TALKING, so a peer-started questline leaves
+-- the host's drx_sl_start_game_<honcho> gate set. Never strip it pre-emptively
+-- at join/load: bidirectional info sync echoes that onto every save.
+local function disable_all_start_game_gates()
+    local main = axr_task_manager and axr_task_manager.drx_sl_main_honcho_table
+    if not main then return end
+    for _, honcho in pairs(main) do
+        local info = "drx_sl_start_game_" .. honcho
+        if has_alife_info(info) then
+            disable_info(info)
+            printf("[xrRazom][quest] disable_all_start_game_gates: disabled stale %s", info)
+        end
+    end
+end
+
+local function run_host_meet_gen()
+    if _orig_meet_random_honcho then _orig_meet_random_honcho(db.actor, nil, nil) end
+    disable_all_start_game_gates()
+end
+
+-- A host-broadcast DRX task needs matching peer pstor, so dialog actions read
+-- the right drx_sl_current_honcho / task_number.
+function xrr_drx_task_received(task_id)
+    if XrrIsHost() then return end
+    if not task_id or string.sub(task_id, 1, 7) ~= "drx_sl_" then return end
+
+    utils_data.save_var(db.actor, "drx_sl_current_task", task_id)
+
+    local honcho = task_id:match("^drx_sl_(.+)_meet_task_%d+$")
+    if honcho then
+        utils_data.save_var(db.actor, "drx_sl_current_honcho", honcho)
+        printf("[xrRazom][quest] xrr_drx_task_received meet honcho=%s", honcho)
+        return
+    end
+
+    local sg_honcho = task_id:match("^drx_sl_(.+)_start_game_%d+$")
+    if sg_honcho then
+        utils_data.save_var(db.actor, "drx_sl_current_honcho", sg_honcho)
+        printf("[xrRazom][quest] xrr_drx_task_received start_game honcho=%s", sg_honcho)
+        return
+    end
+
+    -- find_wish_granter: no additional pstor needed (info portion is the gate)
+end
+
+-- Peer side of a DRX task completing: disabling the gate info portions is what
+-- makes the now-stale dialog options disappear.
+function xrr_drx_on_task_complete(task_id)
+    if XrrIsHost() then return end
+    if not task_id or string.sub(task_id, 1, 7) ~= "drx_sl_" then return end
+
+    local honcho = task_id:match("^drx_sl_(.+)_meet_task_%d+$")
+    if honcho then
+        local info = "drx_sl_meet_honcho_" .. honcho
+        if has_alife_info(info) then
+            disable_info(info)
+            printf("[xrRazom][quest] xrr_drx_on_task_complete: disabled %s", info)
+        end
+        return
+    end
+
+    local sg_honcho = task_id:match("^drx_sl_(.+)_start_game_%d+$")
+    if sg_honcho then
+        local info = "drx_sl_start_game_" .. sg_honcho
+        if has_alife_info(info) then
+            disable_info(info)
+            printf("[xrRazom][quest] xrr_drx_on_task_complete: disabled %s", info)
+        end
+        return
+    end
+
+    if task_id == "drx_sl_find_wish_granter" then
+        if has_alife_info("drx_sl_on_find_wish_granter") then
+            disable_info("drx_sl_on_find_wish_granter")
+            printf("[xrRazom][quest] xrr_drx_on_task_complete: disabled drx_sl_on_find_wish_granter")
+        end
+    end
+end
+
+function apply()
+    log("[xrRazom] Patching DRX Questlines for co-op")
+
+    _G.xrr_story_quest_handlers = _G.xrr_story_quest_handlers or {}
+
+    -- cf-task owner map: abandoned tasks / disconnected peers would leak stale
+    -- task->conn attributions, so reset per game start and on session end.
+    _G.xrr_cf_task_owner = {}
+    xrr_register_cleanup(function() _G.xrr_cf_task_owner = {} end)
+
+    -- (0) DRX xr_effects read actor pstor / A-Life honcho state a peer lacks: routed
+    --     to the host, and skipped for a host-driven effect the host already ran.
+    if xr_effects and type(xr_effects.drx_sl_meet_random_honcho) == "function" then
+        xr_effects.drx_sl_meet_random_honcho = function(actor, npc, p)
+            if XrrIsHost() then return run_host_meet_gen() end
+            if _G.xrr_host_driven_task_effect then
+                printf("[xrRazom][quest] drx_sl_meet_random_honcho PEER: host-driven task effect, skip (host owns meet-gen)")
+                return
+            end
+            local host_id = xrr_pending_npc_lock_host_id() or 65535
+            if host_id == 0 then host_id = 65535 end
+            printf("[xrRazom][quest] xr_effects.drx_sl_meet_random_honcho PEER -> __drx_meet_random npc=%s",
+                tostring(host_id))
+            XrrAlife():SendQuestAccept("__drx_meet_random", host_id)
+        end
+    end
+
+    -- (0b) The cf task is host-delegated, so its faction change would land on the
+    --      host's actor; redirect it to the peer recorded in _G.xrr_cf_task_owner.
+    if xr_effects and type(xr_effects.drx_sl_change_factions) == "function" then
+        local _orig_change_factions = xr_effects.drx_sl_change_factions
+        xr_effects.drx_sl_change_factions = function(actor, npc, p)
+            if XrrIsHost() and p and p[1] then
+                local tid   = _G.xrr_completing_task_id
+                local owner = tid and _G.xrr_cf_task_owner and _G.xrr_cf_task_owner[tid]
+                if owner then
+                    printf("[xrRazom][quest] drx_sl_change_factions: peer-owned cf task=%s conn=%s faction=%s -> redirect (host unchanged)",
+                        tostring(tid), tostring(owner), tostring(p[1]))
+                    XrrAlife():SendFactionSet(owner, p[1])
+                    _G.xrr_cf_task_owner[tid] = nil
+                    return
+                end
+            end
+            return _orig_change_factions(actor, npc, p)
+        end
+    end
+
+    if xr_effects and type(xr_effects.drx_sl_decrease_sl_tasks_count) == "function" then
+        xr_effects.drx_sl_decrease_sl_tasks_count = function(actor, npc, p)
+            if XrrIsHost() then return _orig_decrease_sl_count(actor, npc, p) end
+            if _G.xrr_host_driven_task_effect then
+                printf("[xrRazom][quest] drx_sl_decrease_sl_tasks_count PEER: host-driven task effect, skip (host owns counter)")
+                return
+            end
+            local host_id = xrr_pending_npc_lock_host_id() or 65535
+            if host_id == 0 then host_id = 65535 end
+            printf("[xrRazom][quest] xr_effects.drx_sl_decrease_sl_tasks_count PEER -> __drx_decrease npc=%s",
+                tostring(host_id))
+            XrrAlife():SendQuestAccept("__drx_decrease", host_id)
+        end
+    end
+
+    -- (1) Text-precondition passthroughs. Cosmetic only — the peer-shown
+    --     description may be wrong (A-Life-blind); the real task comes via (2).
+    dialogs.drx_sl_text_mechanic_has_ordered_task_to_give = function(a, b)
+        return _orig_drx_mc_text(a, b)
+    end
+
+    dialogs.drx_sl_text_honcho_has_storyline_task_to_give = function(a, b)
+        return _orig_drx_sl_text(a, b)
+    end
+
+    -- (2) Give-task pivot: the peer sends a pseudo-id; the host's OnQuestAccept
+    --     runs vanilla give and broadcast_task delivers the chosen task back.
+    local function send_drx_pseudo(pseudo_id)
+        local host_id = xrr_pending_npc_lock_host_id()
+        if not (host_id and host_id > 0) then
+            printf("[xrRazom][quest] %s PEER: no lock host_id, dropping", pseudo_id)
+            return
+        end
+        printf("[xrRazom][quest] %s PEER -> SendQuestAccept npc=%s", pseudo_id, tostring(host_id))
+        XrrAlife():SendQuestAccept(pseudo_id, host_id)
+    end
+
+    dialogs.drx_sl_give_sl_task = function(a, b)
+        if XrrIsHost() then return _orig_drx_sl_give(a, b) end
+        send_drx_pseudo("__drx_sl")
+    end
+
+    dialogs.drx_sl_give_cf_task = function(a, b)
+        if XrrIsHost() then return _orig_drx_cf_give(a, b) end
+        send_drx_pseudo("__drx_cf")
+    end
+
+    dialogs.drx_sl_give_mechanic_task = function(a, b)
+        if XrrIsHost() then return _orig_drx_mc_give(a, b) end
+        send_drx_pseudo("__drx_mc")
+    end
+
+    -- (3) Vanilla give relies on dialogs.last_task_id, set by the drx_sl_text_*
+    --     precondition that ran on the PEER — regenerate it here, then run the
+    --     trigger_*_func pair that saves the pstor var the target functor reads.
+    local function run_drx_give_on_host(generator, orig_give, npc, kind)
+        if axr_task_manager and generator then
+            dialogs.last_task_id = generator(npc)
+        end
+        if dialogs.last_task_id and axr_task_manager then
+            if axr_task_manager.trigger_job_func then
+                axr_task_manager.trigger_job_func(dialogs.last_task_id)
+            end
+            if axr_task_manager.trigger_fetch_func then
+                axr_task_manager.trigger_fetch_func(dialogs.last_task_id)
+            end
+        end
+        -- Capture before orig_give: vanilla nils last_task_id after giving.
+        local given_task_id = dialogs.last_task_id
+        printf("[xrRazom][quest] %s HOST -> last_task_id=%s, running vanilla",
+            kind, tostring(given_task_id))
+        orig_give(db.actor, npc)
+        return given_task_id
+    end
+
+    _G.xrr_story_quest_handlers["__drx_sl"] = function(npc_host_id)
+        local npc = level.object_by_id(npc_host_id)
+        if not npc then return end
+        run_drx_give_on_host(axr_task_manager and axr_task_manager.drx_sl_generate_random_sl_task,
+                             _orig_drx_sl_give, npc, "__drx_sl")
+    end
+    _G.xrr_story_quest_handlers["__drx_cf"] = function(npc_host_id)
+        local npc = level.object_by_id(npc_host_id)
+        if not npc then return end
+        local cf_task_id = run_drx_give_on_host(
+                             axr_task_manager and axr_task_manager.drx_sl_generate_change_factions_task,
+                             _orig_drx_cf_give, npc, "__drx_cf")
+        -- Attribute the task to the requester so change_factions can redirect it.
+        if cf_task_id and _G.xrr_quest_accept_conn then
+            _G.xrr_cf_task_owner = _G.xrr_cf_task_owner or {}
+            _G.xrr_cf_task_owner[cf_task_id] = _G.xrr_quest_accept_conn
+            printf("[xrRazom][quest] __drx_cf owner: task=%s conn=%s",
+                tostring(cf_task_id), tostring(_G.xrr_quest_accept_conn))
+        end
+    end
+    _G.xrr_story_quest_handlers["__drx_mc"] = function(npc_host_id)
+        local npc = level.object_by_id(npc_host_id)
+        if not npc then return end
+        run_drx_give_on_host(axr_task_manager and axr_task_manager.drx_sl_get_mechanic_task,
+                             _orig_drx_mc_give, npc, "__drx_mc")
+    end
+
+    -- (4) xr_effects pseudo-id handlers: the vanilla effects use db.actor, so
+    --     npc_host_id is unused.
+    _G.xrr_story_quest_handlers["__drx_meet_random"] = function(npc_host_id)
+        if _orig_meet_random_honcho then
+            printf("[xrRazom][quest] __drx_meet_random HOST -> running vanilla")
+            run_host_meet_gen()
+        end
+    end
+    _G.xrr_story_quest_handlers["__drx_decrease"] = function(npc_host_id)
+        if _orig_decrease_sl_count then
+            printf("[xrRazom][quest] __drx_decrease HOST -> running vanilla")
+            _orig_decrease_sl_count(db.actor, nil, nil)
+        end
+    end
+end

@@ -1,0 +1,21 @@
+; xrRazom — world-loot state, for xrr_patch_game_setup.script.
+; game_setup keeps the loot-spot state and the pending roll in file-locals its
+; own actor_on_item_take consumes; a peer's pickup needs the host to do that
+; from xrr_on_peer_item_take, and the eager bake needs to write the vanilla
+; binder tables that would otherwise restore the save's value over it on the
+; binder's first update. Sections merge additively across unlocalizer files
+; (Interaction Dot Marks already promotes world_itm_on / world_itm_num).
+
+[game_setup]
+world_itm_info
+world_itm_off
+world_itm_num
+world_itm_on
+limited_uses
+
+[bind_item]
+item_condition
+item_uses
+
+[item_device]
+dev_condition

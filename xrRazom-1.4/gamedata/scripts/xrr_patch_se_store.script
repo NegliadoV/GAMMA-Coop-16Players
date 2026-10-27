@@ -1,0 +1,26 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+
+  Module: se_object store patch — the runtime voice for
+  alife_storage_manager.get_state().se_object[id].
+
+  A plain Lua table the engine only touches at save/load, so wrapping
+  se_save_var globally is the only hook available; no mod localizes it.
+]]
+
+local _applied = false
+
+function on_game_start()
+	if _applied then return end
+	_applied = true
+
+	local orig = se_save_var
+	_G.se_save_var = function(id, name, varname, val)
+		orig(id, name, varname, val)
+		-- Numeric ids only: MarkSeObjectDirty's luabind u32 parameter rejects any
+		-- other key type, and a non-numeric key is never an alife id anyway.
+		if type(id) == "number" and (XrrIsHosted() or XrrIsConnected()) then
+			XrrWorld():MarkSeObjectDirty(id)
+		end
+	end
+end

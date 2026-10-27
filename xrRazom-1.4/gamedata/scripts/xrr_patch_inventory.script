@@ -1,0 +1,234 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Inventory patch: a "Send to <Nickname>" RMB entry per nearby peer and a
+  send-money button. ui_inventory builds its context menu from self.properties,
+  bypassing C++ CUIActorMenu, hence the InitProperties wrap.
+]]
+
+local MAX_SEND_TO_SLOTS = 8
+local SEND_TO_RADIUS_M  = 5.0
+
+local _slot_cache = {}
+
+local function refresh_slot_cache()
+    _slot_cache = {}
+
+    if not (XrrIsConnected() or XrrIsHost()) then return end
+
+    local actor = db.actor
+    if not actor then return end
+    local actor_pos = actor:position()
+    local r_sq = SEND_TO_RADIUS_M * SEND_TO_RADIUS_M
+
+    local peer_count = XrrPlayers():GetPeerCount()
+    local slot = 1
+    for i = 1, peer_count do
+        if slot > MAX_SEND_TO_SLOTS then break end
+
+        local netid = XrrPlayers():GetPeerNetidAt(i)
+        local cid   = XrrPlayers():GetPeerLocalIdAt(i)
+
+        if netid and netid ~= "" and netid ~= "0" and cid and cid > 0 then
+            local proxy = level.object_by_id(cid)
+            if proxy then
+                local d_sq = actor_pos:distance_to_sqr(proxy:position())
+                if d_sq <= r_sq then
+                    local nick = proxy:character_name()
+                    if not nick or nick == "" then nick = proxy:name() end
+                    _slot_cache[slot] = { netid = netid, nick = nick or "?" }
+                    slot = slot + 1
+                end
+            end
+        end
+    end
+end
+
+-- Money transfer
+
+local MAX_MONEY_SLOTS = 8
+
+local _money_slots = {}
+
+local function refresh_money_slots()
+    _money_slots = {}
+    if not (XrrIsConnected() or XrrIsHost()) then return end
+
+    local count = XrrPlayers():GetPeerCount()
+    local slot = 1
+    for i = 1, count do
+        if slot > MAX_MONEY_SLOTS then break end
+        local netid = XrrPlayers():GetPeerNetidAt(i)
+        if netid and netid ~= "" and netid ~= "0" then
+            -- Empty nickname = the peer's avatar isn't live locally.
+            local nick = XrrPlayers():GetPeerNicknameAt(i)
+            if nick and nick ~= "" then
+                _money_slots[slot] = { netid = netid, nick = nick }
+                slot = slot + 1
+            end
+        end
+    end
+end
+
+local function money_tip(text)
+    news_manager.send_tip(db.actor, text, nil, "nano", 8000)
+end
+
+function on_game_start()
+    if not (ui_inventory and ui_inventory.UIInventory) then
+        printe("[xrr_patch_inventory] ui_inventory.UIInventory missing — Tronex inventory mod not active; nothing to patch")
+        return
+    end
+
+    local UIInv = ui_inventory.UIInventory
+
+    local _send_to_prefix = game.translate_string("st_send_to") .. " "
+
+    -- Vanilla's property iterator hands precondition1 the game object but
+    -- name_func/action the item id.
+
+    function UIInv:xrr_Cond_SendTo(obj, bag, fn_name, i)
+        return _slot_cache[i] ~= nil
+    end
+
+    function UIInv:xrr_Name_SendTo(id, bag, fn_name, i)
+        local slot = _slot_cache[i]
+        if not slot then return false end
+        return _send_to_prefix .. slot.nick
+    end
+
+    function UIInv:xrr_Action_SendTo(id, bag, fn_name, i)
+        local slot = _slot_cache[i]
+        if not slot then return end
+        if not id or id == 0 or id == 65535 then return end
+        XrrPlayers():SendGiveItem(slot.netid, id)
+    end
+
+    local _orig_InitProperties = UIInv.InitProperties
+    function UIInv:InitProperties(obj, bag)
+        refresh_slot_cache()
+
+        if not self._xrr_send_to_installed then
+            for i = 1, MAX_SEND_TO_SLOTS do
+                self.properties["xrr_send_to_" .. i] = {
+                    index         = 26 + i,                              -- after vanilla 25 (drop_all)
+                    name_func     = { "xrr_Name_SendTo", i },
+                    mode          = { inventory = true },                -- pre-t2k'd (vanilla __init t2k pass already ran)
+                    cont          = { actor_bag = true, actor_equ = true, actor_belt = true },
+                    precondition1 = { "xrr_Cond_SendTo", i },
+                    action        = { "xrr_Action_SendTo", i },
+                }
+            end
+            self._xrr_send_to_installed = true
+        end
+
+        return _orig_InitProperties(self, obj, bag)
+    end
+
+    -- Lazy one-shot: the anchors only exist once vanilla InitControls has run.
+    function UIInv:xrr_EnsureMoneyUI()
+        if self._xrr_money_ui ~= nil then return end
+        if not (self.player_dialog and self.player_money) then
+            self._xrr_money_ui = false
+            printe("[xrr_patch_inventory] player money anchors missing — send-money button disabled")
+            return
+        end
+
+        local xml = CScriptXmlInit()
+        xml:ParseFile("ui_xrrazom_inventory.xml")
+        local btn = xml:Init3tButton("xrr_send_money", self.player_dialog)
+        local mp = self.player_money:GetWndPos()
+        btn:SetWndPos(vector2():set(
+            mp.x - btn:GetWidth() - 4,
+            mp.y + (self.player_money:GetHeight() - btn:GetHeight()) / 2))
+        self:Register(btn, "xrr_money_btn")
+        self:AddCallback("xrr_money_btn", ui_events.BUTTON_CLICKED, self.xrr_OnMoneyBtn, self)
+        self.xrr_money_btn = btn
+
+        -- Own message box instance: the vanilla "mbr" box has its YES wired to
+        -- the repair confirm.
+        self.xrr_money_box = CUIMessageBoxEx()
+        self:Register(self.xrr_money_box, "xrr_money_box")
+        self:AddCallback("xrr_money_box", ui_events.MESSAGE_BOX_YES_CLICKED, self.xrr_MoneyConfirm, self)
+        self._xrr_money_ui = true
+    end
+
+    function UIInv:xrr_OnMoneyBtn()
+        if not db.actor then return end
+        if db.actor:money() == 0 then
+            money_tip(game.translate_string("st_xrr_money_none"))
+            return
+        end
+        refresh_money_slots()
+
+        local actions, names, params = {}, {}, {}
+        for i = 1, MAX_MONEY_SLOTS do
+            if not _money_slots[i] then break end
+            actions[i] = "xrr_MoneyTo"
+            names[i]   = _money_slots[i].nick
+            params[i]  = { i }
+        end
+        if #names == 0 then
+            money_tip(game.translate_string("st_xrr_money_no_peers"))
+            return
+        end
+        -- item_props runs names through translate_string; unknown ids pass through.
+        self.item_props:Reset(GetCursorPosition(), actions, names, params)
+    end
+
+    function UIInv:xrr_MoneyTo(i)
+        local slot = _money_slots[i]
+        if not slot then return end
+        self._xrr_money_target = slot
+
+        local box = self.xrr_money_box
+        box:InitMessageBox("msg_box_xrr_send_money")
+        box:SetText(string.format(game.translate_string("st_xrr_send_money_title"), slot.nick))
+        box:ShowDialog(true)
+    end
+
+    function UIInv:xrr_MoneyConfirm()
+        local slot = self._xrr_money_target
+        self._xrr_money_target = nil
+        if not (slot and db.actor) then return end
+
+        local amount = math.floor(tonumber(self.xrr_money_box:GetHost() or "") or 0)
+        if amount < 1 then return end
+
+        refresh_money_slots()
+        local present = false
+        for _, s in pairs(_money_slots) do
+            if s.netid == slot.netid then present = true break end
+        end
+        if not present then
+            money_tip(game.translate_string("st_xrr_money_no_target"))
+            return
+        end
+
+        local have = db.actor:money()
+        if have == 0 then
+            money_tip(game.translate_string("st_xrr_money_none"))
+            return
+        end
+        if amount > have then amount = have end
+
+        local sent = XrrPlayers():SendMoneyTransfer(slot.netid, amount)
+        if sent and sent > 0 then
+            -- The money readout only redraws on open.
+            self:UpdateCharacter()
+            money_tip(string.format(game.translate_string("st_xrr_money_sent"),
+                tostring(sent), xrr_currency.suffix(), slot.nick))
+        else
+            money_tip(game.translate_string("st_xrr_money_no_target"))
+        end
+    end
+
+    -- Reset runs on every open in every mode.
+    local _orig_Reset = UIInv.Reset
+    function UIInv:Reset(obj)
+        _orig_Reset(self, obj)
+        self:xrr_EnsureMoneyUI()
+        if self.xrr_money_btn then
+            self.xrr_money_btn:Show(XrrIsConnected() or XrrIsHost())
+        end
+    end
+end

@@ -1,0 +1,497 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Perk-Based Artefacts (GAMMA): every perk reads this machine's belt. Under a
+  peer's identity the host declines them and applies the damage factor that
+  peer measured on its own belt; a peer raises its own stalker death perks and
+  asks the host for their world half (pba:corpse, pba:bleed).
+]]
+
+local SCALE_KEY     = "pba"
+local VERB_CORPSE   = "pba:corpse"
+local VERB_BLEED    = "pba:bleed"
+local F_EXPLODE     = 1
+local F_RELEASE     = 2
+local RECORD_TTL_MS = 30000
+local MAX_SECTIONS  = 25
+local MAX_BLEED_S   = 10
+
+local function on_peer()
+    return XrrSessionActive and not XrrHosting
+end
+
+local function is_peer_hit(shit)
+    local drafts = shit and shit.draftsman
+    return drafts ~= nil and XrrPlayers():IsPlayerDummy(drafts:id())
+end
+
+-- A copy of af_moh's invisibility activator plus the peer-hit return: its hit
+-- closure is out of the registry's reach. Re-check when GAMMA changes the perk.
+local function moh_invisibility(effect)
+    return function(self, actor)
+        local pba = perk_based_artefacts
+
+        local function ignore_enemy(obj, enemy, flags)
+            if enemy:id() == AC_ID then
+                flags.override = true
+                flags.result = false
+            end
+        end
+
+        local function enable_enemy()
+            UnregisterScriptCallback("on_enemy_eval", ignore_enemy)
+            pba.remove_status_effect("af_moh_invisibility")
+        end
+
+        local function enable_enemy_on_hit(obj, s_hit)
+            if is_peer_hit(s_hit) then return end
+            if s_hit.draftsman:id() == AC_ID then
+                enable_enemy()
+            end
+        end
+
+        self:register("on_enemy_eval", ignore_enemy)
+        RegisterScriptCallback("actor_on_weapon_fired", enable_enemy)
+        RegisterScriptCallback("monster_on_before_hit", enable_enemy_on_hit)
+        RegisterScriptCallback("npc_on_before_hit", enable_enemy_on_hit)
+        pba.add_status_effect(60, nil, "af_moh_invisibility")
+
+        self:add_effect(function()
+            effect(actor)
+        end, function()
+            UnregisterScriptCallback("actor_on_weapon_fired", enable_enemy)
+            UnregisterScriptCallback("monster_on_before_hit", enable_enemy_on_hit)
+            UnregisterScriptCallback("npc_on_before_hit", enable_enemy_on_hit)
+            pba.remove_status_effect("af_moh_invisibility")
+        end)
+    end
+end
+
+-- Host: corpse writes
+
+-- The host's actor is a stalker to IsStalker and is never a verb's target; the
+-- wire id is a u32 that level.object_by_id would truncate onto it.
+local function creature(id)
+    local obj = id ~= AC_ID and id < 65535 and level.object_by_id(id)
+    return obj and (IsStalker(obj) or IsMonster(obj)) and obj or nil
+end
+
+-- Polls for as long as the spawn exists; the section tells it from a recycled id.
+local function when_online(se_obj, fn)
+    local id, section = se_obj.id, se_obj:section_name()
+    CreateTimeEvent("xrr_pba", "online_" .. id, 0, function()
+        local obj = level.object_by_id(id)
+        if obj then
+            if obj:section() == section then fn(obj) end
+            return true
+        end
+        local se = alife_object(id)
+        return not (se and se:section_name() == section)
+    end)
+end
+
+local function release_corpse(id)
+    local victim = creature(id)
+    if victim and not victim:alive() then xrr_release_entity(id) end
+end
+
+local function explode_corpse(victim)
+    local id = victim:id()
+    local se_obj = alife_create("ied_new_blow", victim:position(),
+        victim:level_vertex_id(), victim:game_vertex_id())
+    if not se_obj then return end
+    when_online(se_obj, function(ied)
+        release_corpse(id)
+        ied:explode(0)
+    end)
+end
+
+-- Peer: death perks
+
+-- A death reaches a peer a round trip after its hit, when the mod's last-hit
+-- globals describe a later shot: [victim id] = what this peer's hits on it rolled.
+local records = {}
+
+local function live_record(id)
+    local rec = records[id]
+    if rec and time_global() - rec.seen_at <= RECORD_TTL_MS then return rec end
+end
+
+local function note_hit(victim, s_hit, bone_id)
+    local id, now = victim:id(), time_global()
+    local rec = live_record(id)
+    if not rec then
+        -- Ids recycle, and a death this peer never sees leaves its entry behind.
+        for stale_id, stale in pairs(records) do
+            if now - stale.seen_at > RECORD_TTL_MS then records[stale_id] = nil end
+        end
+        rec = {}
+        records[id] = rec
+    end
+    local props = perk_based_artefacts.artefact_props
+    rec.seen_at   = now
+    rec.hit_type  = s_hit.type
+    rec.hit_bone  = bone_id
+    rec.de_roll   = props.af_dragon_eye.dice_roll
+    rec.claw_roll = props.af_kogot.dice_roll
+end
+
+-- A mirror's hit callback is raised only by the host's echo, and a corpse is never
+-- echoed, so the last one is the lethal hit. The death callback's own synthetic
+-- hit carries a string for a bone.
+local function note_kill_bone(npc, amount, local_direction, who, bone_index)
+    if not (on_peer() and who and who:id() == AC_ID and type(bone_index) == "number") then return end
+    local rec = live_record(npc:id())
+    if rec then rec.kill_bone = bone_index end
+end
+
+-- A world spawn returns nil on a peer and the mod's death bodies dereference it,
+-- so their replacements below state the world half here instead. `open` only
+-- inside a peer's death dispatch.
+local corpse = { sections = {} }
+
+local function gib_fx(victim)
+    local pos  = victim:position()
+    local gibs = particles_object("new_effects\\krovisha_main")
+    if gibs then gibs:play_at_pos(pos) end
+    local snd = xr_sound.get_safe_sound_object("perk_based_artefacts\\XDEATH" .. math.random(5))
+    if snd then
+        snd:play_at_pos(victim, pos, 0, sound_object.s3d)
+        snd.frequency = random_float(0.95, 1.05)
+    end
+end
+
+local function skull_miser_on_death(orig)
+    return function(actor, count, ids, names, npc, ...)
+        if not corpse.open then return orig(actor, count, ids, names, npc, ...) end
+        local props = perk_based_artefacts.artefact_props
+        local rec   = live_record(npc:id())
+        local bone  = rec and (rec.kill_bone or rec.hit_bone)
+        if not (bone and props.af_skull_miser.head_bones[bone]) then return end
+
+        local money, sections = props.af_skull_miser.money_items, corpse.sections
+        for _ = 1, count * 3 do
+            sections[#sections + 1] = money[math.random(#money)]
+        end
+        props.af_lucifer:change_condition(0.005)
+    end
+end
+
+-- The death gate has no pellet divisor, so a pellet that missed the one-shot can
+-- still explode the corpse: the roll is compared, not a latch from before-hit.
+local function dragon_eye_on_death(orig)
+    return function(self, actor, count, ids, names, npc, ...)
+        if not corpse.open then return orig(self, actor, count, ids, names, npc, ...) end
+        local rec = live_record(npc:id())
+        if (rec and rec.de_roll or self.dice_roll) > self.chance * count then return end
+
+        corpse.explode = true
+        gib_fx(npc)
+        perk_based_artefacts.artefact_props.af_lucifer:change_condition(0.01)
+    end
+end
+
+local function claw_on_death(orig)
+    return function(self, actor, count, ids, names, victim, ...)
+        if not corpse.open then return orig(self, actor, count, ids, names, victim, ...) end
+        local lucifer = perk_based_artefacts.artefact_props.af_lucifer
+        local rec     = live_record(victim:id())
+        local bonus   = math.max(1 - normalize(lucifer.condition, 0, 0.5), 0)
+        local overpowered = lucifer:check_lucifer()
+            and (rec and rec.claw_roll or self.dice_roll) < bonus * bonus
+        if overpowered then
+            corpse.release = true
+            gib_fx(victim)
+            lucifer:change_condition(0.01)
+        end
+
+        local meat = self.monster_to_meat[SYS_GetParam(0, victim:section(), "kind", 0)]
+            or self.monster_to_meat[victim:clsid()]
+        if not (meat and rec and self.valid_hits[rec.hit_type]) then return end
+        local sections = corpse.sections
+        for _ = 1, count + (overpowered and 5 or 0) do
+            sections[#sections + 1] = meat
+        end
+    end
+end
+
+-- One request per death, sent after every perk has run, so loot is placed
+-- before the corpse it is placed around is removed.
+local function peer_death(orig, artefacts_table, victim, ...)
+    local id = victim:id()
+    corpse.open, corpse.explode, corpse.release = true, false, false
+    orig(artefacts_table, victim, ...)
+    corpse.open = false
+    records[id] = nil
+
+    local sections = corpse.sections
+    if #sections == 0 and not (corpse.explode or corpse.release) then return end
+    xrr_use_intent.request{
+        verb   = VERB_CORPSE,
+        obj_id = id,
+        state  = (corpse.explode and F_EXPLODE or 0) + (corpse.release and F_RELEASE or 0),
+        args   = table.concat(sections, "|"),
+    }
+    for i = #sections, 1, -1 do sections[i] = nil end
+end
+
+-- GBO raises the stalker death perks from its own health write, which a mirror refuses.
+local function raise_stalker_death(npc, who)
+    if not (on_peer() and who and who:id() == AC_ID) then return end
+    local pba = perk_based_artefacts
+    pba.process_artefacts(pba.artefact_on_npc_death_functions, npc, who)
+end
+
+-- Peer: damage factor
+
+local function peer_before_hit(orig, artefacts_table, victim, s_hit, bone_id, ...)
+    local before = s_hit.power
+    orig(artefacts_table, victim, s_hit, bone_id, ...)
+    local after = s_hit.power
+    if before > 0 and after ~= before then
+        XrrPlayers():DeclareHitScale(SCALE_KEY, after / before)
+    end
+    note_hit(victim, s_hit, bone_id)
+end
+
+-- The perk still runs for its local feedback; its multiplier stays out of the
+-- declared factor because the host cannot reproduce the rest of its damage.
+local function keep_out_of_factor(perk)
+    local orig = perk.on_before_hit
+    perk.on_before_hit = function(self, actor, count, ids, names, npc, s_hit, ...)
+        if not on_peer() then return orig(self, actor, count, ids, names, npc, s_hit, ...) end
+        local power = s_hit.power
+        orig(self, actor, count, ids, names, npc, s_hit, ...)
+        s_hit.power = power
+    end
+end
+
+-- Thistle bleeds its victim from a timed effect: a health write a mirror refuses.
+-- momopate schedules it through its own s_event global, so that is the hook, and
+-- the amount is the mod's one line recomputed.
+local function forward_thistle_bleed(repei)
+    local tweaks = momopate_pba_tweaks
+    if not (tweaks and type(tweaks.s_event) == "function" and repei.g_bleed) then
+        log("[xrRazom][pba] momopate_pba_tweaks missing — a peer's Thistle changes nothing")
+        keep_out_of_factor(repei)
+        return
+    end
+
+    local running, fired = false, false
+    local orig_event = tweaks.s_event
+    tweaks.s_event = function(...)
+        if running then fired = true; return end
+        return orig_event(...)
+    end
+
+    local orig = repei.on_before_hit
+    repei.on_before_hit = function(self, actor, count, ids, names, npc, s_hit, ...)
+        if not on_peer() then return orig(self, actor, count, ids, names, npc, s_hit, ...) end
+        running, fired = true, false
+        orig(self, actor, count, ids, names, npc, s_hit, ...)
+        running = false
+        if not fired then return end
+        local amount = s_hit.power * (-self.g_bleed[math.min(count, 5)] * 0.75)
+        if not (amount < 0) then return end
+        xrr_use_intent.request{
+            verb   = VERB_BLEED,
+            obj_id = npc:id(),
+            args   = amount .. "|" .. self.effect_time,
+        }
+    end
+end
+
+-- Thistle's health-bar refresh keeps the victim's game object for its whole
+-- effect time and errors once that object is gone; a mirror goes whenever the
+-- host releases it, so in a session the object is looked up again each cycle.
+local function guard_thistle_hud(repei)
+    local orig = repei.on_hit
+    repei.on_hit = function(self, actor, count, ids, names, npc, amount, local_direction, who, bone_index, ...)
+        if not XrrSessionActive then
+            return orig(self, actor, count, ids, names, npc, amount, local_direction, who, bone_index, ...)
+        end
+        local id = npc:id()
+        perk_based_artefacts.add_simple_timed_effect(self.effect_time, function()
+            local victim = creature(id)
+            if not (victim and victim:alive() and victim.health > 0) then return end
+            CreateTimeEvent("af_thistle_hud", "af_thistle_hud", 0, function()
+                local shown = creature(id)
+                if shown then ui_enemy_health.on_hit(shown, nil, local_direction, who, bone_index) end
+                return true
+            end)
+        end, nil, "af_thistle_hud")
+    end
+end
+
+-- Host: the world half
+
+local money_sections, meat_sections = {}, {}
+
+local function spawn_near(section, victim, near, far, lift)
+    local pos = victim:position()
+    local dir = vector_rotate_y(victim:direction(), math.random(-180, 180))
+    pos.x = pos.x + dir.x * random_float(near, far)
+    pos.y = pos.y + dir.y + lift
+    pos.z = pos.z + dir.z * random_float(near, far)
+    return alife_create(section, pos, victim:level_vertex_id(), victim:game_vertex_id())
+end
+
+local function fountain(money)
+    local shell = money:get_physics_shell()
+    if not shell then return end
+    local force = 125 + math.random() * 200
+    shell:apply_force(force, force * 5, force)
+end
+
+-- Only the requester's own kill and only once, or any peer could detonate, remove
+-- or farm any corpse; only the perks' own sections, so the verb mints nothing else.
+local function host_corpse(obj_id, state, args, sender_netid)
+    local victim = creature(obj_id)
+    local avatar = xrr_use_intent.requester_avatar(sender_netid)
+    local st     = db.storage[obj_id]
+    if not (victim and avatar and not victim:alive() and st
+            and st.death_by_id == avatar:id() and not st.xrr_pba_served) then
+        printf("[xrRazom][pba] corpse request on %s from %s refused: not that peer's fresh kill",
+            tostring(obj_id), tostring(sender_netid))
+        return
+    end
+    st.xrr_pba_served = true
+
+    local sections = str_explode(args or "", "|", true)
+    for i = 1, math.min(#sections, MAX_SECTIONS) do
+        local section = sections[i]
+        if money_sections[section] then
+            local se_obj = spawn_near(section, victim, 0.3, 0.5, 2)
+            if se_obj then when_online(se_obj, fountain) end
+        elseif meat_sections[section] then
+            spawn_near(section, victim, 0.5, 0.7, 1)
+        end
+    end
+
+    if bit_and(state, F_EXPLODE) ~= 0 then
+        explode_corpse(victim)
+    elseif bit_and(state, F_RELEASE) ~= 0 then
+        release_corpse(obj_id)
+    end
+end
+
+-- A health write passes the invulnerability gate a relayed hit stops at, so the
+-- same rule is applied here. The NPC may go offline or be released mid-effect,
+-- so each cycle resolves it again.
+local function host_bleed(obj_id, _, args, sender_netid)
+    local f = str_explode(args or "", "|", true)
+    local amount, seconds = tonumber(f[1]), tonumber(f[2])
+    local victim = creature(obj_id)
+    local avatar = xrr_use_intent.requester_avatar(sender_netid)
+    if not (amount and seconds and amount < 0 and seconds > 0 and victim and avatar)
+        or (victim:invulnerable() and victim:relation(avatar) ~= game_object.enemy) then
+        printf("[xrRazom][pba] bleed request on %s from %s refused: args '%s'",
+            tostring(obj_id), tostring(sender_netid), tostring(args))
+        return
+    end
+    amount = math.max(amount, -1)
+    perk_based_artefacts.add_simple_timed_effect(math.min(seconds, MAX_BLEED_S), function()
+        local npc = creature(obj_id)
+        if npc and npc:alive() then npc:change_health(amount) end
+    end)
+end
+
+-- Wiring
+
+local peer_half = false
+
+-- Every perk dispatch, the mod's own and the ones GBO and the damage balancer
+-- make for it, resolves this field at call time and runs the local belt on db.actor.
+local function route_perk_dispatch()
+    local orig = perk_based_artefacts.process_artefacts
+    if type(orig) ~= "function" then
+        log("[xrRazom][pba] perk_based_artefacts.process_artefacts missing — not opted out")
+        return false
+    end
+    perk_based_artefacts.process_artefacts = function(artefacts_table, ...)
+        local pba = perk_based_artefacts
+        local before_hit = artefacts_table == pba.artefact_on_npc_before_hit_functions
+            or artefacts_table == pba.artefact_on_monster_before_hit_functions
+
+        if XrrPeerCount > 0 and XrrPlayers():IsPlayerDummy(db.actor:id()) then
+            if before_hit then
+                local _, s_hit = ...
+                s_hit.power = s_hit.power * XrrPlayers():RelayedHitScale(SCALE_KEY)
+            end
+            return
+        end
+
+        if peer_half and on_peer() then
+            if before_hit then
+                return peer_before_hit(orig, artefacts_table, ...)
+            end
+            if artefacts_table == pba.artefact_on_npc_death_functions
+                or artefacts_table == pba.artefact_on_monster_death_functions then
+                return peer_death(orig, artefacts_table, ...)
+            end
+        end
+        return orig(artefacts_table, ...)
+    end
+    return true
+end
+
+local function install_peer_half()
+    local pba    = perk_based_artefacts
+    local props  = pba.artefact_props
+    local deaths = pba.artefact_on_npc_death_functions
+    if not (props and deaths and deaths.af_skull_miser and pba.artefact_on_monster_death_functions
+            and props.af_skull_miser and props.af_lucifer and props.af_repei and props.af_sandstone
+            and props.af_dragon_eye and props.af_dragon_eye.on_death
+            and props.af_kogot and props.af_kogot.on_death) then
+        log("[xrRazom][pba] perk tables not as expected — a peer's own hit and death perks left as the mod has them")
+        return
+    end
+
+    for _, section in ipairs(props.af_skull_miser.money_items) do money_sections[section] = true end
+    for _, section in pairs(props.af_kogot.monster_to_meat) do meat_sections[section] = true end
+    xrr_use_intent.register(VERB_CORPSE, host_corpse)
+    xrr_use_intent.register(VERB_BLEED, host_bleed)
+
+    deaths.af_skull_miser        = skull_miser_on_death(deaths.af_skull_miser)
+    props.af_dragon_eye.on_death = dragon_eye_on_death(props.af_dragon_eye.on_death)
+    props.af_kogot.on_death      = claw_on_death(props.af_kogot.on_death)
+
+    forward_thistle_bleed(props.af_repei)
+    guard_thistle_hud(props.af_repei)
+    -- Base PBA's Sandstone adds a second hit drafted by the victim, which never leaves
+    -- a peer; relaying its multiplier alone would only weaken the shot.
+    if props.af_sandstone.on_before_hit then keep_out_of_factor(props.af_sandstone) end
+
+    RegisterScriptCallback("npc_on_hit_callback", note_kill_bone)
+    -- Without GBO the mod's own stalker death callback is live and raises them itself.
+    if grok_bo and grok_bo.PBA_odc then
+        RegisterScriptCallback("npc_on_death_callback", raise_stalker_death)
+    end
+    xrr_register_cleanup(function() records = {} end)
+    peer_half = true
+end
+
+local function guard_moh_invisibility()
+    local props = perk_based_artefacts.artefact_props
+    props = props and props.af_moh
+    if not (props and props.mutant_part_krovosos_meat and props.mutant_part_psysucker_meat) then
+        log("[xrRazom][pba] af_moh invisibility perks missing — not opted out")
+        return
+    end
+    props.mutant_part_krovosos_meat = moh_invisibility(function(actor)
+        actor.bleeding = 0.003
+    end)
+    props.mutant_part_psysucker_meat = moh_invisibility(function()
+        perk_based_artefacts.change_psy_health(0.005)
+    end)
+end
+
+function on_game_start()
+    if not perk_based_artefacts then return end
+    guard_moh_invisibility()
+    if not route_perk_dispatch() then return end
+    install_peer_half()
+    log("[xrRazom][pba] perk procs: declined under a peer's identity"
+        .. (peer_half and ", a peer's own relayed" or ""))
+end

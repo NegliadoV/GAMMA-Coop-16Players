@@ -1,0 +1,141 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+
+  Oleh's Extended MovementSFX plays only on db.actor: this gives each
+  avatar positional footsteps and servos. Needs 472 (Dark Signal footsteps) to
+  mute the engine's actor steps, or avatars step twice. Ladder steps and the
+  stereo-only cloth/gear/landing clips (every listener would hear them) are left out.
+]]
+
+-- Copied from the mod.
+local SERVO_DIR = "exo-gear-walk-jump-land\\servo_exo_"
+local STEP_DIR  = "footstep\\n_"
+local STEP_VARIANTS = 6
+local JUMP_DIR  = "jump\\jump_"
+local JUMP_VARIANTS = 5
+local EXO_KIND = {
+    outfit_exo_proto   = "light",
+    outfit_exo         = "medium",
+    outfit_exo_nosorog = "medium",
+}
+
+local step_enabled  = true
+local step_volume   = 0.5
+local jump_enabled  = true
+local jump_volume   = 0.5
+local servo_enabled = true
+local servo_volume  = 0.5
+
+local _outfit_id  = {}   -- [avatar id] = outfit id the kind was read from
+local _outfit_kind = {}  -- [avatar id] = EXO_KIND value, or false
+local _walk_two   = {}   -- [avatar id] = next walk clip is variant 2
+local _last_step  = {}   -- [avatar id] = last step variant played
+
+local function exo_kind(avatar)
+    local outfit = avatar:item_in_slot(7)
+    if not outfit then return nil end
+    local id, oid = avatar:id(), outfit:id()
+    if _outfit_id[id] ~= oid then
+        local sec = outfit:section()
+        local class = SYS_GetParam(0, sec, "repair_type", "default")
+        if string.find(sec, "proto") then class = "outfit_exo_proto" end
+        if string.find(sec, "nosorog") then class = "outfit_exo_nosorog" end
+        _outfit_id[id] = oid
+        _outfit_kind[id] = EXO_KIND[class] or false
+    end
+    return _outfit_kind[id] or nil
+end
+
+local function move_volume(mstate)
+    if IsMoveState("mcSprint", mstate) then return 2 end
+    local accel = IsMoveState("mcAccel", mstate)
+    if IsMoveState("mcCrouch", mstate) then return accel and 0 or 0.5 end
+    return accel and 0.5 or 1
+end
+
+local function play(avatar, path, gain)
+    if gain <= 0 then return end
+    local snd = sound_object(path)
+    snd:play_at_pos(avatar, avatar:position(), 0, sound_object.s3d)
+    -- Clamped: the mod's sprint gain of 2 would cancel distance falloff.
+    snd.volume = math.min(gain, 1)
+end
+
+-- Never the same variant twice running, as the mod's shuffled queue ensures.
+local function step_variant(id)
+    local last = _last_step[id]
+    local n = math.random(last and STEP_VARIANTS - 1 or STEP_VARIANTS)
+    if last and n >= last then n = n + 1 end
+    _last_step[id] = n
+    return n
+end
+
+local function play_step(avatar, material, mstate, volume)
+    if IsMoveState("mcClimb", mstate) then return end
+    local mats = footstep_sounds.available_materials
+    local mat = mats[material] or mats["default"]
+    if mat == "water_" then return end
+    play(avatar, STEP_DIR .. mat .. step_variant(avatar:id()), volume * step_volume)
+end
+
+local function play_servo_walk(avatar, volume)
+    if not servo_enabled then return end
+    local kind = exo_kind(avatar)
+    if not kind then return end
+    local id = avatar:id()
+    local two = _walk_two[id] ~= false
+    _walk_two[id] = not two
+    play(avatar, SERVO_DIR .. "walk_" .. kind .. "_" .. (two and 2 or 1), volume * servo_volume)
+end
+
+local function on_footstep(avatar, material, power, mstate)
+    if not step_enabled then return end
+    local volume = move_volume(mstate)
+    play_step(avatar, material, mstate, volume)
+    play_servo_walk(avatar, volume)
+end
+
+-- get_material raycasts from db.actor; the identity call starts it from this
+-- avatar. As in the mod, no surface means no jump sound and no servo.
+local function on_jump(avatar)
+    if not jump_enabled then return end
+    local ok, material = pcall(XrrPlayerIdentityCall, avatar, eft_jump_sounds.get_material)
+    local mat = ok and material and eft_jump_sounds.available_materials[material]
+    if not mat then return end
+    play(avatar, JUMP_DIR .. mat .. math.random(JUMP_VARIANTS), jump_volume)
+    if not servo_enabled then return end
+    local kind = exo_kind(avatar)
+    if kind then play(avatar, SERVO_DIR .. "jump_" .. kind, servo_volume) end
+end
+
+local function on_land(avatar, speed)
+    if not (jump_enabled and servo_enabled) then return end
+    local kind = exo_kind(avatar)
+    if kind then play(avatar, SERVO_DIR .. "land_" .. kind, servo_volume) end
+end
+
+-- Both mods read the same keys; the prefix follows which MCM is installed.
+local function load_settings()
+    local prefix = (oleh_sounds_mcm and "oleh_sounds/movement/")
+        or ((extended_movement_sounds or extended_movement_sounds_mcm) and "extended_movement_sounds/")
+    if not (ui_mcm and prefix) then return end
+    step_enabled  = ui_mcm.get(prefix .. "enabled_footstep_sounds")
+    step_volume   = ui_mcm.get(prefix .. "volume_footstep_sounds") or 0.5
+    jump_enabled  = ui_mcm.get(prefix .. "enabled_jump_sounds")
+    jump_volume   = ui_mcm.get(prefix .. "volume_jump_sounds") or 0.5
+    servo_enabled = ui_mcm.get(prefix .. "enabled_servo_sounds")
+    servo_volume  = ui_mcm.get(prefix .. "volume_servo_sounds") or 0.5
+end
+
+function on_game_start()
+    if not (oleh_sound_utils and oleh_sound_utils.get_outfit_params
+        and footstep_sounds and footstep_sounds.get_move_state and footstep_sounds.available_materials
+        and eft_jump_sounds and eft_jump_sounds.get_material and eft_jump_sounds.available_materials
+        and XrrPlayerIdentityCall) then return end
+
+    RegisterScriptCallback("avatar_on_footstep", on_footstep)
+    RegisterScriptCallback("avatar_on_jump", on_jump)
+    RegisterScriptCallback("avatar_on_land", on_land)
+    RegisterScriptCallback("on_option_change", load_settings)
+    load_settings()
+end

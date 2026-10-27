@@ -1,0 +1,47 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Group-action gate: actions that move the party or the shared clock (fast
+  travel, book time-skips, sleep) require everyone gathered first.
+]]
+
+local OVERLAY_PREFIX = "options/xrrazom/xrr_session/"
+
+-- nil when solo or when an older host never pushed `key`.
+local function overlay(key)
+    -- The options page calls in from the main menu, before xrr_core defines this.
+    if not (XrrIsConnected and XrrIsConnected()) then return nil end
+    local mcm = XrrMcm()
+    return (mcm and mcm:OverlayTag(key) >= 0) and mcm or nil
+end
+
+function gather_radius()
+    local key = OVERLAY_PREFIX .. "gather_radius"
+    local mcm = overlay(key)
+    if mcm then return mcm:OverlayNumber(key) end
+    return tonumber(get_console_cmd(0, "xrr_gather_radius")) or 10
+end
+
+-- Governs the fast-travel / backpack-travel gate only; book time-skips and
+-- sleep keep theirs unconditionally.
+function party_fast_travel()
+    local key = OVERLAY_PREFIX .. "party_fast_travel"
+    local mcm = overlay(key)
+    if mcm then return mcm:OverlayBool(key) end
+    return get_console_cmd(1, "xrr_party_fast_travel") and true or false
+end
+
+-- True = blocked (tip shown). Runs on both roles, against every avatar proxy present;
+-- sleep passes its own tighter radius and tip.
+function veto_if_ungathered(radius, msg_key)
+    if not (XrrIsHosted() or XrrIsConnected()) then return false end
+    local r = radius or gather_radius()
+    if not XrrPlayers():AnyPeerBeyond(r) then return false end
+    if db.actor then
+        news_manager.send_tip(db.actor,
+            string.format(game.translate_string(msg_key or "st_xrr_travel_peers_far"),
+                          math.floor(r + 0.5)), nil, nil, 4000)
+    end
+    return true
+end

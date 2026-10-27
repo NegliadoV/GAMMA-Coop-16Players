@@ -1,0 +1,60 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+
+  Module: Personal Adjustable Waypoint (Catspaw).
+
+  PAW's task functors read a module-local placed_waypoint, nil on any machine
+  that did not place the waypoint — so its task is declared local, never replicated.
+]]
+
+local _applied = false
+
+-- Avatars fail PAW's IsStalker target checks. Both sites resolve at call time,
+-- so table patches suffice.
+local function apply_avatar_targets()
+    local twp = tasks_placeable_waypoints
+    if twp and type(twp.valid_waypoint_target) == "function" then
+        local orig_valid = twp.valid_waypoint_target
+        twp.valid_waypoint_target = function(se_obj)
+            if se_obj and XrrPlayers():IsPlayerDummy(se_obj.id) then
+                local ok, result = XrrAvatarAwareCall(orig_valid, se_obj)
+                if ok then return result end
+                return nil
+            end
+            return orig_valid(se_obj)
+        end
+    end
+
+    local rcls = ui_paw_reticle and ui_paw_reticle.UIPAWReticle
+    if rcls then
+        local function wrap(name)
+            local orig = rcls[name]
+            if type(orig) ~= "function" then
+                log("[xrRazom] PAW: UIPAWReticle:" .. name .. " missing — avatar targets skipped")
+                return
+            end
+            rcls[name] = function(self, obj)
+                if obj and XrrPlayers():IsPlayerDummy(obj:id()) then
+                    local ok, result = XrrAvatarAwareCall(orig, self, obj)
+                    if ok then return result end
+                    return nil
+                end
+                return orig(self, obj)
+            end
+        end
+        wrap("IsValidTagTarget")
+        wrap("GetTargetName")
+    end
+end
+
+function on_game_start()
+    if _applied then return end
+    if not (tasks_placeable_waypoints and task_functor.waypoint_task_target_functor) then return end
+    _applied = true
+
+    _G.xrr_local_tasks = _G.xrr_local_tasks or {}
+    _G.xrr_local_tasks["task_placeable_waypoint"] = true
+    log("[xrRazom] PAW: task_placeable_waypoint declared local (never replicated)")
+
+    apply_avatar_targets()
+end

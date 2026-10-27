@@ -1,0 +1,366 @@
+<?xml version="1.0" encoding="windows-1251"?>
+<string_table>
+	<string id="ui_xrr_connect">
+		<text>Connect to Session</text>
+	</string>
+	<string id="ui_xrr_server_ip">
+		<text>Server IP:Port</text>
+	</string>
+	<string id="ui_xrr_remember_ip">
+		<text>Remember this address</text>
+	</string>
+	<string id="ui_xrr_connecting">
+		<text>Connecting...</text>
+	</string>
+	<string id="ui_xrr_connection_failed">
+		<text>Connection failed</text>
+	</string>
+	<string id="ui_xrr_mods_mismatch">
+		<text>Your mods don't match the host's. Check the log (appdata\logs) for the list of differing files. Both players must run the same modpack.</text>
+	</string>
+	<string id="ui_xrr_version_mismatch">
+		<text>Your xrRazom version doesn't match the host's. Both players must run the same version.</text>
+	</string>
+	<string id="ui_xrr_world_mismatch">
+		<text>Your game world doesn't match the host's. The two installs were built from different spawn data, so the same object would have different IDs on each machine. Both players must run the same game build.</text>
+	</string>
+	<string id="ui_xrr_duplicate_identity">
+		<text>Your install has the same network identity as the host's. This happens when one install was copied from the other. Delete appdata\xrrazom_lan_id.bin in your game folder and restart - a new identity is generated automatically.</text>
+	</string>
+	<string id="ui_xrr_connection_lost">
+		<text>Connection to host was lost</text>
+	</string>
+	<string id="ui_xrr_host_ended_session">
+		<text>Host ended the session</text>
+	</string>
+	<string id="ui_xrr_no_save_data">
+		<text>Host loaded a save without your character data</text>
+	</string>
+	<string id="ui_xrr_invalid_address">
+		<text>Invalid server address</text>
+	</string>
+	<string id="ui_xrr_diff_host_owned">
+		<text>Gameplay and progression difficulty are session rules set by the host.</text>
+	</string>
+	<string id="ui_xrr_mcm_host_owned">
+		<text>Managed by the host while in a co-op session.</text>
+	</string>
+	<string id="st_xrr_sleep_peers_far">
+		<text>All players must be within 4 meters to sleep.</text>
+	</string>
+	<string id="st_xrr_travel_peers_far">
+		<text>All players must be within %s meters to travel.</text>
+	</string>
+	<string id="ui_xrr_travel_host_owned">
+		<text>Fast travel settings are session rules set by the host.</text>
+	</string>
+	<string id="st_send_to">
+		<text>Send to</text>
+	</string>
+	<string id="st_xrr_gift_received">
+		<text>%s sent you an item!</text>
+	</string>
+
+	<!-- Money transfer (MONEY_TRANSFER) -->
+	<string id="ui_xrr_money_amount">
+		<text>Amount:</text>
+	</string>
+	<string id="ui_xrr_money_send_btn">
+		<text>Send</text>
+	</string>
+	<string id="st_xrr_send_money_title">
+		<text>Send money to %s</text>
+	</string>
+	<string id="st_xrr_money_sent">
+		<text>Sent %s %s to %s</text>
+	</string>
+	<string id="st_xrr_money_received">
+		<text>%s sent you %s %s</text>
+	</string>
+	<string id="st_xrr_money_refunded">
+		<text>Money transfer failed - %s %s returned</text>
+	</string>
+	<string id="st_xrr_money_none">
+		<text>You have no money to send</text>
+	</string>
+	<string id="st_xrr_money_no_target">
+		<text>Player is no longer in the game</text>
+	</string>
+	<string id="st_xrr_money_no_peers">
+		<text>No players to send money to</text>
+	</string>
+
+	<!-- Mid-session rename (PLAYER_NAME_CHANGE) -->
+	<string id="st_xrr_renamed">
+		<text>%s is now known as %s</text>
+	</string>
+	<string id="st_xrr_name_taken_active">
+		<text>Name '%s' is already taken by another player</text>
+	</string>
+	<string id="st_xrr_name_taken_host">
+		<text>Name '%s' is already taken by the host</text>
+	</string>
+	<string id="st_xrr_name_taken_offline">
+		<text>Name '%s' belongs to an offline player of this world</text>
+	</string>
+	<string id="st_xrr_name_invalid">
+		<text>Invalid player name '%s'</text>
+	</string>
+
+	<!-- In-game currency unit (suffix after money amounts) -->
+	<string id="st_xrr_currency">
+		<text>UAH</text>
+	</string>
+
+	<!-- Keybinding (Controls options screen) -->
+	<string id="kb_grp_xrrazom">
+		<text>xrRazom Co-op</text>
+	</string>
+	<string id="kb_xrr_tag">
+		<text>Place / remove ping tag</text>
+	</string>
+	<string id="kb_xrr_chat">
+		<text>Open co-op text chat</text>
+	</string>
+
+	<!-- Peer faction screen -->
+	<string id="ui_xrr_name_options_hint">
+		<text>Change in Settings -> xrRazom Co-op</text>
+	</string>
+	<string id="ui_xrr_coop_options">
+		<text>Co-op Options</text>
+	</string>
+
+	<!-- Settings -> xrRazom Co-op. Caption id is ui_mm_xrrazom_<page>_<option>, hover text the same + _desc. -->
+	<string id="ui_mm_menu_xrrazom">
+		<text>xrRazom Co-op</text>
+	</string>
+	<string id="ui_mm_menu_xrr_player">
+		<text>Player</text>
+	</string>
+	<string id="ui_mm_menu_xrr_hosting">
+		<text>Hosting</text>
+	</string>
+	<string id="ui_mm_menu_xrr_danger">
+		<text>DANGER ZONE -- use at your own risk</text>
+	</string>
+	<string id="ui_mm_menu_xrr_session">
+		<text>Session rules</text>
+	</string>
+	<string id="ui_xrr_session_host_owned">
+		<text>These are session rules; the host sets them for everyone.</text>
+	</string>
+
+	<string id="ui_mm_xrrazom_xrr_player_player_name">
+		<text>Player name</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_player_name_desc">
+		<text>Nickname shown to other players. The host validates it on join and on rename, so a name already in use is refused.</text>
+	</string>
+
+	<string id="ui_mm_xrrazom_xrr_player_show_marks">
+		<text>Show player markers on PDA map</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_show_marks_desc">
+		<text>Draw a map spot for every connected player on your PDA.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_show_names">
+		<text>Show player nameplates</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_show_names_desc">
+		<text>Display each player's nickname floating above their avatar in the world.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_show_players_hp">
+		<text>Show other players' health bars</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_show_players_hp_desc">
+		<text>Display a list of connected players with a thin health bar in the top-right of the HUD.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_show_net_health">
+		<text>Show connection warnings</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_show_net_health_desc">
+		<text>On-screen warning when the connection degrades (high latency, packet loss, or no response). Diagnostics are still written to the log when disabled.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_tag_duration">
+		<text>Ping tag lifetime (s)</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_tag_duration_desc">
+		<text>How long your ping tag stays visible to everyone. Bind the ping key in Settings -> Control -> Keybinds (xrRazom Co-op).</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_chat_enable">
+		<text>Text chat</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_chat_enable_desc">
+		<text>Enable the in-game co-op text chat. Bind the chat key in Settings -> Control -> Keybinds (xrRazom Co-op); press it to open the input box. Messages appear bottom-left for everyone in the session.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_chat_sound">
+		<text>Chat sound</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_player_chat_sound_desc">
+		<text>Play a short blip when a chat message arrives from another player (never for your own). Volume follows the game's effects-volume setting.</text>
+	</string>
+
+	<string id="ui_mm_xrrazom_xrr_session_friendly_fire">
+		<text>Friendly fire</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_friendly_fire_desc">
+		<text>Allow players to damage each other. When disabled, player-on-player hits are suppressed.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_rescue">
+		<text>Wounded state and rescue</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_rescue_desc">
+		<text>A lethal hit leaves a player wounded and crawling instead of dead, and a teammate can rescue them. When disabled, players die as in single player.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_rescue_medkit">
+		<text>Rescue requires a medkit</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_rescue_medkit_desc">
+		<text>A rescue spends one of the rescuer's medkits and gives its effects to the rescued player. When disabled, a rescue needs no medkit: none is spent and no medkit effects are applied, even if the rescuer carries one.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_allow_peer_save_load">
+		<text>Allow player save/load</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_allow_peer_save_load_desc">
+		<text>Allow connected players to request quicksave and load-last-save on the host.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_hosting_max_players">
+		<text>Max players</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_hosting_max_players_desc">
+		<text>Maximum number of other players who can join your hosted session.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_sync_teleport">
+		<text>Sync quest teleports</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_sync_teleport_desc">
+		<text>When a quest or dialog teleports you, pull nearby teammates along to the same destination. Disable to keep teleports local (vanilla behaviour).</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_teleport_radius">
+		<text>Teleport follow radius (m)</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_teleport_radius_desc">
+		<text>Teammates within this distance of you (when you trigger a teleport) are teleported too. 0 = everyone on your level. Uses your setting as the initiator.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_party_fast_travel">
+		<text>Require whole party for fast travel</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_party_fast_travel_desc">
+		<text>Fast travel requires every player within the gather radius below. The host's value applies to the whole session.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_gather_radius">
+		<text>Party gather radius (m)</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_session_gather_radius_desc">
+		<text>Fast travel and time-skip books require every player within this distance of the one starting them. The host's value applies to the whole session.</text>
+	</string>
+
+	<string id="ui_mm_xrrazom_xrr_hosting_host_session">
+		<text>Host session on game start</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_hosting_host_session_desc">
+		<text>Automatically open a co-op session when you load into the game. Required for other players to be able to connect to you.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_hosting_host_steam">
+		<text>Host via Steam ID (P2P)</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_hosting_host_steam_desc">
+		<text>Let other players connect to you via your Steam ID instead of an IP address -- supports NAT traversal and Friends overlay invites. Disable for direct LAN/IP hosting via the port below (Steam's networking library is still used automatically whenever Steam is running).</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_hosting_host_lan_port">
+		<text>LAN port</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_hosting_host_lan_port_desc">
+		<text>UDP port for direct LAN/IP connections. Only used when Steam networking is disabled.</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_hosting_skip_mod_check">
+		<text>Skip mod check</text>
+	</string>
+	<string id="ui_mm_xrrazom_xrr_hosting_skip_mod_check_desc">
+		<text>Let players join even when their mod/config set differs from yours. Use at your own risk: mismatched mods can desync or crash the session, and no support is given for such sessions. The mismatch is still written to your log.</text>
+	</string>
+	<string id="st_xrr_mutant_body_busy">
+		<text>Someone is already dressing this body</text>
+	</string>
+
+	<!-- Wounded / rescue teammate -->
+	<string id="st_xrr_wounded_hint">
+		<text>You are wounded - a teammate can rescue you</text>
+	</string>
+	<string id="st_xrr_rescue_hold">
+		<text>Hold [%s] to rescue</text>
+	</string>
+	<string id="st_xrr_rescue_need_medkit">
+		<text>Rescue requires a medkit</text>
+	</string>
+	<string id="st_xrr_news_down">
+		<text>%s is down and needs rescue!</text>
+	</string>
+	<string id="st_xrr_news_rescued">
+		<text>%s was rescued by %s</text>
+	</string>
+	<string id="st_xrr_news_recovered">
+		<text>%s got back up</text>
+	</string>
+
+	<!-- Co-op save gate -->
+	<string id="st_xrr_save_refused_by_host">
+		<text>The host cannot save right now</text>
+	</string>
+
+	<!-- Task text floor (peer, when the host had no text either) -->
+	<string id="st_xrr_task_untitled">
+		<text>Task</text>
+	</string>
+	<string id="st_xrr_task_no_descr">
+		<text>No description</text>
+	</string>
+
+	<!-- Staged join notifications (host) -->
+	<string id="ui_xrr_join_loading">
+		<text>%s is joining - loading in...</text>
+	</string>
+	<string id="ui_xrr_join_creating">
+		<text>%s is joining - creating a character...</text>
+	</string>
+	<string id="ui_xrr_join_char_picked">
+		<text>%s picked %s - loading in...</text>
+	</string>
+	<string id="ui_xrr_join_joined">
+		<text>%s joined the session</text>
+	</string>
+	<string id="ui_xrr_join_rejected">
+		<text>%s could not join: %s</text>
+	</string>
+	<string id="ui_xrr_join_left">
+		<text>%s left the session</text>
+	</string>
+	<string id="ui_xrr_join_left_early">
+		<text>%s disconnected while joining</text>
+	</string>
+	<string id="ui_xrr_waiting_for_player">
+		<text>Waiting for %s to finish loading</text>
+	</string>
+	<string id="ui_xrr_session_full">
+		<text>The session is full</text>
+	</string>
+	<string id="ui_xrr_nickname_taken">
+		<text>That player name is already in use in this session</text>
+	</string>
+
+	<!-- Readiness barrier: host refused a peer's transition request -->
+	<string id="st_xrr_transition_waiting">
+		<text>Transition refused - %s is still loading</text>
+	</string>
+
+	<!-- Co-op boot landed in fake_start with the session already gone -->
+	<string id="ui_xrr_session_lost_during_load">
+		<text>The session was lost while loading - returning to the main menu</text>
+	</string>
+
+	<!-- Boot hold: the host's gear bundle never arrived within the ceiling -->
+	<string id="ui_xrr_gear_bundle_timeout">
+		<text>The host did not send your character data in time - returning to the main menu</text>
+	</string>
+</string_table>

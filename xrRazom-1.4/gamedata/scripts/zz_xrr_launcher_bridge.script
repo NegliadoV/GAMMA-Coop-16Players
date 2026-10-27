@@ -1,0 +1,381 @@
+--[[
+  Mod: zz xrRazom Fix - Launcher Bridge & Dedicated Server Host
+  Script: gamedata/scripts/zz_xrr_launcher_bridge.script
+  Where: host and peer (cold-start Main Menu via modxml_zz_xrr_launcher_bridge.script + in-game via on_game_start)
+  Log marker: [XRRFIX] launcher_bridge: installed
+
+  Features:
+  1. Reads per-instance $app_data_root$\axr_options.ltx so multiple local instances
+     (appdata\ vs appdata_client2\) each have their own isolated [xrr_launcher] queue.
+  2. One-click Auto-Join from Zone Co-op Launcher via [xrr_launcher] auto_action = join.
+  3. One-click Auto-Host / Dedicated Server startup (new world or saved game) with configurable
+     port and unlocked max_players (up to 16 peers / 17 players).
+  4. Dedicated Server 24/7 Observer Mode (optional host invulnerability/metabolism lock + periodic
+     world autosaves every N minutes).
+  5. Real-time Server Telemetry writer to [xrr_server_telemetry] in $app_data_root$\axr_options.ltx.
+]]
+
+local TELEMETRY_INTERVAL_MS = 3000
+local _installed_menu = false
+local _installed_game = false
+local _menu_hooked = false
+local _pending_action = nil
+local _pending_frames = 0
+local _last_telemetry_tg = 0
+local _last_autosave_tg = 0
+local _dedicated_observer = false
+local _autosave_ms = 0
+local _need_initial_faststart_save = false
+local _faststart_landed_tg = 0
+
+local function get_appdata_axr_path()
+    if getFS then
+        local ok, p = pcall(function() return getFS():update_path("$app_data_root$", "axr_options.ltx") end)
+        if ok and p and p ~= "" then return p end
+    end
+    return "appdata\\axr_options.ltx"
+end
+
+local function read_ini_sections(path)
+    local sections = {}
+    local order = {}
+    local f = io.open(path, "r")
+    if not f then return sections, order end
+    local cur_sec = nil
+    for line in f:lines() do
+        local s = line:match("^%s*%[([^%]]+)%]%s*$")
+        if s then
+            cur_sec = s
+            if not sections[cur_sec] then
+                sections[cur_sec] = {}
+                order[#order + 1] = cur_sec
+            end
+        elseif cur_sec then
+            local k, v = line:match("^%s*([^=;]+)%s*=%s*(.-)%s*$")
+            if k then
+                k = k:match("^%s*(.-)%s*$")
+                v = v:match("^(.-)%s*$")
+                sections[cur_sec][k] = v
+            end
+        end
+    end
+    f:close()
+    return sections, order
+end
+
+local function write_ini_sections(path, sections, order)
+    local f = io.open(path, "w")
+    if not f then return false end
+    local written = {}
+    for _, sec in ipairs(order or {}) do
+        if sections[sec] and not written[sec] then
+            written[sec] = true
+            f:write("[" .. sec .. "]\n")
+            for k, v in pairs(sections[sec]) do
+                f:write(tostring(k) .. " = " .. tostring(v) .. "\n")
+            end
+            f:write("\n")
+        end
+    end
+    for sec, tbl in pairs(sections) do
+        if not written[sec] then
+            written[sec] = true
+            f:write("[" .. sec .. "]\n")
+            for k, v in pairs(tbl) do
+                f:write(tostring(k) .. " = " .. tostring(v) .. "\n")
+            end
+            f:write("\n")
+        end
+    end
+    f:close()
+    return true
+end
+
+local function write_telemetry(online_state)
+    local path = get_appdata_axr_path()
+    local sections, order = read_ini_sections(path)
+    local is_hosting = XrrIsHosted and XrrIsHosted() or false
+    local lvl = (level and level.present and level.present() and level.name and level.name()) or "main_menu"
+    local peer_cnt = (XrrPlayers and XrrPlayers() and XrrPlayers().GetPeerCount and XrrPlayers():GetPeerCount()) or 0
+    local max_p = tonumber(get_console_cmd and get_console_cmd(0, "xrr_max_players") or "16") or 16
+
+    local roster = {}
+    if XrrPlayers and XrrPlayers() and peer_cnt > 0 then
+        local xp = XrrPlayers()
+        for i = 1, peer_cnt do
+            local ok_n, nick = pcall(function() return xp:GetPeerNicknameAt(i) end)
+            local ok_f, fac  = pcall(function() return xp:GetPeerFactionAt(i) end)
+            if ok_n and nick and nick ~= "" then
+                local clean_fac = (ok_f and fac and string.gsub(fac, "^actor_", "")) or "stalker"
+                roster[#roster + 1] = nick .. ":" .. clean_fac
+            end
+        end
+    end
+
+    sections["xrr_server_telemetry"] = {
+        online      = (online_state and is_hosting) and "1" or "0",
+        level       = lvl,
+        players     = tostring(is_hosting and (peer_cnt + 1) or 0),
+        max_players = tostring(max_p + 1),
+        roster      = table.concat(roster, ";"),
+        timestamp   = tostring(os.time and os.time() or 0),
+    }
+    write_ini_sections(path, sections, order)
+end
+
+local function consume_launcher_command()
+    local path = get_appdata_axr_path()
+    local sections, order = read_ini_sections(path)
+    local sec = sections["xrr_launcher"]
+    if not sec then return nil end
+
+    local action = sec["auto_action"] or "none"
+    if action == "none" or action == "" then return nil end
+
+    local cmd = {
+        action             = action,
+        connect_ip         = sec["connect_ip"] or "127.0.0.1:28666",
+        player_name        = sec["player_name"] or "",
+        host_port          = sec["host_port"] or "28666",
+        host_steam         = sec["host_steam"] or "1",
+        max_players        = sec["max_players"] or "16",
+        skip_mod_check     = sec["skip_mod_check"] or "0",
+        host_save          = sec["host_save"] or "new",
+        dedicated_observer = (sec["dedicated_observer"] or "0") == "1",
+        autosave_minutes   = tonumber(sec["autosave_minutes"] or "10") or 0,
+    }
+
+    -- Clear one-shot action immediately so returning to menu does not re-trigger
+    sec["auto_action"] = "none"
+    write_ini_sections(path, sections, order)
+
+    printf("[XRRFIX] launcher_bridge: consumed command action=%s ip=%s nick=%s from %s",
+        tostring(cmd.action), tostring(cmd.connect_ip), tostring(cmd.player_name), tostring(path))
+    return cmd
+end
+
+local function has_any_savegame()
+    if not getFS then return false, nil end
+    local ok, res, save_name = pcall(function()
+        local flist = getFS():file_list_open_ex("$game_saves$", bit_or(FS.FS_ListFiles, FS.FS_RootOnly), "*.scop")
+        local cnt = flist and flist:Size() or 0
+        if cnt <= 0 then return false, nil end
+        local preferred = {
+            ["gamma_coop_faststart.scop"] = "gamma_coop_faststart",
+            ["server_autosave.scop"] = "server_autosave",
+            ["player - autosave.scop"] = "player - autosave",
+        }
+        for _, pref_key in ipairs({ "gamma_coop_faststart.scop", "server_autosave.scop", "player - autosave.scop" }) do
+            for i = 0, cnt - 1 do
+                local f = flist:GetAt(i)
+                local nm = f and f:NameShort() or ""
+                if nm == pref_key then
+                    return true, preferred[pref_key]
+                end
+            end
+        end
+        local first = flist:GetAt(0):NameShort()
+        return true, first:gsub("%.scop$", "")
+    end)
+    if ok and res then return true, save_name end
+    return false, nil
+end
+
+local function configure_fast_new_game_on_cordon(player_name)
+    if not (axr_main and axr_main.config) then return false end
+    local ok, err = pcall(function()
+        local safe_name = (player_name and player_name ~= "" and player_name or "Stalker"):gsub(" ", "_")
+        axr_main.config:w_value("character_creation", "new_game_difficulty", 1)
+        axr_main.config:w_value("character_creation", "new_game_economy", 1)
+        axr_main.config:w_value("character_creation", "new_game_economy_treasure", 1)
+        axr_main.config:w_value("character_creation", "new_game_story_mode", true)
+        axr_main.config:w_value("character_creation", "new_game_opened_routes", true)
+        axr_main.config:w_value("character_creation", "new_game_character_name", safe_name)
+        axr_main.config:w_value("character_creation", "new_game_faction", "stalker")
+        axr_main.config:w_value("character_creation", "new_game_icon", "ui_inGame2_Hero")
+        axr_main.config:w_value("character_creation", "new_game_map", "rookie_village")
+        axr_main.config:w_value("character_creation", "new_game_money", 15000)
+        axr_main.config:w_value("character_creation", "new_game_loadout",
+            "device_pda_1,wpn_knife,wpn_pm,novice_outfit,detector_simple,device_torch_dummy,bandage,bandage,medkit,conserva,flask,bolt_bullet")
+        axr_main.config:save()
+    end)
+    if not ok then
+        printf("![XRRFIX] launcher_bridge: configure_fast_new_game_on_cordon error: %s", tostring(err))
+    end
+    return ok
+end
+
+local function execute_pending_menu_command(menu)
+    if not _pending_action then return end
+    local cmd = _pending_action
+    _pending_action = nil
+
+    if cmd.player_name and cmd.player_name ~= "" then
+        exec_console_cmd("xrr_player_name " .. cmd.player_name)
+    end
+
+    if cmd.action == "join" then
+        printf("[XRRFIX] launcher_bridge: auto-joining %s as %s", tostring(cmd.connect_ip), tostring(cmd.player_name))
+        exec_console_cmd("xrr_host_session off")
+        if axr_main and axr_main.config then
+            pcall(function()
+                axr_main.config:w_value("xrrazom", "last_ip", cmd.connect_ip)
+                axr_main.config:save()
+            end)
+        end
+        local gm = XrrNet and XrrNet()
+        if gm and gm.Connect then
+            local ok, err = pcall(gm.Connect, gm, cmd.connect_ip)
+            if not ok then
+                printf("![XRRFIX] launcher_bridge: Connect error: %s", tostring(err))
+            end
+        end
+    elseif cmd.action == "host" then
+        printf("[XRRFIX] launcher_bridge: auto-hosting port=%s max_players=%s save=%s dedicated=%s",
+            tostring(cmd.host_port), tostring(cmd.max_players), tostring(cmd.host_save), tostring(cmd.dedicated_observer))
+        _dedicated_observer = cmd.dedicated_observer
+        _autosave_ms = (cmd.autosave_minutes > 0) and (cmd.autosave_minutes * 60 * 1000) or 0
+
+        exec_console_cmd("xrr_host_session on")
+        if cmd.host_steam == "1" or cmd.host_steam == "on" then
+            exec_console_cmd("xrr_host_steam on")
+        else
+            exec_console_cmd("xrr_host_steam off")
+        end
+        exec_console_cmd("xrr_host_lan_port " .. tostring(cmd.host_port))
+        exec_console_cmd("xrr_max_players " .. tostring(cmd.max_players))
+        exec_console_cmd("xrr_skip_mod_check " .. (cmd.skip_mod_check == "1" and "on" or "off"))
+        exec_console_cmd("cfg_save")
+
+        local target_save = cmd.host_save
+        if target_save ~= "fast_new" and (not target_save or target_save == "" or target_save == "new" or target_save == "auto") then
+            local has_save, auto_save_name = has_any_savegame()
+            if has_save and auto_save_name then
+                printf("[XRRFIX] launcher_bridge: found existing save '%s', loading directly so LAN listen socket opens immediately", tostring(auto_save_name))
+                target_save = auto_save_name
+            end
+        end
+
+        if target_save and target_save ~= "" and target_save ~= "new" and target_save ~= "fast_new" and target_save ~= "auto" then
+            device():pause(false)
+            exec_console_cmd("main_menu off")
+            if alife() == nil then
+                exec_console_cmd("start server(" .. target_save .. "/single/alife/load) client(localhost)")
+            else
+                exec_console_cmd("load " .. target_save)
+            end
+        else
+            -- Instant Fast Start on Cordon (rookie_village -> l01_escape) via direct [character_creation] config
+            printf("[XRRFIX] launcher_bridge: starting Fast Start New Game on Cordon (rookie_village -> l01_escape)")
+            _need_initial_faststart_save = true
+            _faststart_landed_tg = 0
+            configure_fast_new_game_on_cordon(cmd.player_name)
+            if menu and menu.StartGame then
+                menu:StartGame()
+            else
+                device():pause(false)
+                exec_console_cmd("start server(all/single/alife/new) client(localhost)")
+                exec_console_cmd("main_menu off")
+            end
+        end
+    end
+end
+
+local function hook_main_menu()
+    if _menu_hooked then return end
+    if not (ui_main_menu and ui_main_menu.main_menu) then return end
+    _menu_hooked = true
+
+    local cls = ui_main_menu.main_menu
+    local orig_update = cls.Update
+    cls.Update = function(self, ...)
+        if orig_update then orig_update(self, ...) end
+        if _pending_action then
+            _pending_frames = _pending_frames + 1
+            if _pending_frames >= 3 then
+                _pending_frames = 0
+                pcall(execute_pending_menu_command, self)
+            end
+        end
+    end
+end
+
+function on_main_menu_on_init(menu)
+    pcall(function()
+        hook_main_menu()
+        local cmd = consume_launcher_command()
+        if cmd then
+            _pending_frames = 0
+            _pending_action = cmd
+        end
+    end)
+end
+
+local function on_actor_update()
+    local tg = time_global and time_global() or 0
+
+    -- 0. Create initial gamma_coop_faststart save once actor lands on Cordon (l01_escape)
+    if _need_initial_faststart_save and level and level.present and level.present() and level.name then
+        local cur_lvl = level.name()
+        if cur_lvl and cur_lvl ~= "fake_start" and cur_lvl ~= "main_menu" then
+            if _faststart_landed_tg == 0 then
+                _faststart_landed_tg = tg
+            elseif (tg - _faststart_landed_tg) >= 4000 then
+                _need_initial_faststart_save = false
+                pcall(function()
+                    printf("[XRRFIX] launcher_bridge: creating initial gamma_coop_faststart checkpoint on %s", tostring(cur_lvl))
+                    exec_console_cmd("save gamma_coop_faststart")
+                end)
+            end
+        end
+    end
+
+    -- 1. Dedicated 24/7 Server Host protection & autosave
+    if XrrIsHosted and XrrIsHosted() then
+        if _dedicated_observer and db and db.actor and db.actor:alive() then
+            pcall(function()
+                if db.actor.health < 0.99 then db.actor.health = 1.0 end
+                if db.actor.power < 0.99 then db.actor.power = 1.0 end
+                if db.actor.bleeding and db.actor.bleeding > 0 then db.actor.bleeding = 1.0 end
+                if db.actor.radiation and db.actor.radiation > 0 then db.actor.radiation = -1.0 end
+            end)
+        end
+
+        if _autosave_ms > 0 then
+            if _last_autosave_tg == 0 then
+                _last_autosave_tg = tg
+            elseif (tg - _last_autosave_tg) >= _autosave_ms then
+                _last_autosave_tg = tg
+                pcall(function()
+                    printf("[XRRFIX] launcher_bridge: executing periodic server_autosave")
+                    exec_console_cmd("save server_autosave")
+                end)
+            end
+        end
+    end
+
+    -- 2. Periodic telemetry flush for Server Browser
+    if (tg - _last_telemetry_tg) >= TELEMETRY_INTERVAL_MS then
+        _last_telemetry_tg = tg
+        pcall(write_telemetry, true)
+    end
+end
+
+function init_from_dxml()
+    if _installed_menu then return end
+    _installed_menu = true
+    pcall(function()
+        RegisterScriptCallback("main_menu_on_init", on_main_menu_on_init)
+        printf("[XRRFIX] launcher_bridge: registered cold-start main_menu_on_init hook")
+    end)
+end
+
+function on_game_start()
+    init_from_dxml()
+    if _installed_game then return end
+    _installed_game = true
+    pcall(function()
+        RegisterScriptCallback("actor_on_update", on_actor_update)
+        printf("[XRRFIX] launcher_bridge: installed (16-player & launcher bridge active)")
+    end)
+end

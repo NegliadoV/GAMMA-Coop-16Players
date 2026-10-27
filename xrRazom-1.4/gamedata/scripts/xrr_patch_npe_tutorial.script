@@ -1,0 +1,25 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  npe_gamma_tutorial_ammo_mcm.is_ammo_item_used arms the LOCAL player's "ammo
+  spent" tutorial, so under xrr_patch_common's before-hit identity swap a peer's
+  shot would raise the popup on the HOST's screen.
+]]
+
+function on_game_start()
+    local orig = npe_gamma_tutorial_ammo_mcm and npe_gamma_tutorial_ammo_mcm.is_ammo_item_used
+    if type(orig) ~= "function" then return end
+
+    local function wrapped(npc, shit, bone_id)
+        local drafts = shit and shit.draftsman
+        if drafts and XrrPlayers():IsPlayerDummy(drafts:id()) then return end
+        return orig(npc, shit, bone_id)
+    end
+
+    -- The registry keys on the function VALUE; the module-field write is inert.
+    npe_gamma_tutorial_ammo_mcm.is_ammo_item_used = wrapped
+    UnregisterScriptCallback("npc_on_before_hit", orig)
+    RegisterScriptCallback("npc_on_before_hit", wrapped)
+    log("[xrRazom][npe] ammo tutorial: peer hits declined")
+end

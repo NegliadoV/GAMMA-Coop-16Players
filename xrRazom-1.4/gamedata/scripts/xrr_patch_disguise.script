@@ -1,0 +1,291 @@
+--[[
+  xrRazom — Disguise sync: the peer reports its community and suspicion inputs;
+  the host re-applies the disguise onto the proxy that host NPCs judge, runs
+  vanilla's suspicion formula, and answers with an expose.
+]]
+
+-- Peer side
+
+local last_sent_comm = nil
+local last_sent_true = nil   -- last reported TRUE faction (PEER_FACTION_CHANGE)
+local next_peer_tg   = 0
+local peer_spike     = 0   -- re-tracked locally (vanilla's gameplay_disguise spike is a file-local)
+
+-- Disarmed until the host's restore arrives, or a rejoin reports its TRUE faction
+-- over the disguise. The restore waits for the update tick: is_disguised needs
+-- default_comm, which vanilla seeds only on actor_on_first_update.
+local reporter_armed  = false
+local pending_restore = nil
+
+local function apply_pending_restore()
+    if pending_restore == nil then return end
+    local comm = pending_restore
+    pending_restore = nil
+    reporter_armed  = true
+    local gd = gameplay_disguise
+    if comm ~= "" and gd and gd.set_comm then
+        gd.set_comm(comm)
+        last_sent_comm = "actor_" .. comm    -- host already holds this state; no echo report
+        printf("[xrRazom][disguise] restored disguise as %s", comm)
+    else
+        last_sent_comm = character_community(db.actor)  -- arm without an initial echo
+    end
+end
+
+-- itm_factor half of vanilla calculate_npc_suspicion: 100 − weighted average of the
+-- six examinate_* values, using the peer's own MCM multipliers.
+local function compute_item_factor()
+    local gd = gameplay_disguise
+    if not gd then return 100 end
+    local vals = {
+        { gd.examinate_active_item(), ui_options.get("gameplay/disguise/active_item_factor") or 1 },
+        { gd.examinate_weapon(),      ui_options.get("gameplay/disguise/weapon_factor")      or 1 },
+        { gd.examinate_outfit(),      ui_options.get("gameplay/disguise/outfit_factor")      or 1 },
+        { gd.examinate_helmet(),      ui_options.get("gameplay/disguise/helmet_factor")      or 1 },
+        { gd.examinate_backpack(),    ui_options.get("gameplay/disguise/backpack_factor")    or 1 },
+        { gd.examinate_inventory(),   ui_options.get("gameplay/disguise/inventory_factor")   or 1 },
+    }
+    local fraction, sum = 0, 0
+    for _, p in ipairs(vals) do
+        if p[1] and p[1] > 0 then           -- examinate returns 0 only when its factor is disabled
+            fraction = fraction + 1
+            sum = sum + p[1] * p[2]
+        end
+    end
+    if fraction <= 0 then return 1 end
+    return clamp(math.floor(100 - (sum / fraction)), 0, 100)
+end
+
+local function peer_report()
+    local tg = time_global()
+    if tg < next_peer_tg then return end
+    next_peer_tg = tg + 1000   -- disguise changes are rare; 1 Hz poll is ample
+
+    local cur = character_community(db.actor)   -- e.g. "actor_dolg"
+    if not cur or cur == "" then return end
+    local bare = cur:match("^actor_(.+)") or cur
+
+    local gd = gameplay_disguise
+    local disguised = gd and gd.is_actor_disguised and gd.is_actor_disguised() and true or false
+
+    if cur ~= last_sent_comm then
+        last_sent_comm = cur
+        XrrPlayers():ReportDisguise(bare, disguised)
+    end
+
+    if disguised then
+        XrrPlayers():ReportDisguiseInput(compute_item_factor(), peer_spike)
+    end
+    peer_spike = 0   -- vanilla resets spike every actor-update window
+
+    -- The vanilla "default" community, NOT the live one a disguise swaps.
+    local true_comm = get_actor_true_community and get_actor_true_community()
+    if true_comm and true_comm ~= "" then
+        if last_sent_true == nil then
+            last_sent_true = true_comm        -- seed on first poll: host already has the join faction
+        elseif true_comm ~= last_sent_true then
+            last_sent_true = true_comm
+            XrrPlayers():ReportFactionChange(true_comm)
+        end
+    end
+end
+
+-- HOST_FACTION_SET (host → peer): applies via vanilla update_default, NOT
+-- set_actor_true_community, which would also recycle host-owned DRX questlines locally.
+function OnHostFactionSet(community)
+    if XrrIsHost() then return end
+    if not (community and community ~= "" and db.actor) then return end
+    local gd = gameplay_disguise
+    if gd and gd.update_default then
+        gd.update_default(community)
+    else
+        db.actor:set_character_community("actor_" .. community, 0, 0)
+    end
+    printf("[xrRazom][faction] OnHostFactionSet -> %s", community)
+end
+
+-- Always sent at proxy (re)spawn; empty = not disguised.
+function OnDisguiseRestore(community)
+    if XrrIsHost() then return end
+    pending_restore = community or ""
+end
+
+-- DISGUISE_EXPOSE (host → peer): run the LOCAL half of vanilla expose_actor.
+function OnDisguiseExpose(is_enem, rep_hit, npc_community)
+    local gd = gameplay_disguise
+    if not (gd and db.actor) then return end
+    local def = (gd.get_default_comm and gd.get_default_comm())
+                or (character_community(db.actor):sub(7)) or "stalker"
+    if gd.set_msg  then gd.set_msg("st_disguse_actor_exposed", def) end
+    if gd.set_comm then gd.set_comm(def) end                 -- revert community; clears is_disguised
+    if rep_hit and rep_hit ~= 0 then
+        game_statistics.increment_reputation(rep_hit)        -- peer owns its reputation (PEER_PROGRESS)
+    end
+    last_sent_comm = nil   -- force an immediate community re-report so host + peer agree
+end
+
+-- Peer disguise bar: vanilla hud_update reads a script-local highest_suspicion that
+-- never moves on a peer — mirror NPCs don't run npc_on_update.
+local hud_override_installed = false
+local orig_hud_update        = nil
+local hb_tmr, hb_val         = 0, 1
+local HB_STEP, HB_TIME       = 10, 500
+
+local function peer_hud_update()
+    local gd  = gameplay_disguise
+    local hud = get_hud()
+    local hud_d = hud:GetCustomStatic("bar_disguise")
+
+    local disguised = gd and gd.is_actor_disguised and gd.is_actor_disguised()
+    if (not disguised) or db.actor:is_talking() then
+        if hud_d ~= nil then hud:RemoveCustomStatic("bar_disguise") end
+        return
+    end
+
+    if hud_d == nil then
+        hud:AddCustomStatic("bar_disguise", true)
+        hud_d = hud:GetCustomStatic("bar_disguise")
+        local w = hud_d:wnd()
+        if w ~= nil then w:SetAutoDelete(true) end
+    end
+
+    local tg = time_global()
+    if hb_tmr >= tg then return end
+    hb_tmr = tg + HB_TIME
+
+    local wnd = hud_d:wnd()
+    if wnd == nil then return end
+
+    local val = XrrPlayers():DisguiseSuspicion()    -- host-computed meter (0..100)
+    if (val > hb_val) and (val - hb_val > HB_STEP) then
+        hb_val = hb_val + HB_STEP
+    elseif (val < hb_val) and (hb_val - val > HB_STEP) then
+        hb_val = hb_val - HB_STEP
+    end
+    hb_val = clamp(hb_val, 0, 100)
+
+    local str   = gd.hud_val_to_str(hb_val)
+    local green = math.floor(255 * ((100 - hb_val) / 100))
+    local red   = math.floor(255 * (hb_val / 100))
+    wnd:TextControl():SetTextST(str)
+    wnd:TextControl():SetTextColor(GetARGB(255, red, green, 50))
+end
+
+local function install_hud_override()
+    if hud_override_installed then return end
+    if not (gameplay_disguise and gameplay_disguise.hud_update) then return end
+    hud_override_installed = true
+    orig_hud_update = gameplay_disguise.hud_update
+    gameplay_disguise.hud_update = function()
+        if XrrIsConnected() then peer_hud_update() else orig_hud_update() end
+    end
+end
+
+-- Host side: config push + expose penalty
+
+-- Penalty tuning defaults (mirrors vanilla gameplay_disguise locals).
+local host_cfg_loaded = false
+local relation_hit, reputation_hit, goodwill_hit = -75, -100, -50
+
+local function refresh_host_config()
+    local ini = ini_file("plugins\\disguise.ltx")
+    relation_hit   = ini:r_float_ex("relation_impact", "relation_hit")   or -75
+    reputation_hit = ini:r_float_ex("relation_impact", "reputation_hit") or -100
+    goodwill_hit   = ini:r_float_ex("relation_impact", "goodwill_hit")   or -50
+
+    -- SetDisguiseCfg arms the evaluator, so it goes last of the three pushes.
+    XrrPlayers():SetDisguiseFactors(
+        ui_options.get("gameplay/disguise/distance") and true or false,
+        ui_options.get("gameplay/disguise/distance_factor")  or 5,
+        ui_options.get("gameplay/disguise/stay_time") and true or false,
+        ui_options.get("gameplay/disguise/stay_time_factor") or 20,
+        ui_options.get("gameplay/disguise/speed") and true or false,
+        ui_options.get("gameplay/disguise/speed_factor")     or 1)
+    XrrPlayers():SetDisguiseAwareness(
+        ini:r_float_ex("npc_awareness", "npc_awareness_type_0") or 1,
+        ini:r_float_ex("npc_awareness", "npc_awareness_type_1") or 1,
+        ini:r_float_ex("npc_awareness", "npc_awareness_type_2") or 1,
+        ini:r_float_ex("npc_awareness", "npc_awareness_type_3") or 1.1,
+        ini:r_float_ex("npc_awareness", "npc_awareness_type_4") or 1.2,
+        ini:r_float_ex("npc_awareness", "npc_awareness_type_5") or 1.3)
+    XrrPlayers():SetDisguiseCfg(
+        ini:r_float_ex("diguise_controls", "break_point")        or 90,
+        ini:r_float_ex("diguise_controls", "usual_memory_limit") or 10,
+        ini:r_float_ex("diguise_controls", "enemy_memory_limit") or 30,
+        ini:r_float_ex("diguise_controls", "memory_multi")       or 10)
+
+    host_cfg_loaded = true
+end
+
+-- No Lua caller: the engine's evaluator calls this on break_point. Applies vanilla
+-- expose_actor's relation/goodwill hits; returns the reputation hit it sends back.
+function XrrDisguiseExposePenalty(comm, true_faction, is_enem)
+    if is_enem or comm == true_faction then return 0 end
+    if (ui_options.get("alife/general/dynamic_relations") == true)
+       and (not game_relations.is_faction_unaffected(comm))
+       and (not game_relations.is_faction_unaffected(true_faction))
+       and (not game_relations.is_faction_pair_unaffected(comm, true_faction)) then
+        game_relations.change_faction_relations(comm, true_faction, relation_hit)
+    end
+    game_relations.change_factions_community_num(comm, true_faction, goodwill_hit)
+    return math.floor(reputation_hit)
+end
+
+-- Dispatch + callback registration
+
+-- Cosmetic: peers' local copy of the host shows the disguise faction.
+local last_host_comm = nil
+local function host_own_disguise_poll()
+    local cur = character_community(db.actor)
+    if not cur or cur == "" then return end
+    if cur ~= last_host_comm then
+        last_host_comm = cur
+        XrrPlayers():BroadcastMyDisguise(cur:match("^actor_(.+)") or cur)
+    end
+end
+
+local next_host_tg = 0
+local function disguise_update_impl()
+    if not db.actor then return end
+    if XrrIsConnected() then          -- peer
+        install_hud_override()
+        apply_pending_restore()
+        if reporter_armed then peer_report() end
+    elseif XrrIsHosted() then         -- host with peers
+        local tg = time_global()
+        if tg < next_host_tg then return end
+        next_host_tg = tg + 1000      -- disguise changes are rare; 1 Hz matches the peer poll
+        if not host_cfg_loaded then refresh_host_config() end
+        host_own_disguise_poll()
+    end
+end
+
+-- pcall shield: examinate_* derefs vanilla chains a broken mod can nil out mid-tick.
+local next_err_tg = 0
+local function disguise_update()
+    if not XrrSessionActive then return end   -- per frame: no pcall, no facade, in solo
+    local ok, err = pcall(disguise_update_impl)
+    if not ok then
+        local tg = time_global()
+        if tg >= next_err_tg then
+            next_err_tg = tg + 5000
+            printf("![xrRazom] disguise_update error (skipped this tick): %s", tostring(err))
+        end
+    end
+end
+
+local function on_item_drop(_)   peer_spike = 15 end
+local function on_weapon_zoom(_) peer_spike = 30 end
+
+local function on_option_change()
+    if XrrIsHosted() then refresh_host_config() end
+end
+
+_G.xrr_disguise_report_update     = disguise_update
+_G.xrr_disguise_on_item_drop      = on_item_drop
+_G.xrr_disguise_on_weapon_zoom    = on_weapon_zoom
+_G.xrr_disguise_on_option_change  = on_option_change
+_G.OnDisguiseExpose               = OnDisguiseExpose
+_G.OnDisguiseRestore              = OnDisguiseRestore
+_G.OnHostFactionSet               = OnHostFactionSet
+_G.XrrDisguiseExposePenalty       = XrrDisguiseExposePenalty

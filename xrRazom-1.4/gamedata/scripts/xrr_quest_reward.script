@@ -1,0 +1,134 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Quest rewards: one QUEST_REWARD per completed task merges the task's reward
+  fields, the fetch payment, on_complete effects and rewards a dialog paid.
+]]
+
+-- Filled during the host's on_complete replay.
+local accum = { money = 0, items = {} }
+
+function accum_reset()
+    accum = { money = 0, items = {} }
+end
+
+-- items_blob is a wire fragment ("sec1,sec2").
+function accum_add(money, items_blob)
+    if money and money > 0 then accum.money = accum.money + money end
+    if items_blob and items_blob ~= "" then accum.items[#accum.items + 1] = items_blob end
+end
+
+-- Rewards a dialog paid, parked apart: task_callback's accum_reset() runs a tick
+-- or more after the dialog.
+local pending = {}
+
+function add_pending(task_id, money, items)
+    if not task_id then return end
+    local p = pending[task_id] or { money = 0, items = {} }
+    p.money = p.money + (tonumber(money) or 0)
+    for _, sec in ipairs(items or {}) do p.items[#p.items + 1] = sec end
+    pending[task_id] = p
+end
+
+function take_pending(task_id)
+    local p = pending[task_id]
+    pending[task_id] = nil
+    return p
+end
+
+-- Rolls per call: the peers' share and the host's own credit deliberately differ.
+function calc_fetch_money(task_id)
+    local raw_oc = task_manager.task_ini:r_string_ex(task_id, "on_complete")
+    if not raw_oc then return 0 end
+    -- Optional 2nd arg = cost multiplier, e.g. fetch_reward_and_remove(var:1.25)
+    local fetch_var, fetch_mult = raw_oc:match("fetch_reward_and_remove%(([^:%)]+):?([%d%.]*)")
+    if not fetch_var then return 0 end
+    local sec = utils_data.load_var(db.actor, fetch_var)
+    local count = utils_data.load_var(db.actor, task_id .. "_fetch_count") or 1
+    if not (sec and ini_sys:section_exist(sec)) then return 0 end
+    local multi = game_difficulties.get_eco_factor("rewards") or 1
+    local cost = ini_sys:r_float_ex(sec, "cost") or 500
+    -- Vanilla's cost * count * mult ±10%, without its condition factor: fetch
+    -- sections are patches and parts at condition ≈ 1.
+    local total = cost * count * multi * (tonumber(fetch_mult) or 1)
+    local delta_r = math.floor(total * 0.1)
+    return math.random(math.floor(total - delta_r), math.floor(total + delta_r))
+end
+
+-- Reward extraction
+
+function extract(tsk)
+    local money = 0
+    local items = {}
+
+    if tsk.reward_money then
+        local cond = tsk.reward_money
+        if type(cond) == "table" then
+            local m = xr_logic.pick_section_from_condlist(db.actor, db.actor, cond)
+            money = money + (tonumber(m) or 0)
+        end
+    end
+
+    if tsk.reward_item then
+        local cond = tsk.reward_item
+        if type(cond) == "table" then
+            local itm = xr_logic.pick_section_from_condlist(db.actor, db.actor, cond)
+            if itm and itm ~= "" then
+                for section in itm:gmatch("[^,]+") do
+                    local sec, cnt = section:match("^(.+):(%d+)$")
+                    if sec then
+                        for _ = 1, tonumber(cnt) do items[#items + 1] = sec end
+                    else
+                        items[#items + 1] = section
+                    end
+                end
+            end
+        end
+    end
+
+    return money, items
+end
+
+-- Broadcast
+
+-- Call after _orig_task_callback. Roll fetch_money before it: on_complete
+-- resets the fetch var, so a later roll reads nil.
+function broadcast(tsk, fetch_money)
+    -- Cleared before the solo early-out so a solo completion leaves no stale entry.
+    local pend = take_pending(tsk.id)
+    if not XrrIsHosted() then
+        accum_reset()
+        return
+    end
+    local money, items = extract(tsk)
+    money = money + (fetch_money or 0)
+    local item_parts = {}
+    for _, sec in ipairs(items) do item_parts[#item_parts + 1] = sec end
+
+    money = money + accum.money
+    for _, blob in ipairs(accum.items) do item_parts[#item_parts + 1] = blob end
+    accum_reset()
+
+    if pend then
+        money = money + pend.money
+        for _, sec in ipairs(pend.items) do item_parts[#item_parts + 1] = sec end
+    end
+
+    local items_blob = table.concat(item_parts, ",")
+    printf("[xrRazom][quest] broadcast_quest_reward id=%s money=%s items=[%s]",
+        tsk.id, tostring(money), items_blob)
+    XrrAlife():SendQuestReward(tsk.id, money, items_blob)
+end
+
+-- On-fail penalties: only the on_fail effect captures, no reward fields or fetch.
+function broadcast_fail(task_id)
+    local money, item_parts = accum.money, accum.items
+    accum_reset()
+    if not XrrIsHosted() then return end
+    if money == 0 and #item_parts == 0 then return end
+    local items_blob = table.concat(item_parts, ",")
+    printf("[xrRazom][quest] broadcast_quest_fail_penalty id=%s money=%s items=[%s]",
+        tostring(task_id), tostring(money), items_blob)
+    XrrAlife():SendQuestReward(task_id, money, items_blob)
+end

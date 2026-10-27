@@ -1,0 +1,146 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Immersive Sleep patch: sleep is a party action, so the mod's sleepiness veto
+  judges the party's most tired member instead of the local actor.
+]]
+
+local KEY_SELF  = "xrr_imsleep"        -- peer → host: own sleepiness
+local KEY_PARTY = "xrr_imsleep_party"  -- host → peer: party max
+
+local QUANT   = 100    -- report/push granularity (sleepiness is 0..10000)
+local TICK_MS = 5000
+
+local _installed     = false
+local _next_tick     = 0
+local _last_reported = nil   -- peer: last KEY_SELF value sent
+local _last_pushed   = nil   -- host: last KEY_PARTY value pushed
+local _last_pushed_n = 0     -- host: peer count at last push
+
+local function in_session()
+    return XrrIsHosted() or XrrIsConnected()
+end
+
+local function own_sleepiness()
+    local v = actor_status_sleep.get_last_sleep()
+    return type(v) == "number" and v or 0
+end
+
+local function quantize(v)
+    return math.floor(v / QUANT) * QUANT
+end
+
+local function host_party_max()
+    local m = own_sleepiness()
+    local players = XrrPlayers()
+    for i = 1, players:GetPeerCount() do
+        local nick = players:GetPeerNicknameAt(i)
+        if nick and nick ~= "" then
+            local v = tonumber(players:GetPeerVarOf(nick, KEY_SELF))
+            if v and v > m then m = v end
+        end
+    end
+    return m
+end
+
+-- The peer folds in its own value so a fresh local rise counts before the
+-- host's push comes back around.
+local function party_view()
+    if XrrIsHost() then return host_party_max() end
+    local v = tonumber(XrrPlayers():GetPeerVar(KEY_PARTY))
+    return math.max(own_sleepiness(), v or 0)
+end
+
+-- Scoped swap so other get_last_sleep consumers (stat bars) never see `value`.
+local function with_sleepiness(value, fn, ...)
+    local orig = actor_status_sleep.get_last_sleep
+    actor_status_sleep.get_last_sleep = function() return value end
+    local ok, err = pcall(fn, ...)
+    actor_status_sleep.get_last_sleep = orig
+    if not ok then
+        printe("![xrRazom] imsleep: wrapped call raised: %s", tostring(err))
+    end
+end
+
+local function on_update()
+    if not in_session() then return end
+    local tg = time_global()
+    if tg < _next_tick then return end
+    _next_tick = tg + TICK_MS
+    local players = XrrPlayers()
+    if XrrIsHost() then
+        local n = players:GetPeerCount()
+        local q = quantize(host_party_max())
+        if q ~= _last_pushed or n ~= _last_pushed_n then
+            _last_pushed, _last_pushed_n = q, n
+            for i = 1, n do
+                local nick = players:GetPeerNicknameAt(i)
+                if nick and nick ~= "" then
+                    players:SetPeerVarOf(nick, KEY_PARTY, tostring(q))
+                end
+            end
+        end
+    else
+        local q = quantize(own_sleepiness())
+        if q ~= _last_reported then
+            _last_reported = q
+            players:SetPeerVar(KEY_SELF, tostring(q))
+        end
+    end
+end
+
+-- Must install after xrr_patch_weather so this OnButtonSleep wrap layers over
+-- the co-op sleep coordination.
+function apply()
+    if _installed then return end
+    if not (ui_sleep_dialog
+            and type(ui_sleep_dialog.get_immersive_sleep_hours) == "function"
+            and actor_status_sleep
+            and type(actor_status_sleep.get_last_sleep) == "function") then
+        log("[xrRazom] imsleep: Immersive Sleep absent — skipped")
+        return
+    end
+    _installed = true
+
+    local orig_test  = ui_sleep_dialog.UISleep.TestAndShow
+    local orig_btn   = ui_sleep_dialog.UISleep.OnButtonSleep
+    local orig_begin = _G.OnSleepBegin
+    local orig_req   = _G.OnPeerSleepRequest
+
+    function ui_sleep_dialog.UISleep:TestAndShow(force)
+        if not in_session() then return orig_test(self, force) end
+        with_sleepiness(party_view(), orig_test, self, force)
+    end
+
+    function ui_sleep_dialog.UISleep:OnButtonSleep()
+        if not in_session() then return orig_btn(self) end
+        with_sleepiness(party_view(), orig_btn, self)
+    end
+
+    -- Follows force-pass: the requester already gated, and a host-side re-veto
+    -- would land after BroadcastSleepBegin went out.
+    if orig_begin then
+        _G.OnSleepBegin = function(hours)
+            if not in_session() then return orig_begin(hours) end
+            with_sleepiness(10000, orig_begin, hours)
+        end
+    end
+    if orig_req then
+        _G.OnPeerSleepRequest = function(hours)
+            if not in_session() then return orig_req(hours) end
+            with_sleepiness(10000, orig_req, hours)
+        end
+    end
+
+    RegisterScriptCallback("actor_on_update", on_update)
+    if xrr_register_cleanup then
+        xrr_register_cleanup(function()
+            _next_tick     = 0
+            _last_reported = nil
+            _last_pushed   = nil
+            _last_pushed_n = 0
+        end)
+    end
+    log("[xrRazom] imsleep: party-wide tiredness gate installed")
+end

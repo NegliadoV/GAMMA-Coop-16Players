@@ -1,0 +1,14 @@
+C:\Users\stanis\Desktop\GAMMA-Coop\DlCli\bin\Release\net10.0\stalker-gamma-dl-cli.exe
+C:\Users\stanis\Desktop\GAMMA-Coop\DlCli\bin\Release\net10.0\stalker-gamma-dl-cli.deps.json
+C:\Users\stanis\Desktop\GAMMA-Coop\DlCli\bin\Release\net10.0\stalker-gamma-dl-cli.runtimeconfig.json
+C:\Users\stanis\Desktop\GAMMA-Coop\DlCli\bin\Release\net10.0\stalker-gamma-dl-cli.dll
+C:\Users\stanis\Desktop\GAMMA-Coop\DlCli\bin\Release\net10.0\stalker-gamma-dl-cli.pdb
+C:\Users\stanis\Desktop\GAMMA-Coop\DlCli\obj\Release\net10.0\stalker-gamma-dl-cli.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\stanis\Desktop\GAMMA-Coop\DlCli\obj\Release\net10.0\stalker-gamma-dl-cli.AssemblyInfoInputs.cache
+C:\Users\stanis\Desktop\GAMMA-Coop\DlCli\obj\Release\net10.0\stalker-gamma-dl-cli.AssemblyInfo.cs
+C:\Users\stanis\Desktop\GAMMA-Coop\DlCli\obj\Release\net10.0\stalker-gamma-dl-cli.csproj.CoreCompileInputs.cache
+C:\Users\stanis\Desktop\GAMMA-Coop\DlCli\obj\Release\net10.0\stalker-gamma-dl-cli.dll
+C:\Users\stanis\Desktop\GAMMA-Coop\DlCli\obj\Release\net10.0\refint\stalker-gamma-dl-cli.dll
+C:\Users\stanis\Desktop\GAMMA-Coop\DlCli\obj\Release\net10.0\stalker-gamma-dl-cli.pdb
+C:\Users\stanis\Desktop\GAMMA-Coop\DlCli\obj\Release\net10.0\stalker-gamma-dl-cli.genruntimeconfig.cache
+C:\Users\stanis\Desktop\GAMMA-Coop\DlCli\obj\Release\net10.0\ref\stalker-gamma-dl-cli.dll

@@ -1,0 +1,15 @@
+; xrRazom — placed hideout radio, for xrr_patch_hf_radio.script.
+; The station catalog and the shared volume/lock controls live in
+; placeable_radio's file-locals, which the module.fn patch idiom cannot reach;
+; the engine's Lua unlocalizer promotes them to placeable_radio fields.
+; Sections merge additively across unlocalizer files, so this extends
+; [placeable_radio] rather than replacing it.
+
+[placeable_radio]
+path_radio_ch
+path_radio_session
+radio_ch_names
+radio_frequencies
+radio_vol
+psi_vol
+safety_lock

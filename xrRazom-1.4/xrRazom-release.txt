@@ -1,0 +1,6 @@
+﻿xrRazom 1.4 - Full-Bundle
+
+protocol      116
+engine        develop-mt @ 82abfe14f
+configs       all 8
+included      xrmpe; options: MCM, FDDA, UA localization

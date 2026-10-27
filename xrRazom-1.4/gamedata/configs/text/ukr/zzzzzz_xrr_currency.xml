@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="windows-1251" ?>
+
+<!--
+	xrRazom: currency-unit overrides for string ids owned by third-party mods.
+
+	Keep the text in sync with st_xrr_currency (ui_xrrazom.xml) - a string table
+	cannot reference another entry, so the unit is spelled out again here.
+
+	The filename sorts last on purpose: CStringTable::Load overwrites duplicate
+	ids and walks the text folder in name order, so this file must be read after
+	the one that defines the id. Same trick GAMMA's own zzzz_*.xml files use.
+-->
+
+<string_table>
+
+	<!--
+		Item UI Improvements (Utjan) - value stamped on a money stack's inventory
+		cell. Used as a prefix with no separator, so no leading space here.
+	-->
+	<string id="ui_utjan_ruble">
+		<text>UAH</text>
+	</string>
+
+</string_table>

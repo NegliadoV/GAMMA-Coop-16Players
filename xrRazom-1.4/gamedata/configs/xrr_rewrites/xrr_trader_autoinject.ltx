@@ -1,0 +1,14 @@
+; xrRazom — GAMMA's trader_autoinject (the copy MO2 resolves; 3 of the 21
+; shipped copies carry this line, and the winning one is among them).
+; Its "sid/forester fix" refuses a restock for esc_m_trader / red_m_lesnik
+; unless db.actor is within 20 m. Every restock trigger goes through that
+; wrapper, so on the host a peer at the counter can never trigger one and the
+; trader serves its bare loadout until the host walks up. Rewritten to the
+; nearest-player test in xrr_patch_common: same radius, same two NPCs, the
+; distance counts peers as players — and no dead player, host or peer, which
+; the original did not check.
+; A miss logs INSTALL FAILED and the file runs untouched.
+
+[trader_autoinject]
+from_1 = "npc:position():distance_to(db.actor:position()) > 20"
+to_1   = "(not XrrAnyPlayerWithin(npc, 20))"

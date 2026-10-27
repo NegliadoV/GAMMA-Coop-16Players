@@ -1,0 +1,73 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Peer-side MCM overlay: while connected, reads of host-authored keys answer
+  with the host's values; writes to them are dropped.
+  The modxml_ name makes dxml_core load this before ui_mcm or xrr_core exist:
+  reference only axr_main and the engine's Xrr* accessors.
+]]
+
+local function authored(k)
+    if not (k and XrrNet) then return nil end
+    local net = XrrNet()
+    -- The map also holds the host's own authored values; only a peer may read them here.
+    if not (net and net:IsConnected()) then return nil end
+    local mcm = XrrMcm()
+    if mcm:OverlayTag(k) < 0 then return nil end
+    return mcm
+end
+
+local announced = {}
+
+-- Wraps the axr_main.config instance above its read cache, so a host value never
+-- reaches the cache or the ltx; the class would hit every ini in the game.
+local function install()
+    if not XrrNet then return end                    -- vanilla exe
+    local cfg = axr_main and axr_main.config
+    if not (cfg and cfg.r_value and cfg.w_value) then return end
+
+    local orig_r = cfg.r_value
+    local orig_w = cfg.w_value
+
+    -- Session test before the concat: every axr_option read in the game passes here.
+    local function overlay_key(s, k)
+        if s == "mcm" then return k end
+        if s == "options" and XrrNet and XrrNet():IsConnected() then
+            return "options/" .. k
+        end
+        return nil
+    end
+
+    cfg.r_value = function(self, s, k, typ, def)
+        local ok = overlay_key(s, k)
+        if ok then
+            local mcm = authored(ok)
+            if mcm then
+                if not announced[ok] then
+                    announced[ok] = true
+                    log("[xrRazom] mcm overlay: " .. ok .. " → host")
+                end
+                if typ == 1 then return mcm:OverlayBool(ok) end
+                if typ == 2 then return mcm:OverlayNumber(ok) end
+                return mcm:OverlayString(ok)
+            end
+        end
+        return orig_r(self, s, k, typ, def)
+    end
+
+    cfg.w_value = function(self, s, k, val, comment)
+        local ok = overlay_key(s, k)
+        if ok and authored(ok) then
+            log("[xrRazom] mcm overlay: write to host-owned " .. ok .. " dropped")
+            return
+        end
+        return orig_w(self, s, k, val, comment)
+    end
+end
+
+install()
+
+-- dxml_core calls this on every gathered file; the wrap is already installed.
+function on_xml_read()
+end

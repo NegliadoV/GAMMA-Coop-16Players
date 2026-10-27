@@ -1,0 +1,88 @@
+<w>
+	<msg_box_xrr_connecting type="ok" x="240" y="256" width="541" height="255" stretch="1">
+	    <texture>ui_inGame2_message_box</texture>
+	    <message_text x="49" y="28" width="461" height="150" complex_mode="1">
+		    <text r="240" g="240" b="240" align="c" vert_align="c" font="letterica18">ui_xrr_connecting</text>
+	    </message_text>
+	    <button_ok x="220" y="212" width="101" height="28" check_mode="0">
+	        <window_name>button_ok</window_name>
+	        <text font="letterica18">Btn_Cancel</text>
+	        <texture>ui_button_ordinary</texture>
+	    </button_ok>
+	</msg_box_xrr_connecting>
+	<msg_box_xrr_direct_ip type="direct_ip" x="240" y="256" width="541" height="255" stretch="1">
+	    <texture>ui_inGame2_message_box</texture>
+	    <cap_host x="192" y="30" width="89" height="25">
+	        <text font="letterica16" vert_align="c">ui_xrr_server_ip</text>
+	    </cap_host>
+	    <!-- Password row is unused until/unless a session-password feature ships.
+	         The C++ direct_ip init (UIMessageBox.cpp) creates all four widgets
+	         unconditionally, so the nodes must exist — hidden via height=0 and an
+	         empty label. -->
+	    <cap_password x="192" y="65" width="89" height="0">
+	        <text font="letterica16" vert_align="c"></text>
+	    </cap_password>
+	    <edit_host x="282" y="30" width="136" height="25" max_symb_count="40">
+	        <text x="3" font="letterica16" vert_align="c">127.0.0.1</text>
+	        <texture>ui_inGame2_edit_box_1</texture>
+	    </edit_host>
+	    <edit_password x="282" y="65" width="136" height="0" password="1" max_symb_count="24">
+	        <text x="3" font="letterica16" vert_align="c"></text>
+	        <texture>ui_inGame2_edit_box_1</texture>
+	    </edit_password>
+	    <!-- x is 6 left of cap_host's 192: the checker sprite carries a transparent
+	         left margin, so the drawn box lands on the "Server IP:Port" text start. -->
+	    <check_remember x="186" y="68" width="28" height="23" stretch="1">
+	        <texture>ui_inGame2_checkbox</texture>
+	    </check_remember>
+	    <cap_remember x="224" y="68" width="200" height="23">
+	        <text font="letterica16" align="l" vert_align="c">ui_xrr_remember_ip</text>
+	    </cap_remember>
+	    <button_yes x="167" y="212" width="101" height="28" check_mode="0">
+	        <window_name>button_yes</window_name>
+	        <text font="letterica18">Btn_OK</text>
+	        <texture>ui_button_ordinary</texture>
+	    </button_yes>
+	    <button_no x="272" y="212" width="101" height="28" check_mode="0">
+	        <window_name>button_no</window_name>
+	        <text font="letterica18">Btn_Cancel</text>
+	        <texture>ui_button_ordinary</texture>
+	    </button_no>
+	</msg_box_xrr_direct_ip>
+	<!-- Money-transfer amount entry (xrr_patch_inventory). type="direct_ip" is
+	     the engine's only edit-box message box; the password row it insists on
+	     creating is hidden via height=0. message_text is MANDATORY for every
+	     template used with SetText (CUIMessageBox::SetText derefs it) — it
+	     carries "Send money to <nick>" set at runtime. -->
+	<msg_box_xrr_send_money type="direct_ip" x="240" y="256" width="541" height="255" stretch="1">
+	    <texture>ui_inGame2_message_box</texture>
+	    <message_text x="49" y="28" width="461" height="60" complex_mode="1">
+		    <text r="240" g="240" b="240" align="c" vert_align="c" font="letterica18"></text>
+	    </message_text>
+	    <!-- Label + edit centred as a pair on the box's 270 midline. -->
+	    <cap_host x="120" y="100" width="125" height="25">
+	        <text font="letterica16" align="r" vert_align="c">ui_xrr_money_amount</text>
+	    </cap_host>
+	    <cap_password x="192" y="135" width="89" height="0">
+	        <text font="letterica16" vert_align="c"></text>
+	    </cap_password>
+	    <edit_host x="255" y="100" width="100" height="25" max_symb_count="10">
+	        <text x="3" font="letterica16" vert_align="c"></text>
+	        <texture>ui_inGame2_edit_box_1</texture>
+	    </edit_host>
+	    <edit_password x="292" y="135" width="100" height="0" password="1" max_symb_count="24">
+	        <text x="3" font="letterica16" vert_align="c"></text>
+	        <texture>ui_inGame2_edit_box_1</texture>
+	    </edit_password>
+	    <button_yes x="167" y="212" width="101" height="28" check_mode="0">
+	        <window_name>button_yes</window_name>
+	        <text font="letterica18">ui_xrr_money_send_btn</text>
+	        <texture>ui_button_ordinary</texture>
+	    </button_yes>
+	    <button_no x="272" y="212" width="101" height="28" check_mode="0">
+	        <window_name>button_no</window_name>
+	        <text font="letterica18">Btn_Cancel</text>
+	        <texture>ui_button_ordinary</texture>
+	    </button_no>
+	</msg_box_xrr_send_money>
+</w>

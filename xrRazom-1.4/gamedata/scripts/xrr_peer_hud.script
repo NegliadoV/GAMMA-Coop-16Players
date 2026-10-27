@@ -1,0 +1,236 @@
+--[[
+  xrRazom — party HUD. Slots clone vanilla's companion_list slot template, so
+  the panel matches the companion column under any HUD-mod restyle.
+  Patched for 16-player support (MAX_SLOTS = 16 with adaptive compact stacking).
+]]
+
+local MAX_SLOTS   = 16  -- expanded from 4 to 16 to match unlocked xrr_max_players
+local REFRESH_MS  = 500
+local EDGE_GAP_PX = 10  -- panel right margin, physical pixels
+local COMP_GAP_PX = 8   -- gap between companion column and party panel
+
+-- Fallback when the peer's outfit has no character_portrait.
+local FACTION_ICON = {
+    stalker  = "ui_inGame2_neutral_0",
+    bandit   = "ui_inGame2_bandit_a",
+    dolg     = "ui_inGame2_neutral_1",
+    freedom  = "ui_inGame2_neutral_1",
+    army     = "ui_inGame2_neutral_1",
+    csky     = "ui_inGame2_csky_4",
+    ecolog   = "ui_inGame2_neutral_1",
+    killer   = "ui_inGame2_mercen_2_mask",
+    monolith = "ui_inGame2_neutral_1w",
+    renegade = "ui_inGame2_bandit_a",
+    greh     = "ui_inGame2_neutral_1w",
+    isg      = "ui_inGame2_neutral_0",
+    zombied  = "ui_inGame2_Zombied_1",
+}
+local DEFAULT_ICON = "ui_inGame2_neutral_0"
+
+HUD = nil
+
+function activate_hud()
+    if HUD == nil then
+        HUD = UIPeerList()
+        get_hud():AddDialogToRender(HUD)
+    end
+    RegisterScriptCallback("actor_on_net_destroy", deactivate_hud)
+    RegisterScriptCallback("on_console_execute",   on_console_execute)
+end
+
+function deactivate_hud()
+    if HUD ~= nil then
+        get_hud():RemoveDialogToRender(HUD)
+        HUD = nil
+    end
+    UnregisterScriptCallback("actor_on_net_destroy", deactivate_hud)
+    UnregisterScriptCallback("on_console_execute",   on_console_execute)
+end
+
+function on_console_execute(name)
+    if name == "hud_draw" and HUD then
+        HUD:Update(true)
+    end
+end
+
+local function slot_width(s)
+    local w = 0
+    for _, ele in pairs(s) do
+        local r = ele:GetWndPos().x + ele:GetWidth()
+        if r > w then w = r end
+    end
+    return w
+end
+
+class "UIPeerList" (CUIScriptWnd)
+
+function UIPeerList:__init() super()
+    self.slots = {}
+    self._tmr  = time_global()
+    self.clr_list = {
+        def      = GetARGB(255, 255, 255, 255),
+        stalker  = GetARGB(255, 255, 255, 100),
+        bandit   = GetARGB(255, 120, 201,  79),
+        ecolog   = GetARGB(255, 255, 128, 100),
+        csky     = GetARGB(255, 100, 200, 255),
+        dolg     = GetARGB(255, 255, 100, 100),
+        freedom  = GetARGB(255, 100, 255, 100),
+        killer   = GetARGB(255, 100, 100, 255),
+        army     = GetARGB(255, 100, 128, 255),
+        monolith = GetARGB(255, 120, 201,  79),
+    }
+    self:InitControls()
+end
+
+function UIPeerList:__finalize() end
+
+function UIPeerList:InitControls()
+    local xml = CScriptXmlInit()
+    xml:ParseFile("ui_xrrazom_hud.xml")
+    local hud_xml = utils_xml.get_hud_xml()
+
+    self.dialog = hud_xml:InitStatic("companion_list", self)
+
+    for i = 1, MAX_SLOTS do
+        local s = {}
+        s.base       = hud_xml:InitStatic     ("companion_list:slot",            self.dialog)
+        s.background = hud_xml:InitStatic     ("companion_list:slot:background", s.base)
+        s.icon       = hud_xml:InitStatic     ("companion_list:slot:icon",       s.base)
+        s.distance   = hud_xml:InitTextWnd    ("companion_list:slot:distance",   s.base)
+        s.hp         = hud_xml:InitProgressBar("companion_list:slot:health",     s.base)
+        s.name_bg = xml:InitStatic ("peer_list:nameplate_bg", s.base)
+        s.name    = xml:InitTextWnd("peer_list:nameplate",    s.base)
+        s.role_shadow = hud_xml:InitStatic("companion_list:slot:team_role", s.base)
+        s.role        = hud_xml:InitStatic("companion_list:slot:team_role", s.base)
+
+        for _, ele in pairs(s) do
+            utils_xml.correct_ratio(ele)
+        end
+
+        s.distance:SetFont(GetFontSmall())
+        s.distance:Show(false)
+        s.name:SetFont(GetFontSmall())
+        s.name:SetEllipsis(true)
+
+        local rp = s.role:GetWndPos()
+        s.role_shadow:SetWndPos(vector2():set(rp.x + 1, rp.y + 2))
+        s.role_shadow:SetTextureColor(GetARGB(255, 0, 0, 0))
+
+        local h = s.background:GetHeight()
+        local col = math.floor((i - 1) / 8)
+        local row = ((i - 1) % 8) + 1
+        s.base:SetWndPos(vector2():set(-col * (slot_width(s) + 6), (8 - row) * (h + 10)))
+        s.base:Show(false)
+
+        self.slots[i] = s
+    end
+
+    local ratio_w = 1024 / device().width
+    local pos = self.dialog:GetWndPos()
+    self.col_w = slot_width(self.slots[1])
+    self.dialog:SetWndPos(vector2():set(1024 - self.col_w - EDGE_GAP_PX * ratio_w, pos.y))
+end
+
+function UIPeerList:ResolveFaction(i)
+    local fac = XrrPlayers():GetPeerFactionAt(i) or ""
+    return (string.gsub(fac, "^actor_", ""))
+end
+
+function UIPeerList:ResolvePortrait(i)
+    local outfit = XrrPlayers():GetPeerOutfitAt(i)
+    if outfit ~= "" and ini_sys:section_exist(outfit) then
+        local icon = ini_sys:r_string_ex(outfit, "character_portrait")
+        if icon and icon ~= "" then return icon end
+    end
+    return FACTION_ICON[self:ResolveFaction(i)] or DEFAULT_ICON
+end
+
+function UIPeerList:PlaceCompanionList(in_session)
+    local chud = axr_companions and axr_companions.HUD
+    if not (chud and chud.dialog) then return end
+
+    if in_session and not self._comp_shifted then
+        local cpos = chud.dialog:GetWndPos()
+        self._comp_orig_x = cpos.x
+        local my  = self.dialog:GetWndPos()
+        local gap = COMP_GAP_PX * (1024 / device().width)
+        chud.dialog:SetWndPos(vector2():set(my.x - self.col_w - gap, cpos.y))
+        self._comp_shifted = true
+    elseif not in_session and self._comp_shifted then
+        local cpos = chud.dialog:GetWndPos()
+        chud.dialog:SetWndPos(vector2():set(self._comp_orig_x, cpos.y))
+        self._comp_shifted = false
+    end
+end
+
+function UIPeerList:Update(force)
+    CUIScriptWnd.Update(self)
+
+    local tg = time_global()
+    if force then self._tmr = tg - 1 end
+    if self._tmr >= tg then return end
+    self._tmr = tg + REFRESH_MS
+
+    local in_session = XrrIsHosted() or XrrIsConnected()
+    local show = main_hud_shown() and get_console_cmd(1, "xrr_show_players_hp") and in_session
+
+    self:PlaceCompanionList(in_session)
+
+    if not show then
+        for i = 1, MAX_SLOTS do self.slots[i].base:Show(false) end
+        return
+    end
+
+    local count = XrrPlayers():GetPeerCount()
+    local shown = 0
+
+    for i = 1, count do
+        if shown >= MAX_SLOTS then break end
+        local nick = XrrPlayers():GetPeerNicknameAt(i)
+        if nick ~= "" then
+            shown = shown + 1
+            local s  = self.slots[shown]
+            local hp = clamp(XrrPlayers():GetPeerHealthAt(i), 0, 1)
+
+            local icon = self:ResolvePortrait(i)
+            if s._icon ~= icon then
+                s.icon:InitTexture(icon)
+                s._icon = icon
+            end
+            local dead    = hp <= 0
+            local wounded = (not dead) and XrrPlayers():IsPeerWoundedAt(i)
+            local icon_clr = dead    and GetARGB(255, 110, 110, 110)
+                          or wounded and GetARGB(255, 255,  80,  80)
+                          or             GetARGB(255, 255, 255, 255)
+            local name_clr = dead    and GetARGB(255, 130, 130, 130)
+                          or wounded and GetARGB(255, 255,  90,  90)
+                          or             GetARGB(255, 230, 230, 230)
+            s.icon:SetTextureColor(icon_clr)
+            s.name:SetTextColor(name_clr)
+
+            s.name:SetText(nick)
+            s.hp:SetProgressPos(hp)
+            local mark = XrrPlayers():IsPeerHostAt(i) and "ui_minimap_squad_leader" or "ui_minimap_point"
+            if s._mark ~= mark then
+                s.role:InitTexture(mark)
+                s.role_shadow:InitTexture(mark)
+                s._mark = mark
+            end
+            s.role:SetTextureColor(self.clr_list[self:ResolveFaction(i)] or self.clr_list.def)
+
+            local id  = XrrPlayers():GetPeerLocalIdAt(i)
+            local obj = (id and id > 0 and id < 65535) and level.object_by_id(id) or nil
+            if obj and db.actor then
+                s.distance:SetText(string.format("%.0f m", obj:position():distance_to(db.actor:position())))
+            else
+                s.distance:SetText("")
+            end
+
+            s.base:Show(true)
+        end
+    end
+
+    for i = shown + 1, MAX_SLOTS do
+        self.slots[i].base:Show(false)
+    end
+end

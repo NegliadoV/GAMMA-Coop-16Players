@@ -1,0 +1,13 @@
+; xrRazom — Zone FM channel clock, for xrr_patch_radio_fm.script.
+; The clock the PDA tab and the world speakers share lives in file-locals the
+; module.fn patch idiom cannot reach; the engine's Lua unlocalizer promotes them
+; to ui_pda_radio_tab fields. Sections merge additively across unlocalizer
+; files, so this extends [ui_pda_radio_tab] rather than replacing it.
+
+[ui_pda_radio_tab]
+radio_ch
+radio_ch_out
+radio_now
+radio_session
+radio_session_out
+radio_session_now

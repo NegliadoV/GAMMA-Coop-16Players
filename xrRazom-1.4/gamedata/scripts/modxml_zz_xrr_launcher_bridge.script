@@ -1,0 +1,11 @@
+--[[
+  Mod: zz xrRazom Fix - Launcher Bridge (Cold-Start Main Menu Hook)
+  Script: gamedata/scripts/modxml_zz_xrr_launcher_bridge.script
+  dxml_core loads modxml_*.script at cold boot before the Main Menu initializes.
+]]
+
+function on_xml_read()
+    if zz_xrr_launcher_bridge and zz_xrr_launcher_bridge.init_from_dxml then
+        zz_xrr_launcher_bridge.init_from_dxml()
+    end
+end

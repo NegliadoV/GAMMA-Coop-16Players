@@ -1,0 +1,29 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Ishmaeel's Kill Tracker (Milspec PDA): vanilla IsStalker misses the avatar clsid,
+  so a peer's kills and body read as "The Zone".
+]]
+
+function on_game_start()
+    local ikt = ish_kill_tracker
+    if not ikt then return end -- mod absent
+
+    -- safename only: swapping IsStalker around new_kill sends an avatar killer into
+    -- its kse_obj:character_name() branch, which the avatar's CSE errors on.
+    local orig_safename = ikt.safename
+    if type(orig_safename) ~= "function" then
+        log("[xrRazom][killtracker] INSTALL FAILED: ish_kill_tracker.safename missing")
+        return
+    end
+    ikt.safename = function(obj)
+        if obj and XrrPlayers():IsPlayerDummy(obj:id()) then
+            local ok, result = XrrAvatarAwareCall(orig_safename, obj)
+            if ok then return result end
+            return nil
+        end
+        return orig_safename(obj)
+    end
+    log("[xrRazom][killtracker] avatar kill attribution installed")
+end

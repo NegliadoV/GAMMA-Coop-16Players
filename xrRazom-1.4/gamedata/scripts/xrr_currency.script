@@ -1,0 +1,5 @@
+-- xrRazom: the in-game currency suffix; route every money display through here.
+
+function suffix()
+	return game.translate_string("st_xrr_currency")
+end

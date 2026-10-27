@@ -1,0 +1,349 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Effector mirror: host → peers cosmetic relay of camera, pp, sound and particle
+  effectors. xr_effects entry points always relay; raw level.* calls relay only
+  whitelisted effectors during a scripted psy scene.
+]]
+
+-- WORLD_EFFECTOR kinds — must match handle_world_effector engine-side.
+local K_STOPCAM    = 0
+local K_CAM        = 1
+local K_PP         = 2
+local K_RMPP       = 3
+local K_COMPLEX    = 4
+local K_RMCOMPLEX  = 5
+local K_SND        = 6
+local K_PARTICLE   = 7
+local K_SETFACTOR  = 8   -- set_pp_effector_factor(id, factor)
+
+-- Relayed effectors get their own id range, clear of peer-local handles.
+local RELAY_ID_OFFSET = 30000
+
+-- Raised while a Tier-1 wrap runs its original, so the level.* hooks don't
+-- double-broadcast what Tier 1 already sent.
+local _in_wrap = false
+
+-- set_pp_effector_factor throttle (it's a per-frame call).
+local FACTOR_MIN_DELTA = 0.02
+local FACTOR_MIN_MS    = 150
+local _factor_last     = {}   -- [id] = { v = factor, t = time_global }
+
+-- Scripted psy scenes whose effects the host applies regardless of which player
+-- drives the dialog. Gate each new entry on its OWN info portions: the sections
+-- whitelisted below are reused by per-player psy zones.
+local SCENE_PORTIONS = {
+    -- Greh / Sabaoth "Mortal Sin" psi attack (psi.ppe + fatigue.anm).
+    { start = "kat_greh_sabaoth_psi",
+      stops = { "kat_greh_sabaoth_psi_end", "kat_greh_sabaoth_psi_conversion",
+                "kat_greh_sabaoth_psi_death", "kat_greh_sabaoth_mortal_sin" } },
+}
+
+local function scene_active()
+    for i = 1, #SCENE_PORTIONS do
+        local s = SCENE_PORTIONS[i]
+        if has_alife_info(s.start) then
+            local ended = false
+            if s.stops then
+                for j = 1, #s.stops do
+                    if has_alife_info(s.stops[j]) then ended = true break end
+                end
+            end
+            if not ended then return true end
+        end
+    end
+    return false
+end
+
+-- Deliberately no is_talking branch — a host merely in a dialog must not mirror
+-- local psy tint.
+local function relay_window()
+    return scene_active()
+end
+
+-- WHITELIST: only scene-disorientation effectors relay; everything else stays local.
+local PP_SYNC = {
+    ["psi.ppe"]       = true,   -- Sabaoth / Mortal Sin disorientation tint
+    ["blur.ppe"]      = true,
+    ["alcohol.ppe"]   = true,
+    ["deimos1.ppe"]   = true,
+    ["deimos2.ppe"]   = true,
+    ["snd_shock.ppe"] = true,
+}
+-- Disorientation camera effectors, matched by bare anm name.
+local CAM_SYNC = {
+    ["fatigue"] = true,         -- Sabaoth / Mortal Sin disorientation wobble
+}
+local function cam_whitelisted(anm)
+    local bare = tostring(anm):match("([^\\/]+)%.anm$") or tostring(anm)
+    return CAM_SYNC[bare] == true
+end
+
+-- ids actually relayed: factor / remove follow only these.
+local _relayed_pp  = {}
+local _relayed_cam = {}
+
+local function send_fx(kind, name, id, loop, param)
+    if XrrWorld() then
+        XrrWorld():SendWorldEffector(kind, name or "", id or 0,
+                                     loop and 1 or 0, param or 0)
+    end
+end
+
+local function bcast(kind, name, id, loop, param)
+    if XrrIsHosted() then send_fx(kind, name, id, loop, param) end
+end
+
+-- For a mod patch whose effect reaches neither tier below.
+function relay_sound(name)          bcast(K_SND, name) end
+function relay_cam(anm, id, loop)   bcast(K_CAM, anm, id, loop) end
+function relay_stop_cam(id)         bcast(K_STOPCAM, "", id) end
+
+local function run_orig(orig, a, b, c)
+    _in_wrap = true
+    local ok, err = pcall(orig, a, b, c)
+    _in_wrap = false
+    if not ok then printf("[xrRazom][effects] orig error: %s", tostring(err)) end
+end
+
+-- Tier 1: xr_effects entry-point wraps, always relayed
+local function apply_xr_effects_wraps()
+    if not xr_effects then
+        log("[xrRazom][effects] INSTALL FAILED: xr_effects module missing")
+        return
+    end
+
+    local _run_cam = xr_effects.run_cam_effector
+    xr_effects.run_cam_effector = function(actor, npc, p)
+        run_orig(_run_cam, actor, npc, p)
+        if p and p[1] then
+            local num = 1000 + math.random(100)
+            if p[2] and type(p[2]) == "number" and p[2] > 0 then num = p[2] end
+            bcast(K_CAM, p[1], num, p[3] == "true", 0)
+        end
+    end
+
+    local _run_cam_g = xr_effects.run_cam_effector_global
+    xr_effects.run_cam_effector_global = function(actor, npc, p)
+        run_orig(_run_cam_g, actor, npc, p)
+        if p and p[1] then
+            local num = 1000 + math.random(100)
+            if p[2] and type(p[2]) == "number" and p[2] > 0 then num = p[2] end
+            local fov = device().fov
+            if p[3] ~= nil and type(p[3]) == "number" then fov = p[3] end
+            bcast(K_CAM, p[1], num, false, fov)
+        end
+    end
+
+    local _stop_cam = xr_effects.stop_cam_effector
+    xr_effects.stop_cam_effector = function(actor, npc, p)
+        run_orig(_stop_cam, actor, npc, p)
+        if p and p[1] and type(p[1]) == "number" and p[1] > 0 then
+            bcast(K_STOPCAM, "", p[1], false, 0)
+        end
+    end
+
+    local _run_pp = xr_effects.run_postprocess
+    xr_effects.run_postprocess = function(actor, npc, p)
+        run_orig(_run_pp, actor, npc, p)
+        if p and p[1] and ini_sys:section_exist(p[1]) then
+            local num = 2000 + math.random(100)
+            if p[2] and type(p[2]) == "number" and p[2] > 0 then num = p[2] end
+            bcast(K_COMPLEX, p[1], num, false, 0)
+        end
+    end
+
+    local _stop_pp = xr_effects.stop_postprocess
+    xr_effects.stop_postprocess = function(actor, npc, p)
+        run_orig(_stop_pp, actor, npc, p)
+        if p and p[1] and type(p[1]) == "number" and p[1] > 0 then
+            bcast(K_RMCOMPLEX, "", p[1], false, 0)
+        end
+    end
+
+    -- Raw sound_object on the actor — the CSoundPlayer SOUND hook never sees it.
+    local _snd_actor = xr_effects.play_sound_on_actor
+    xr_effects.play_sound_on_actor = function(actor, obj, p)
+        run_orig(_snd_actor, actor, obj, p)
+        if p and p[1] then bcast(K_SND, p[1], 0, false, 0) end
+    end
+
+    -- Quest cinematic black-screen fades.
+    local _create_sts = xr_effects.create_special_task_squad
+    xr_effects.create_special_task_squad = function(actor, npc, p)
+        run_orig(_create_sts, actor, npc, p)
+        bcast(K_PP, "black.ppe", 1500, false, 0)
+    end
+
+    local _remove_sts = xr_effects.remove_special_task_squad
+    xr_effects.remove_special_task_squad = function(actor, npc, p)
+        run_orig(_remove_sts, actor, npc, p)
+        bcast(K_PP, "black.ppe", 1313, false, 0)
+    end
+
+    -- Lab / Sarcofag shakes + psy blackout sounds (affect sounds bypass SOUND hook).
+    local _aes = xr_effects.aes_earthshake
+    xr_effects.aes_earthshake = function(npc)
+        run_orig(_aes, npc)
+        bcast(K_CAM, "earthquake", 1974, false, 0)
+        bcast(K_SND, "ambient\\earthquake", 0, false, 0)
+    end
+
+    local _yan = xr_effects.yan_gluk
+    xr_effects.yan_gluk = function(actor, npc)
+        run_orig(_yan, actor, npc)
+        bcast(K_CAM, "earthquake", 1974, false, 0)
+        bcast(K_SND, "affects\\psy_blackout_l", 0, false, 0)
+        bcast(K_SND, "affects\\psy_blackout_r", 0, false, 0)
+    end
+
+    local _x18 = xr_effects.x18_gluk
+    xr_effects.x18_gluk = function(actor, npc)
+        run_orig(_x18, actor, npc)
+        bcast(K_PP,  "blink.ppe", 234, false, 0)
+        bcast(K_CAM, "earthquake", 1974, false, 0)
+        bcast(K_SND, "affects\\tinnitus3a", 0, false, 0)
+        bcast(K_SND, "affects\\psy_blackout_l", 0, false, 0)
+        bcast(K_SND, "affects\\psy_blackout_r", 0, false, 0)
+    end
+
+    local _warlab = xr_effects.warlab_stop_particle
+    xr_effects.warlab_stop_particle = function(actor, npc, p)
+        run_orig(_warlab, actor, npc, p)
+        bcast(K_PARTICLE, "anomaly2\\control_monolit_holo|link", 0, false, 0)
+    end
+end
+
+-- Tier 2: level.* primitive hooks, scene-gated
+-- Hooks forward args verbatim (...) so luabind arity matching is never disturbed.
+local function apply_level_hooks()
+    local _add_cam = level.add_cam_effector
+    level.add_cam_effector = function(...)
+        local length = _add_cam(...)
+        if XrrIsHosted() and not _in_wrap and relay_window() then
+            local anm, id, looped, cb, fov = ...
+            if cam_whitelisted(anm) and not _relayed_cam[id] then
+                _relayed_cam[id] = true
+                send_fx(K_CAM, anm, id, looped, fov or 0)
+            end
+        end
+        return length
+    end
+
+    local _rem_cam = level.remove_cam_effector
+    level.remove_cam_effector = function(...)
+        _rem_cam(...)
+        if XrrIsHosted() and not _in_wrap then
+            local id = ...
+            if _relayed_cam[id] then
+                _relayed_cam[id] = nil
+                send_fx(K_STOPCAM, "", id, false, 0)
+            end
+        end
+    end
+
+    local _add_pp = level.add_pp_effector
+    level.add_pp_effector = function(...)
+        _add_pp(...)
+        if XrrIsHosted() and not _in_wrap and relay_window() then
+            local name, id, looped = ...
+            if name and PP_SYNC[name] and not _relayed_pp[id] then
+                _relayed_pp[id] = true
+                send_fx(K_PP, name, id, looped, 0)
+            end
+        end
+    end
+
+    local _rem_pp = level.remove_pp_effector
+    level.remove_pp_effector = function(...)
+        _rem_pp(...)
+        if XrrIsHosted() and not _in_wrap then
+            local id = ...
+            if _relayed_pp[id] then
+                _relayed_pp[id] = nil
+                send_fx(K_RMPP, "", id, false, 0)
+            end
+        end
+    end
+
+    local _set_factor = level.set_pp_effector_factor
+    level.set_pp_effector_factor = function(...)
+        _set_factor(...)
+        if XrrIsHosted() and not _in_wrap and relay_window() then
+            local id, factor = ...
+            if _relayed_pp[id] then
+                local now  = time_global()
+                local prev = _factor_last[id]
+                if (not prev)
+                   or (math.abs(prev.v - factor) > FACTOR_MIN_DELTA)
+                   or (now - prev.t > FACTOR_MIN_MS) then
+                    _factor_last[id] = { v = factor, t = now }
+                    send_fx(K_SETFACTOR, "", id, false, factor)
+                end
+            end
+        end
+    end
+end
+
+function on_game_start()
+    apply_xr_effects_wraps()
+    apply_level_hooks()
+end
+
+function OnWorldEffector(kind, name, id, loop, param)
+    if not db.actor then return end
+    local rid = (id or 0) + RELAY_ID_OFFSET
+
+    if kind == K_STOPCAM then
+        level.remove_cam_effector(rid)
+
+    elseif kind == K_CAM then
+        if not name or name == "" then return end
+        local path
+        if name:find("%.anm$") or name:find("[\\/]") then
+            path = name                                   -- full path (level-hook origin)
+        else
+            path = "camera_effects\\" .. name .. ".anm"   -- bare name (xr_effects origin)
+        end
+        -- Pass fov verbatim: cam_fov ~= 0 makes the engine use absolute positioning;
+        -- the host sends 0 for relative wobbles. Empty callback — the host's pokes
+        -- scheme signals that exist only there.
+        level.add_cam_effector(path, rid, loop == 1, "", param or 0)
+
+    elseif kind == K_PP then
+        if name and name ~= "" then level.add_pp_effector(name, rid, loop == 1) end
+
+    elseif kind == K_RMPP then
+        level.remove_pp_effector(rid)
+
+    elseif kind == K_COMPLEX then
+        if name and name ~= "" then level.add_complex_effector(name, rid) end
+
+    elseif kind == K_RMCOMPLEX then
+        level.remove_complex_effector(rid)
+
+    elseif kind == K_SETFACTOR then
+        level.set_pp_effector_factor(rid, param or 0)
+
+    elseif kind == K_SND then
+        if name and name ~= "" then
+            local snd = sound_object(name)
+            if snd then snd:play(db.actor, 0, sound_object.s2d) end
+        end
+
+    elseif kind == K_PARTICLE then
+        if name and name ~= "" then
+            local particle, bone = name, "link"
+            local sep = name:find("|", 1, true)
+            if sep then
+                particle = name:sub(1, sep - 1)
+                bone     = name:sub(sep + 1)
+            end
+            db.actor:stop_particles(particle, bone)
+        end
+    end
+end
+
+-- No Lua caller: handle_world_effector looks the handler up here by name.
+_G.OnWorldEffector = OnWorldEffector

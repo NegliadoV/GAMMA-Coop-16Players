@@ -1,0 +1,33 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Module: G.A.M.M.A. Killing Friends Reduces Goodwill — the penalty is the killer's own.
+
+  Wraps relation_kill_check in the own-goodwill scope so a friendly/neutral
+  kill's goodwill loss stays with the player who made it instead of being shared.
+  The host never charges a peer's kill again: the mod only charges db.actor.
+]]
+
+function on_game_start()
+    local m = grok_killing_friends_reduces_goodwill
+    if not m then return end
+
+    local orig = m.relation_kill_check
+    if type(orig) ~= "function" then
+        log("[xrRazom][killing_friends] INSTALL FAILED: relation_kill_check missing")
+        return
+    end
+    local function wrapped(...)
+        if not (XrrIsClient() or XrrIsHosted()) then return orig(...) end
+        XrrWorld():BeginOwnGoodwill()
+        local ok, err = pcall(orig, ...)
+        XrrWorld():EndOwnGoodwill()
+        if not ok then error(err, 0) end
+    end
+    -- The registry keys on the function VALUE; the module-field write is inert.
+    m.relation_kill_check = wrapped
+    UnregisterScriptCallback("npc_on_death_callback", orig)
+    RegisterScriptCallback("npc_on_death_callback", wrapped)
+    log("[xrRazom][killing_friends] own-goodwill scope installed")
+end

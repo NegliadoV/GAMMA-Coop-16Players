@@ -1,0 +1,102 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  game_setup world loot: its roll applies only in actor_on_item_take, which a
+  peer's pickup never fires, so the host bakes it onto the entity instead.
+]]
+
+-- bind_item's table outranks the entity and is restored on every spawn, so a bake writes it.
+local function bake(id, section, num)
+    local gs  = game_setup
+    local obj = level.object_by_id(id)
+    if IsItem("ammo", section) then
+        return XrrAlife():SetAmmoCount(id, num)
+    elseif gs.limited_uses[section] then
+        bind_item.item_uses[id] = num
+        if obj then obj:set_remaining_uses(num) end
+        return true
+    elseif utils_item.is_degradable(nil, section) then
+        bind_item.item_condition[id] = num
+        if item_device and item_device.dev_condition then
+            item_device.dev_condition[id] = num
+        end
+        return XrrAlife():SetItemCondition(id, num)
+    end
+    return false
+end
+
+-- Peer pickup seam (host)
+
+-- Runs BEFORE the possession transfer, on the live free-standing item, so a
+-- still-pending roll rides the transfer to the taker.
+local function on_peer_item_take(avatar_id, item_id)
+    local gs   = game_setup
+    local name = gs.world_itm_on and gs.world_itm_on[item_id]
+    if not name then return end
+    local obj = level.object_by_id(item_id)
+    if not obj then return end            -- the transfer refuses; leave the spot alone
+    local section = obj:section()
+
+    gs.try_spawn_world_item()
+    gs.world_itm_on[item_id] = nil
+    gs.world_itm_off[name]   = true
+
+    local num = gs.world_itm_num[name]
+    if num then
+        bake(item_id, section, num)
+        gs.world_itm_num[name] = nil
+    end
+
+    local info = gs.world_itm_info[name]
+    if info then gs.remove_marker(item_id, info.typ) end
+    -- send_itm_msg and ammo_aggregation run in the taker's own actor_on_item_take.
+    printf("[xrRazom][world-loot] peer avatar %s took %s(%s): spot %s released%s",
+           tostring(avatar_id), section, tostring(item_id), tostring(name),
+           num and (", baked " .. tostring(num)) or "")
+end
+
+-- Host: eager bake
+
+-- Leaving world_itm_num sends the mod's own take down its normal branch.
+local function bake_pending()
+    local gs = game_setup
+    local id_of = {}
+    for id, name in pairs(gs.world_itm_on) do id_of[name] = id end
+    for name, num in pairs(gs.world_itm_num) do
+        local id = id_of[name]
+        local se = id and alife_object(id)
+        if se then
+            local section = se:section_name()
+            if bake(id, section, num) then
+                gs.world_itm_num[name] = nil
+                printf("[xrRazom][world-loot] baked %s(%s) at spot %s: %s",
+                       section, tostring(id), tostring(name), tostring(num))
+            end
+        end
+    end
+end
+
+local function apply_host()
+    local orig = game_setup.try_spawn_world_item
+    game_setup.try_spawn_world_item = function(...)
+        local r = orig(...)
+        bake_pending()
+        return r
+    end
+    RegisterScriptCallback("actor_on_first_update", bake_pending)
+end
+
+function on_game_start()
+    local gs = game_setup
+    if not (gs and gs.world_itm_on and gs.world_itm_off and gs.world_itm_num
+            and gs.world_itm_info and gs.limited_uses
+            and bind_item and bind_item.item_condition and bind_item.item_uses) then
+        log("[xrRazom][world-loot] game_setup / bind_item tables not unlocalized — patch skipped")
+        return
+    end
+    RegisterScriptCallback("xrr_on_peer_item_take", on_peer_item_take)
+    -- Solo play keeps the mod's deferred roll; a peer's world items are the host's.
+    if XrrIsClient() or not XrrWillHost() then return end
+    apply_host()
+end

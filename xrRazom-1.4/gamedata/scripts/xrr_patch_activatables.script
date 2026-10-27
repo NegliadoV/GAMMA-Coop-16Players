@@ -1,0 +1,187 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Activatables: replicates campfire, instrument, button and door use across players.
+]]
+
+local _applied = false
+
+function apply()
+    -- One-shot: a re-apply would double-register the actor_on_update poller.
+    if _applied then return end
+    _applied = true
+
+    -- Campfire: the host broadcasts engine-side; Lua sends only the peer→host toggle.
+    bind_campfire.campfire_go_off = function(cf, obj)
+        cf = cf or bind_campfire.get_nearby_campfire(2, true)
+        if cf and cf:is_on() then
+            actor_effects.play_item_fx("matches_script")
+            cf:turn_off()
+            if not XrrIsHost() then
+                XrrWorld():SendInteract(obj:id(), 0, false)
+            end
+        end
+    end
+
+    bind_campfire.campfire_go_on = function(obj, cf)
+        cf = cf or bind_campfire.get_nearby_campfire(2, true)
+        if not cf or cf:is_on() then return end
+        if bind_campfire.rain_pass() then
+            actor_effects.play_item_fx("matches_script")
+            xr_sound.set_sound_play(AC_ID, "inv_matches")
+            cf:turn_on()
+            if not XrrIsHost() then
+                XrrWorld():SendInteract(obj:id(), 0, true)
+            end
+        else
+            actor_effects.play_item_fx("matches_script")
+            actor_menu.set_msg(1, game.translate_string("st_fail"), 3)
+        end
+    end
+
+    bind_campfire.actor_on_item_use = function(obj, cfo, cf)
+        local sec = obj:section()
+        if sec == "matches" or sec == "box_matches" then
+            bind_campfire.campfire_go_on(cfo, cf)
+            utils_item.discharge(obj)
+        end
+    end
+
+    bind_campfire.use_campfire = function()
+        local pos = db.actor:position()
+        for _, binder in pairs(bind_campfire.campfires_all) do
+            if binder and binder.campfire and pos:distance_to_sqr(binder.object:position()) <= 2 then
+                if binder.campfire:is_on() then
+                    bind_campfire.campfire_go_off(binder.campfire, binder.object)
+                else
+                    local m = db.actor:object("matches") or db.actor:object("box_matches")
+                    if m then bind_campfire.actor_on_item_use(m, binder.object, binder.campfire)
+                    else actor_menu.set_msg(1, game.translate_string("st_ui_campfire_prereq"), 3) end
+                end
+            end
+        end
+    end
+
+    -- Instruments
+    itms_manager.use_guitar = function(obj)
+        local n   = math.random(28)
+        local snd = sound_object("music\\guitar_" .. n)
+        if not snd then return end
+        local period = snd:length()
+        snd:play_no_feedback(db.actor, 0, 0, db.actor:position(), 1.0, 1.0)
+        actor_effects.play_continuous_effect(period)
+        XrrPlayers():SendPeerAnimLoopItem("guitar_0", period / 1000, "music\\guitar_" .. n, obj:section())
+    end
+
+    itms_manager.use_harmonica = function(obj)
+        local n   = math.random(5)
+        local snd = sound_object("music\\harmonica_" .. n)
+        if not snd then return end
+        local period = snd:length()
+        snd:play_no_feedback(db.actor, 0, 0, db.actor:position(), 1.0, 1.0)
+        actor_effects.play_continuous_effect(period)
+        XrrPlayers():SendPeerAnimLoopItem("harmonica_0", period / 1000, "music\\harmonica_" .. n, obj:section())
+    end
+
+    -- Button
+    function ph_button.ph_button:__init(obj, storage)
+        self.object = obj
+        self.st     = storage
+        storage.button_action = self
+    end
+    function ph_button.ph_button:use_callback()
+        if not self.object then return end
+        XrrPlayers():SendPeerAnim("knopka_0", 1.7, "")
+        XrrWorld():SendInteract(self.object:id(), 2, true)
+        self:try_switch()
+    end
+
+    -- Door: sync the xr_logic active section, not a bool — zone-driven section
+    -- switches (on_actor_in_zone) would re-close the door on the next tick.
+    function ph_door.action_door:use_callback(door, actor)
+        if not self.object then return end
+        if self.st.locked and self.st.snd_open_start then
+            xr_sound.set_sound_play(self.object:id(), self.st.snd_open_start)
+        end
+        self:try_switch()
+        local to = db.storage[self.object:id()]
+        XrrWorld():SendLogicSection(self.object:id(), (to and to.active_section) or "")
+    end
+
+    ph_door.try_to_open_door = function(npc, opened_doors)
+        local npos = npc:position()
+        for id, position in pairs(db.level_doors) do
+            local t = db.storage[id]
+            if t and t.ph_door and npos:distance_to_sqr(position) <= 3 then
+                local action = t.ph_door.door_action
+                if action.st.not_for_npc == false and action.st.closed == true then
+                    action:use_callback()
+                    opened_doors[id] = true
+                end
+            end
+        end
+    end
+
+    ph_door.try_to_close_door = function(npc, doors)
+        local npos = npc:position()
+        for id in pairs(doors) do
+            local t = db.storage[id]
+            if t and t.ph_door then
+                if npos:distance_to_sqr(db.level_doors[id]) > 3 then
+                    local action = t.ph_door.door_action
+                    if not action.st.not_for_npc and not action.st.closed then
+                        action:use_callback()
+                    end
+                    doors[id] = nil
+                end
+            else
+                doors[id] = nil
+            end
+        end
+    end
+end
+
+-- Engine-called during join: a flat array of {id, type, state} triples.
+function xrr_collect_interactable_states()
+    local result = {}
+    local n = 0
+
+    if bind_campfire and bind_campfire.campfires_all then
+        for _, binder in pairs(bind_campfire.campfires_all) do
+            if binder and binder.campfire and binder.object then
+                n = n + 1; result[n] = binder.object:id()
+                n = n + 1; result[n] = 0
+                n = n + 1; result[n] = binder.campfire:is_on()
+            end
+        end
+    end
+
+    if db.level_doors then
+        for id in pairs(db.level_doors) do
+            local to = db.storage[id]
+            local section = to and to.active_section
+            if section and to.ph_door and to.ph_door.door_action then
+                n = n + 1; result[n] = id
+                n = n + 1; result[n] = 1
+                n = n + 1; result[n] = section
+            end
+        end
+    end
+
+    if xrr_patch_restrictor_logic and xrr_patch_restrictor_logic.is_replicated and db.zone_by_name then
+        for _, zone in pairs(db.zone_by_name) do
+            local id = zone:id()
+            if xrr_patch_restrictor_logic.is_replicated(id) then
+                local to = db.storage[id]
+                n = n + 1; result[n] = id
+                n = n + 1; result[n] = 1
+                n = n + 1; result[n] = (to and to.active_section) or "nil"
+            end
+        end
+    end
+
+    return result
+end
+
+_G.xrr_collect_interactable_states = xrr_collect_interactable_states

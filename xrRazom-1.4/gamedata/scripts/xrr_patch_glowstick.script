@@ -1,0 +1,246 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+
+  Glowsticks (zz_glowstick_mcm): a peer may not alife_create the
+  lamp, so the host creates it, burns it down and hands it back on pickup.
+  Known: a burnt-out lamp keeps glowing on peers until the host despawns it.
+]]
+
+local THROW_VERB   = "gs:throw"
+local PICKUP_VERB  = "gs:pickup"
+local LAMP_SECTION = "lights_glowstick"
+
+local _applied = false
+local _orig_spawn, _orig_binder_update
+
+-- load_state reassigns the table, so never cache it.
+local function mod_glowsticks()
+    return zz_glowstick_mcm and zz_glowstick_mcm.glowsticks
+end
+
+-- Peer
+
+-- World half only: the mod releases a thrown item itself; the host releases a dropped one.
+local function peer_spawn_glowstick(id, throw)
+    local itm = id and level.object_by_id(id)
+    if not itm then return true end
+    if not throw and itm:parent() then return true end
+
+    local actor = db.actor
+    local pos = actor:bone_position(throw and "eye_left" or "bip01_l_hand")
+    pos.y = pos.y + 0.1
+    local dir = device().cam_dir
+
+    xrr_use_intent.request{
+        verb = THROW_VERB, obj_id = id, state = throw and 1 or 0,
+        args = table.concat({
+            itm:section(),
+            tostring(pos.x), tostring(pos.y), tostring(pos.z),
+            tostring(dir.x), tostring(dir.y), tostring(dir.z),
+            tostring(actor:level_vertex_id()), tostring(actor:game_vertex_id()),
+            tostring(itm:condition()),
+        }, "|"),
+    }
+    return true
+end
+
+-- Fire-and-forget: the answer arrives as the lamp's release plus the gift.
+local function peer_on_key_press(key)
+    if not XrrIsClient() then return end
+    if not db.actor then return end
+    if dik_to_bind(key) ~= key_bindings.kUSE then return end
+    if not is_empty(_GUIs) then return end
+    if not game.hud_motion_allowed() then return end
+    if game.only_movekeys_allowed() then return end
+
+    -- The mod's reach and screen window, minus its table gate: that holds only the thrower's lamps.
+    level.iterate_nearest(db.actor:position(), 2, function(obj)
+        if not (obj and obj:section() == LAMP_SECTION) then return false end
+        local p = game.world2ui(obj:position())
+        if p.x < 350 or p.x > 750 or p.y < 250 or p.y > 500 then return false end
+        if not obj:get_hanging_lamp():is_on() then return false end
+        xrr_use_intent.request{ verb = PICKUP_VERB, obj_id = obj:id(), state = 1 }
+        return true
+    end)
+end
+
+-- Prompt only; the burn-down and the despawn release are the host's.
+local function peer_binder_update(self)
+    if not self.first_update then return end
+    self.first_update = nil
+    if self.object:get_hanging_lamp():is_on() then
+        self.object:set_tip_text("inventory_item_use")
+    end
+end
+
+-- Host
+
+local function decode_throw(args)
+    local f = str_explode(args or "", "|", true)
+    if #f < 10 then return nil end
+    local lvid, gvid, cond = tonumber(f[8]), tonumber(f[9]), tonumber(f[10])
+    if f[1] == "" or not (lvid and gvid and cond) then return nil end
+    return f[1],
+        vector():set(tonumber(f[2]) or 0, tonumber(f[3]) or 0, tonumber(f[4]) or 0),
+        vector():set(tonumber(f[5]) or 0, tonumber(f[6]) or 0, tonumber(f[7]) or 0),
+        lvid, gvid, cond
+end
+
+-- MCM is host-authoritative, so the requester's throw force is this machine's.
+local function throw_force()
+    return ((ui_mcm and ui_mcm.get("glowsticks/throw_force")) or 8) * 1000
+end
+
+-- spawn_glowstick's world half, fed the requester's pose instead of db.actor's; the
+-- entry in the mod's table lets the host's binder burn a peer's lamp down too.
+local function host_create_lamp(section, pos, dir, lvid, gvid, con_d, throw)
+    local obj = alife_create(LAMP_SECTION, pos, lvid, gvid)
+    if not obj then
+        printe("![xrRazom][gs] alife_create %s failed", LAMP_SECTION)
+        return
+    end
+    local data = utils_stpk.get_lamp_data(obj)
+    if not data then
+        printe("![xrRazom][gs] no lamp data on %s — released", tostring(obj.id))
+        alife_release_id(obj.id)
+        return
+    end
+
+    obj.angle = vector():set(dir.x + math.random(-5, 5),
+                             dir.y + math.random(-5, 5),
+                             dir.z + math.random(-5, 5))
+
+    local light_section = ini_sys:r_string_ex(section, "light_section", "glowstick_definition")
+    local hud_section   = ini_sys:r_string_ex(section, "hud", "device_glowstick_hud")
+
+    data.visual_name = ini_sys:r_string_ex(section, "visual",
+        "dynamics\\devices\\dev_glowstick\\dev_glowstick_glow")
+    data.light_flags = 47
+
+    if ini_sys:r_bool_ex(light_section, "volumetric", false) then
+        data.light_flags = data.light_flags + 64
+        data.volumetric_quality   = ini_sys:r_float_ex(light_section, "volumetric_quality", 0.5)
+        data.volumetric_intensity = ini_sys:r_float_ex(light_section, "volumetric_intensity", 0.5)
+        data.volumetric_distance  = ini_sys:r_float_ex(light_section, "volumetric_distance", 0.5)
+    end
+
+    local c = str_explode(ini_sys:r_string_ex(light_section, "color_r2", "0.0,0.4,0.3,0.8"), ",")
+    for i = 1, #c do c[i] = clamp(round(tonumber(c[i]) * 255), 0, 255) end
+    data.main_color = bit_and(c[4], 0xff) * 2 ^ 24 + bit_and(c[1], 0xff) * 2 ^ 16
+                    + bit_and(c[2], 0xff) * 2 ^ 8 + bit_and(c[3], 0xff)
+    data.main_brightness = con_d <= 0.01 and 0 or (c[1] / 255 + c[2] / 255 + c[3] / 255) / 3 + 1
+    data.main_color_animator = ini_sys:r_string_ex(light_section, "color_animator", "empty")
+    data.main_bone  = ini_sys:r_string_ex(hud_section, "fire_bone", "light_bone_2")
+    data.main_range = ini_sys:r_float_ex(light_section, "range_r2", 15)
+
+    mod_glowsticks()[obj.id] = { section, con_d }
+    utils_stpk.set_lamp_data(data, obj)
+
+    -- Per lamp, so quick throws keep their own force; bounded, since a lamp on
+    -- another level never comes online here.
+    local f = throw and throw_force() or 100
+    local deadline = time_global() + 2000
+    CreateTimeEvent("xrr_gs", "throw_" .. obj.id, 0, function(id, fx, fy, fz)
+        local gl = level.object_by_id(id)
+        local sh = gl and gl:get_physics_shell()
+        if not sh then return time_global() > deadline end
+        sh:apply_force(fx, fy, fz)
+        return true
+    end, obj.id, dir.x * f, dir.y * f, dir.z * f)
+
+    return obj.id
+end
+
+-- A drop's item is checked before the lamp is minted and released after, so no failure dupes or loses it.
+local function host_throw(item_id, state, args, sender_netid)
+    local section, pos, dir, lvid, gvid, con_d = decode_throw(args)
+    if not section then
+        printe("![xrRazom][gs] throw from %s: unparsable args '%s' — refused",
+            tostring(sender_netid), tostring(args))
+        return
+    end
+
+    local throw = (state ~= 0)
+    local se
+    if not throw then
+        se = alife_object(item_id)
+        if not (se and string.find(se:section_name(), "glowstick")) then
+            printe("![xrRazom][gs] drop %s from %s: item not on this machine — refused",
+                tostring(item_id), tostring(sender_netid))
+            return
+        end
+    end
+
+    local lamp_id = host_create_lamp(section, pos, dir, lvid, gvid, con_d, throw)
+    if not lamp_id then return end
+    if se then alife_release_id(item_id) end
+
+    printf("[xrRazom][gs] %s %s from %s -> lamp %s",
+        throw and "throw" or "drop", section, tostring(sender_netid), tostring(lamp_id))
+end
+
+-- Charge comes from the mod's own table; the item returns on the gift leg.
+local function host_pickup(lamp_id, state, args, sender_netid)
+    -- Without a gift target the release would lose the glowstick.
+    if not sender_netid or sender_netid == "0" then
+        printe("![xrRazom][gs] pickup %s: sender netid unresolved — refused", tostring(lamp_id))
+        return
+    end
+    local se = alife_object(lamp_id)
+    if not (se and se:section_name() == LAMP_SECTION) then
+        printf("[xrRazom][gs] pickup %s already gone — no-op", tostring(lamp_id))
+        return
+    end
+    local tbl   = mod_glowsticks()
+    local entry = tbl[lamp_id]
+    if not entry then
+        printe("![xrRazom][gs] pickup %s: untracked lamp — refused", tostring(lamp_id))
+        return
+    end
+    local section, con_d = entry[1] or "device_glowstick", entry[2] or 0.01
+    if con_d <= 0.01 then
+        printf("[xrRazom][gs] pickup %s: burnt out — refused", tostring(lamp_id))
+        return
+    end
+
+    tbl[lamp_id] = nil
+    alife_release_id(lamp_id)
+    XrrPlayers():SendGiftSection(sender_netid, section, con_d)
+    printf("[xrRazom][gs] pickup %s -> %s from %s",
+        tostring(lamp_id), section, tostring(sender_netid))
+end
+
+-- Wiring
+
+-- Not order-dependent: each wrap picks its role at call time.
+function on_game_start()
+    if _applied then return end
+    if not (zz_glowstick_mcm and zz_glowstick_mcm.spawn_glowstick) then return end
+    if not mod_glowsticks() then
+        printe("![xrRazom][gs] zz_glowstick_mcm.glowsticks is not module-visible "
+            .. "(unlocalizer missing) — glowstick sync disabled")
+        return
+    end
+    _applied = true
+
+    xrr_use_intent.register(THROW_VERB,  host_throw)
+    xrr_use_intent.register(PICKUP_VERB, host_pickup)
+
+    _orig_spawn = zz_glowstick_mcm.spawn_glowstick
+    function zz_glowstick_mcm.spawn_glowstick(id, throw)
+        if not XrrIsClient() then return _orig_spawn(id, throw) end
+        return peer_spawn_glowstick(id, throw)
+    end
+
+    local binder = zz_glowstick_mcm.glowstick_binder
+    if binder then
+        _orig_binder_update = binder.update
+        function binder:update(delta)
+            if not XrrIsClient() then return _orig_binder_update(self, delta) end
+            peer_binder_update(self)
+        end
+    end
+
+    RegisterScriptCallback("on_key_press", peer_on_key_press)
+    log("[xrRazom][gs] glowstick throw/drop/pickup routed to the host")
+end

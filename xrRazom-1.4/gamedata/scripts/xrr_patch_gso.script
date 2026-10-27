@@ -1,0 +1,45 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Stash Overhaul corpse stashes (grok_stashes_on_corpses): a peer's stash roll is
+  NOPed, so the peer hands the body to the host, which runs the mod's npc_on_use.
+]]
+
+local VERB = "gso:corpse_stash"
+
+local orig_npc_on_use
+
+local function gso() return grok_stashes_on_corpses end
+
+-- Host
+
+xrr_use_intent.register(VERB, function(obj_id, state, args, sender)
+    local npc = level.object_by_id(obj_id)
+    if not (orig_npc_on_use and npc and IsStalker(npc)) then return end
+    orig_npc_on_use(npc)
+end)
+
+-- Peer
+
+local function install()
+    local mod = gso()
+    if not mod then return end   -- no Stash Overhaul in this install
+    if type(mod.npc_on_use) ~= "function" then
+        log("[xrRazom][gso] INSTALL WARNING: npc_on_use missing — not patched")
+        return
+    end
+
+    -- No peer-side "already asked" set: corpse ids are recycled, and a stale
+    -- entry would silently cost a later body its roll. The host dedupes.
+    orig_npc_on_use = mod.npc_on_use
+    mod.npc_on_use = function(npc)
+        if not (npc and XrrIsConnected()) then return orig_npc_on_use(npc) end
+        if npc:alive() then return end
+        xrr_use_intent.request{ verb = VERB, obj_id = npc:id() }
+    end
+end
+
+-- File scope (pass 1): the mod registers npc_on_use by name in its on_game_start,
+-- so by then the name is already ours.
+install()

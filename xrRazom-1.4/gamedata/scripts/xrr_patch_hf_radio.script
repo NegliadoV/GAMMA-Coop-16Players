@@ -1,0 +1,468 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+
+  245- Hideout Furniture's placed radio picks its clips per machine: the host runs
+  the mod's clock and publishes the audible clip on the radio's se_object; peers play it.
+  Adapted from Nito's Hideout Radio Sync.
+]]
+
+-- se_object[radio_id] key carrying the published programme.
+local KEY = "xrr_hf_radio"
+
+local KIND_TRACK, KIND_SESSION, KIND_NONE = 0, 1, 2
+
+local P, W                          -- placeable_radio, its wrapper class
+local orig = {}                     -- the wrapper methods we shadow
+local catalog                       -- [ch] = { program, intermission, [kind] = file list }
+local live = setmetatable({}, { __mode = "k" })   -- wrapper → our per-radio state
+local _applied = false
+
+local function role()
+    if XrrHosting then return "host" end
+    if XrrSessionActive then return "peer" end
+end
+
+local function clamp(v)
+    return math.max(0, math.min(1, tonumber(v) or 0.5))
+end
+
+local function normalized(s)
+    return string.lower((string.gsub(s or "", "/", "\\")))
+end
+
+local function state(w)
+    local m = live[w]
+    if not m then
+        m = { volume = tonumber(P.radio_vol) or 0.5, seq = 0 }
+        live[w] = m
+    end
+    return m
+end
+
+-- Sound tables
+
+local CHANNELS     = { "radio_ch", "radio_ch_out", "radio_session", "radio_session_out" }
+local SOUND_LISTS  = { "snd_radio_mixdown", "snd_white_noise_heavy_horror" }
+local SOUNDS       = { "snd_radio_on", "snd_radio_off", "snd_white_noise_light",
+                       "snd_white_noise_heavy", "snd_white_noise_heavy_start",
+                       "snd_white_noise_heavy_end" }
+
+local function stop_music(w)
+    for _, name in ipairs(CHANNELS) do
+        for _, channel in pairs(w[name] or {}) do
+            for _, snd in pairs(channel) do snd:stop() end
+        end
+    end
+end
+
+local function stop_all(w)
+    stop_music(w)
+    for _, name in ipairs(SOUND_LISTS) do
+        for _, snd in pairs(w[name] or {}) do snd:stop() end
+    end
+    for _, name in ipairs(SOUNDS) do
+        if w[name] then w[name]:stop() end
+    end
+end
+
+-- The mod's own listing, repeated so an index maps back to a filename: sound_object
+-- has no name, and indexes differ between installs. "@no_sound" is the mod's placeholder.
+local function file_names(path)
+    local names, index = {}, {}
+    local files = getFS():file_list_open("$game_sounds$", path,
+                                         bit_or(FS.FS_ListFiles, FS.FS_RootOnly))
+    for i = 1, files and files:Size() or 0 do
+        local name = files:GetAt(i - 1):sub(1, -5)   -- drop ".ogg", as the mod does
+        names[i], index[normalized(name)] = name, i
+    end
+    if #names == 0 then names[1], index["@no_sound"] = "@no_sound", 1 end
+    return { names = names, index = index }
+end
+
+local function build_catalog()
+    local out = {}
+    for ch = 1, #P.path_radio_ch do
+        out[ch] = {
+            program = P.path_radio_ch[ch], intermission = P.path_radio_session[ch],
+            [KIND_TRACK]   = file_names(P.path_radio_ch[ch]),
+            [KIND_SESSION] = file_names(P.path_radio_session[ch]),
+        }
+    end
+    return out
+end
+
+-- The station is named by its two paths, not by its index: a modlist difference
+-- renumbers channels, and playing the wrong station is worse than playing none.
+local function channel_for(program, intermission)
+    if program == "" and intermission == "" then return 0 end
+    for ch, info in ipairs(catalog) do
+        if normalized(info.program) == normalized(program)
+            and normalized(info.intermission) == normalized(intermission) then return ch end
+    end
+end
+
+local function valid(w)
+    if not (w and w.object and w.radio_ch and w.radio_session and w.radio_now
+            and w.radio_session_now and w.radio_ch_out and w.radio_session_out) then return false end
+    local m = state(w)
+    if m.valid ~= nil then return m.valid end
+    m.valid = true
+    for ch, info in ipairs(catalog) do
+        if not (w.radio_ch[ch] and w.radio_session[ch])
+            or #w.radio_ch[ch] ~= #info[KIND_TRACK].names
+            or #w.radio_session[ch] ~= #info[KIND_SESSION].names then m.valid = false end
+    end
+    if not m.valid then
+        printf("![xrRazom][hf-radio] %s: sound tables are not the ones we listed — not synced",
+               tostring(w.object:id()))
+    end
+    return m.valid
+end
+
+-- The mod's own precedence: a station ident masks the track.
+local function active(w)
+    local ch = w.radio_selected
+    if not catalog[ch] then return end
+    local si, ti = w.radio_session_now[ch], w.radio_now[ch]
+    local snd = w.radio_session[ch][si]
+    if snd and snd:playing() then return KIND_SESSION, si, snd end
+    snd = w.radio_ch[ch][ti]
+    if snd and snd:playing() then return KIND_TRACK, ti, snd end
+end
+
+-- Wire shape
+
+-- The host keeps the mod's own ladder, which tops out at 1.1; the wire carries
+-- at most 1.0, the ceiling the mod says is already audible full volume.
+local function encode(m, on, ch, kind, idx)
+    local info = catalog[ch]
+    return table.concat({ "v1", m.seq, on and "1" or "0",
+                          info and info.program or "", info and info.intermission or "",
+                          kind or KIND_NONE,
+                          (info and kind and info[kind].names[idx]) or "",
+                          math.floor(clamp(m.volume) * 1000 + 0.5) }, "|")
+end
+
+local function decode(blob)
+    if type(blob) ~= "string" or #blob > 2048 then return end
+    local seq, on, program, intermission, kind, clip, volume = blob:match(
+        "^v1|(%d+)|([01])|([^|]*)|([^|]*)|([012])|([^|]*)|(%d+)$")
+    seq, kind, volume = tonumber(seq), tonumber(kind), tonumber(volume)
+    if not seq or not volume or volume > 1000 then return end
+    return { seq = seq, on = on == "1", program = program, intermission = intermission,
+             kind = kind, clip = clip, volume = volume / 1000 }
+end
+
+-- The mod's volume is file-global; hold it at this radio's own value for the
+-- duration of the native call, and restore even when that call raises.
+local function native(w, fn, arg, suppress_picker)
+    local m = state(w)
+    local volume, lock = P.radio_vol, P.safety_lock
+    P.radio_vol = m.volume
+    if suppress_picker then P.safety_lock = true end
+    local ok, result = pcall(fn, w, arg)
+    m.volume = tonumber(P.radio_vol) or m.volume
+    P.radio_vol, P.safety_lock = volume, lock
+    if not ok then error(result) end
+    return result
+end
+
+-- Host
+
+-- Only seq survives a rebuilt binder; the rest starts at the mod's defaults, as
+-- vanilla does. A republished identical blob would read as no change to the peer.
+local function prepare_host(w)
+    local m = state(w)
+    if m.host_ready then return m end
+    m.host_ready = true
+    local saved = decode(se_load_var(w.object:id(), nil, KEY))
+    if saved then m.seq = saved.seq end
+    return m
+end
+
+-- Encoding costs a concat and a table, so the per-frame gate is the scalar
+-- tuple; the blob is built only once it actually moves.
+local function publish(w, m, on, ch, kind, idx)
+    if on == m.p_on and ch == m.p_ch and kind == m.p_kind and idx == m.p_idx
+        and m.seq == m.p_seq and m.volume == m.p_volume then return end
+    m.p_on, m.p_ch, m.p_kind, m.p_idx = on, ch, kind, idx
+    m.p_seq, m.p_volume = m.seq, m.volume
+    local blob = encode(m, on, ch, kind, idx)
+    xrr_use_intent.host_bridge(w.object:id(), KEY, blob)
+    printf("[xrRazom][hf-radio] %s -> %s", tostring(w.object:id()), blob)
+end
+
+local function host_update(w, delta)
+    local m = prepare_host(w)
+    local was_playing = active(w)
+    native(w, orig.update, delta)
+
+    local kind, idx, snd = active(w)
+    local ch = w.radio_selected
+    if w.radio_state and kind then
+        if m.restart or not m.was_on or m.was_ch ~= ch then
+            -- Power-on and a channel switch join a clip started long ago; restart it
+            -- so the peer, which can only begin at the top, hears the same seconds.
+            w.radio_ch[ch][w.radio_now[ch]]:stop()
+            w.radio_session[ch][w.radio_session_now[ch]]:stop()
+            snd:play_at_pos(w.object, w.object:position(), 0, sound_object.s3d)
+            snd.volume = clamp(m.volume - (P.psi_vol or 0))
+            m.seq, m.restart = m.seq + 1, false
+        elseif was_playing == nil or kind ~= m.kind or idx ~= m.idx then
+            -- seq, not the clip name: a station with one file repeats it, and
+            -- the peer must hear that as a new play rather than a no-op.
+            m.seq = m.seq + 1
+        end
+    elseif not w.radio_state then
+        m.restart = false
+    end
+    m.was_on, m.was_ch, m.kind, m.idx = w.radio_state, ch, kind, idx
+
+    -- Off, the clock still cycles clips: publish nothing that would rebuild
+    -- the blob for a change nobody can hear.
+    publish(w, m, w.radio_state, ch, w.radio_state and kind or nil, w.radio_state and idx or nil)
+end
+
+local function control(w, action, value)
+    local m = prepare_host(w)
+    local on, ch = w.radio_state, w.radio_selected
+    local result = native(w, orig[action], value)
+    if w.radio_state and (not on or ch ~= w.radio_selected) then m.restart = true end
+    return result
+end
+
+-- Reached only from a registered verb, which dispatch already gates to the host.
+local function host_wrapper(id)
+    local w = bind_hf_base.get_wrapper(id)
+    if valid(w) then return w end
+    printf("![xrRazom][hf-radio] control refused: %s is offline or not synced", tostring(id))
+end
+
+-- Peer
+
+local function peer_apply(w, blob)
+    local m = state(w)
+    if blob == m.seen then return end
+    m.seen = blob
+
+    local d = decode(blob)
+    if not d then
+        printf("![xrRazom][hf-radio] %s: unreadable state, muted: %s",
+               tostring(w.object:id()), tostring(blob))
+        stop_all(w)
+        w.radio_state, m.token, m.sound, m.missing = false, nil, nil, true
+        return
+    end
+
+    local ch = channel_for(d.program, d.intermission)
+    local info = ch and catalog[ch]
+    local idx = info and info[d.kind] and info[d.kind].index[normalized(d.clip)]
+    -- A station or clip this install does not have: stay silent rather than
+    -- substitute something the host is not playing.
+    local missing = ch == nil or (d.on and d.kind ~= KIND_NONE and not idx)
+
+    w.radio_state, w.radio_selected = d.on, ch or 0
+    m.volume, m.missing = d.volume, missing
+
+    local token = table.concat({ d.seq, d.program, d.intermission, d.kind, d.clip }, "|")
+    if not d.on or d.kind == KIND_NONE or missing then
+        stop_all(w)
+        m.token, m.sound = nil, nil
+    elseif token ~= m.token then
+        stop_music(w)
+        if d.kind == KIND_SESSION then
+            w.radio_session_now[ch] = idx
+            m.sound = w.radio_session[ch][idx]
+        else
+            w.radio_now[ch] = idx
+            m.sound = w.radio_ch[ch][idx]
+        end
+        -- Always starts from the top: sound_object cannot seek, so a late
+        -- join misses whatever the host already played of this clip.
+        m.sound:play_at_pos(w.object, w.object:position(), 0, sound_object.s3d)
+        m.sound.volume = clamp(m.volume - (P.psi_vol or 0))
+        m.token = token
+    end
+
+    -- Replay the host's switch sounds on transitions, but not for the first state a
+    -- binder reads: that is a join or an online switch, not a press.
+    if m.heard then
+        if d.on ~= m.heard_on then
+            local snd = d.on and w.snd_radio_on or w.snd_radio_off
+            snd:play_at_pos(w.object, w.object:position(), 0, sound_object.s3d)
+        elseif d.on and ch ~= m.heard_ch then
+            local mix = w.snd_radio_mixdown
+            mix[math.random(#mix)]:play_at_pos(w.object, w.object:position(), 0, sound_object.s3d)
+        end
+    end
+    m.heard, m.heard_on, m.heard_ch = true, d.on, ch
+
+    if missing then
+        printf("![xrRazom][hf-radio] %s: station or clip absent here, muted: %s",
+               tostring(w.object:id()), blob)
+    else
+        printf("[xrRazom][hf-radio] %s <- %s", tostring(w.object:id()), blob)
+    end
+end
+
+local function peer_update(w, delta)
+    local m = state(w)
+    if not m.peer_ready then
+        -- The binder starts its own programme before the first host blob lands.
+        stop_all(w)
+        w.radio_state, m.peer_ready, m.seen = false, true, nil
+    end
+    peer_apply(w, se_load_var(w.object:id(), nil, KEY))
+
+    -- Keep the native physics, white-noise and emission work; safety_lock is
+    -- what shuts the picker block off, so the peer never chooses a programme.
+    local on = w.radio_state
+    if m.missing then w.radio_state = false end
+    native(w, orig.update, delta, true)
+    w.radio_state = on
+    if m.missing then stop_all(w) end
+    if m.sound then m.sound.volume = on and clamp(m.volume - (P.psi_vol or 0)) or 0 end
+end
+
+-- UI
+
+-- A peer's action_radio_ch returns false, so the mod never moves the needle: follow
+-- the wrapper's real channel. The refresh flag keeps SetText from re-entering selection.
+local function install_ui()
+    local U = P.UIFurnitureRadio
+    if not (U and type(U.Update) == "function") then return end
+
+    local orig_update, orig_select = U.Update, U.OnSelectChannel
+    if type(orig_select) == "function" then
+        U.OnSelectChannel = function(dlg)
+            if dlg._xrr_ui_refresh then return end
+            if role() then dlg._xrr_shown_ch = nil end
+            return orig_select(dlg)
+        end
+    end
+
+    U.Update = function(dlg)
+        if role() and dlg.obj_id then
+            local w = bind_hf_base.get_wrapper(dlg.obj_id)
+            local ch = w and w.radio_selected
+            -- Two scalars, not a built key: this runs every frame the dialog is up.
+            local shown = dlg._xrr_shown_id == dlg.obj_id and dlg._xrr_shown_ch == ch
+            if ch and P.radio_frequencies[ch] and dlg.list_channel and not shown then
+                dlg._xrr_ui_refresh = true
+                dlg:SwitchChannel(P.radio_frequencies[ch])
+                dlg.list_channel:SetText(game.translate_string(P.radio_ch_names[ch]))
+                dlg._xrr_ui_refresh = false
+                dlg._xrr_shown_id, dlg._xrr_shown_ch = dlg.obj_id, ch
+            end
+        end
+        return orig_update(dlg)
+    end
+end
+
+-- Apply
+
+-- Peer button → host verb. The flag is the raw wire u8, so handlers test it
+-- against 0/1 rather than truthiness.
+local ACTIONS = {
+    action_radio_start  = { "hf:radio_power",   1 },
+    action_radio_stop   = { "hf:radio_power",   0 },
+    action_radio_ch     = { "hf:radio_channel", 0 },
+    action_radio_v_up   = { "hf:radio_volume",  1 },
+    action_radio_v_down = { "hf:radio_volume",  0 },
+}
+
+local function usable()
+    if not (W and bind_hf_base and xrr_use_intent
+            and type(P.path_radio_ch) == "table" and type(P.path_radio_session) == "table"
+            and type(P.radio_vol) == "number" and type(P.safety_lock) == "boolean"
+            and P.radio_frequencies and P.radio_ch_names and #P.path_radio_ch > 0) then
+        printf("![xrRazom][hf-radio] radio locals unavailable — not synced "
+               .. "(unlocalizer_xrr_hf_radio.ltx missing, or the game was not restarted)")
+        return false
+    end
+    for _, name in ipairs({ "update", "net_destroy", "action_radio_start", "action_radio_stop",
+                            "action_radio_ch", "action_radio_v_up", "action_radio_v_down" }) do
+        if type(W[name]) ~= "function" then
+            printf("![xrRazom][hf-radio] radio method %s is missing — not synced", name)
+            return false
+        end
+        orig[name] = W[name]
+    end
+    -- The pipe is the blob's own separator, so a station path holding one would
+    -- decode as a different station.
+    for ch = 1, #P.path_radio_ch do
+        local program, intermission = P.path_radio_ch[ch], P.path_radio_session[ch]
+        if type(program) ~= "string" or type(intermission) ~= "string"
+            or program:find("|", 1, true) or intermission:find("|", 1, true) then
+            printf("![xrRazom][hf-radio] station %s is not addressable — not synced", tostring(ch))
+            return false
+        end
+    end
+    return true
+end
+
+function on_game_start()
+    if _applied then return end
+    P = placeable_radio
+    W = P and P.placeable_radio_wrapper
+    if not (P and usable()) then return end
+
+    catalog = build_catalog()
+    _applied = true
+
+    W.update = function(w, delta)
+        local r = role()
+        if not r then return orig.update(w, delta) end
+        if not valid(w) then
+            if r == "peer" then return stop_all(w) end
+            return orig.update(w, delta)
+        end
+        if r == "host" then return host_update(w, delta) end
+        return peer_update(w, delta)
+    end
+
+    W.net_destroy = function(w)
+        if live[w] then stop_all(w); live[w] = nil end
+        return orig.net_destroy(w)
+    end
+
+    for name, spec in pairs(ACTIONS) do
+        local verb, flag = spec[1], spec[2]
+        W[name] = function(w, value)
+            local r = role()
+            if not r then return orig[name](w, value) end
+            if not valid(w) then return false end
+            if r == "host" then return control(w, name, value) end
+            local args = ""
+            if name == "action_radio_ch" then
+                local info = catalog[value]
+                if not info then return false end
+                args = info.program .. "|" .. info.intermission
+            end
+            xrr_use_intent.request{ verb = verb, obj_id = w.object:id(), state = flag, args = args }
+            return false   -- the UI follows the host's state on the next update
+        end
+    end
+
+    xrr_use_intent.register("hf:radio_power", function(id, flag)
+        local w = host_wrapper(id)
+        if w then control(w, flag ~= 0 and "action_radio_start" or "action_radio_stop") end
+    end)
+    xrr_use_intent.register("hf:radio_volume", function(id, flag)
+        local w = host_wrapper(id)
+        if w then control(w, flag ~= 0 and "action_radio_v_up" or "action_radio_v_down") end
+    end)
+    xrr_use_intent.register("hf:radio_channel", function(id, _, args)
+        if type(args) ~= "string" then return end
+        local program, intermission = args:match("^([^|]+)|([^|]+)$")
+        local ch = program and channel_for(program, intermission)
+        local w = ch and host_wrapper(id)
+        if w then control(w, "action_radio_ch", ch) end
+    end)
+
+    install_ui()
+    xrr_register_cleanup(function()
+        for w in pairs(live) do stop_all(w) end
+        live = setmetatable({}, { __mode = "k" })
+    end)
+end

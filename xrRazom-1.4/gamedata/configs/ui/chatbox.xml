@@ -1,0 +1,9 @@
+<w>
+	<!-- xrRazom co-op chat: input line only. History/overlay is drawn by C++
+	     (xrr_render_chat) on the left; this edit box sits just below that block.
+	     y must track the C++ `bottom` anchor (0.60 * height): 0.60 * 768 ~= 461. -->
+	<input x="15" y="462" width="520" height="24" max_symb_count="200">
+		<text x="5" font="letterica16" vert_align="c" r="230" g="230" b="230"/>
+		<texture>ui_inGame2_edit_box_1</texture>
+	</input>
+</w>

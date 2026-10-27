@@ -1,0 +1,148 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Warfare patch: vanilla keys auto-capture on the single local actor; on the
+  host, the host actor and every peer avatar can start or sustain a capture.
+]]
+
+local _orig = nil
+
+-- Nearest player within max_dist (XZ): nil, "host" or the peer's netid.
+local function trigger_near(pos, max_dist)
+    local players = XrrPlayers()
+    if not players then return nil end
+    local who = players:NearestPlayerInRangeXZ(pos.x, pos.z, max_dist)
+    if who == nil or who == "" then return nil end
+    return who
+end
+
+-- Composed on the machine that shows it, so the name resolves in that
+-- player's own locale — the wire carries the raw smart name.
+local function show_capture_tip(smart_name)
+    local stw  = smart_terrain_warfare
+    local name = (stw and stw.translate_smart_name(smart_name)) or smart_name
+    actor_menu.set_msg(1, string.format(game.translate_string("st_wrfr_smrt_auto_capture"),
+                                        tostring(name)), 3)
+end
+
+xrr_script_event.register("xrr:warfare_capture_tip", function(args, sender)
+    if db.actor then show_capture_tip(args) end
+end)
+
+local function announce_capture(who, smart_obj)
+    if who == "host" then
+        show_capture_tip(smart_obj:name())
+    else
+        xrr_script_event.send("xrr:warfare_capture_tip", who, smart_obj:name())
+    end
+end
+
+-- Mirrors vanilla process_manual_capture 1:1; only the two actor-distance
+-- checks and the message routing differ.
+local function process_manual_capture_mp(smart)
+    local stw     = smart_terrain_warfare
+    local players = XrrPlayers()
+
+    if not (XrrIsHost and XrrIsHost() and players and players:GetPeerCount() > 0) then
+        return _orig(smart)
+    end
+
+    local opts     = warfare_options.options
+    local max_dist = opts.auto_capture_max_distance
+
+    if (stw.manual_point == nil) and opts.enable_auto_capture then
+        local lvl = game_graph():vertex(smart.m_game_vertex_id):level_id()
+        if (lvl == get_player_level_id() and warfare_levels.level_information[lvl]) then
+            for _, sm in pairs(warfare_levels.level_information[lvl].smarts) do
+                local sm_obj = sm and alife_object(sm)
+                if (sm_obj and sm_obj.props
+                    and (sm_obj.props.base > 0 or sm_obj.props.resource > 0)
+                    and sm_obj.owning_faction == "none") then
+                    local who = trigger_near(sm_obj.position, max_dist)
+                    if who then
+                        stw.manual_point = { sm_obj.id, game.get_game_time() }
+                        announce_capture(who, sm_obj)
+                        break
+                    end
+                end
+            end
+        end
+    end
+
+    local mp = stw.manual_point
+    if (mp and mp[1] and mp[2]) then
+        if (mp[1] == smart.id) then
+            if (smart.owning_faction ~= "none") then
+                stw.manual_point = nil
+                return stw.process_manual_capture(smart)
+            end
+
+            local diff = round_idp(game.get_game_time():diffSec(mp[2]) / 60)
+
+            if (diff >= opts.auto_capture_wait_time) then
+                stw.manual_point = nil
+                -- Capture always resolves to the host's (shared) faction, whoever triggered it.
+                local targeting = stw.squad_count(smart, warfare.actor_faction)
+                if (targeting < smart.max_population) then
+                    local section = faction_expansions.get_spawn_section(
+                        warfare.actor_faction,
+                        warfare_factions.faction_information[warfare.actor_faction].resource_count)
+                    local squad = utils_obj.create_squad(section, smart:name())
+                    sim_squad_warfare.set_target(squad, smart.id)
+                end
+            else
+                -- Cancel only when EVERY player has left the radius.
+                local obj = mp[1] and alife_object(mp[1])
+                if (obj) then
+                    if not trigger_near(obj.position, max_dist) then
+                        stw.manual_point = nil
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- Warfare registration is Lua-only state, so the host tags these squads on the
+-- wire for peers to render with warfare rules. Returns { n, id1, ..., idn },
+-- the count-first shape xrr_lua_collect_table reads.
+function xrr_collect_warfare_squads()
+    local out = { 0 }
+    if _G.WARFARE and warfare and warfare.registered_squads then
+        local n = 0
+        for _faction, tbl in pairs(warfare.registered_squads) do
+            for id, _tgt in pairs(tbl) do
+                n = n + 1
+                out[n + 1] = id
+            end
+        end
+        out[1] = n
+    end
+    return out
+end
+
+-- This install's own, unsynced map-display options; nil makes C++ default to
+-- whole-map, show-all.
+function xrr_get_warfare_display_opts()
+    local o = warfare_options and warfare_options.options
+    if not (o) then return nil end
+    return { o.fog_of_war and 1 or 0,
+             tonumber(o.fog_of_war_distance) or 0,
+             o.hide_unfriendly_squads and 1 or 0 }
+end
+
+_G.xrr_collect_warfare_squads   = xrr_collect_warfare_squads
+_G.xrr_get_warfare_display_opts = xrr_get_warfare_display_opts
+
+function on_game_start()
+    if not (smart_terrain_warfare and smart_terrain_warfare.process_manual_capture) then
+        log("[xrRazom] xrr_patch_warfare: smart_terrain_warfare missing — skipped")
+        return
+    end
+    -- A double-install would capture our own override as _orig and recurse.
+    if smart_terrain_warfare.process_manual_capture == process_manual_capture_mp then return end
+    _orig = smart_terrain_warfare.process_manual_capture
+    smart_terrain_warfare.process_manual_capture = process_manual_capture_mp
+    log("[xrRazom] xrr_patch_warfare: multi-actor auto-capture installed")
+end

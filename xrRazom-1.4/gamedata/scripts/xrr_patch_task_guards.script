@@ -1,0 +1,298 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Peer-side host guards over the vanilla task functor tables, plus party-aware
+  barrier_defense.
+]]
+
+-- "Return nil", as distinct from "no entry".
+local NIL = {}
+
+-- Per table: functor name -> peer return value (a literal, or the NIL sentinel).
+local HOST_ONLY = {
+    xr_conditions = {
+        validate_anomaly_scanner_field   = false,
+        validate_smart_control_task      = false,
+        mutants_in_map_ge                = false,
+        recover_mutant_data_precondition = false,
+        -- MDATA[tid].attackers is host-only, so `pairs(nil)` is fatal on the peer. false,
+        -- not true: an empty set reads as "all dead" and latches +*_finished mid-fight.
+        all_attackers_dead               = false,
+    },
+    xr_effects = {
+        setup_spy_task                = true,
+        pick_anomaly_scanner_field    = NIL,
+        on_init_delivery_task         = NIL,
+        on_init_fate_task             = NIL,
+        setup_smart_control_task      = NIL,
+        drx_sl_create_quest_stash     = NIL,
+        setup_top_10_task             = NIL,
+        multifetch_remove             = NIL,
+        recover_mutant_data_location  = NIL,
+        recover_mutant_data_unset     = NIL,
+        -- create_squad_at_named_location is nil on the peer: CTD indexing `sq.id`.
+        barrier_defense_first_spawn      = NIL,
+    },
+    task_status_functor = {
+        assault_task_status_functor             = NIL,
+        smart_control_task_status_functor       = NIL,
+        top_10_task_status_functor              = NIL,
+        veh_destroy_sf                          = NIL,
+        gd_task_status_functor                  = NIL,
+        recover_item_on_corpse_status_functor   = NIL,
+        recover_mutant_data_status              = NIL,
+    },
+}
+
+local function apply_host_only_guards()
+    for tbl_name, entries in pairs(HOST_ONLY) do
+        local tbl = _G[tbl_name]
+        if type(tbl) == "table" then
+            for fn_name, ret in pairs(entries) do
+                local orig = tbl[fn_name]
+                if type(orig) == "function" then
+                    local peer_ret = (ret == NIL) and nil or ret
+                    tbl[fn_name] = function(...)
+                        if not XrrIsHost() then return peer_ret end
+                        return orig(...)
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- Vanilla target functors read host-side caches that are empty on the peer.
+local _functors_wrapped = false
+
+local function wrap_task_functors()
+    if _functors_wrapped then return end
+    _functors_wrapped = true
+    local originals = {}
+    for k, v in pairs(task_functor) do
+        if type(v) == "function" then originals[k] = v end
+    end
+    for k, orig in pairs(originals) do
+        task_functor[k] = function(task_id, field, p, tsk, ...)
+            if not XrrIsHost() then
+                if field == "target" then
+                    -- Re-resolved every call, so a level transition swaps the
+                    -- shadow id for the mirror id on its own.
+                    local resolved = xrr_net_client and
+                                     xrr_net_client.xrr_resolve_synced_target and
+                                     xrr_net_client.xrr_resolve_synced_target(task_id)
+                    if resolved and resolved > 0 then
+                        return resolved
+                    end
+                    -- Last known target: the map spot must not flicker off in a resolution gap.
+                    if tsk then return tsk.current_target or tsk.task_giver_id end
+                    return nil
+                elseif field == "title" or field == "descr" then
+                    -- The giving machine's text wins: only it has the state the functor reads.
+                    local synced = xrr_net_client and
+                                   xrr_net_client.xrr_get_synced_task_text and
+                                   xrr_net_client.xrr_get_synced_task_text(task_id, field)
+                    if synced ~= nil then return synced end
+
+                    -- A throwing text functor must not abort the give.
+                    local ok, v = pcall(orig, task_id, field, p, tsk, ...)
+                    if not ok then
+                        printf("![xrRazom][quest] %s functor threw for %s: %s",
+                            field, tostring(task_id), tostring(v))
+                    elseif v then
+                        return v
+                    end
+
+                    -- Explicit per field: the `and`/`or` one-liner would return
+                    -- the descr as the title in exactly the case this exists for.
+                    if tsk then
+                        if field == "title" and tsk.current_title then return tsk.current_title end
+                        if field == "descr" and tsk.current_descr then return tsk.current_descr end
+                    end
+
+                    -- Never nil or false: luabind passes either as a NULL pcstr, and
+                    -- set_title(NULL) leaves a null shared_str that later dereferences.
+                    if field == "title" then return "st_xrr_task_untitled" end
+                    return "st_xrr_task_no_descr"
+                end
+            end
+            return orig(task_id, field, p, tsk, ...)
+        end
+    end
+end
+
+-- Runs AFTER apply_host_only_guards: the onion is peer-guard(host-hook(orig)).
+local function install_host_after_hooks()
+    -- current_target is what the peer's target fallback returns.
+    local _orig_bounty = xr_effects.setup_bounty_task
+    if type(_orig_bounty) == "function" then
+        xr_effects.setup_bounty_task = function(actor, npc, p)
+            if not XrrIsHost() then return true end
+            _orig_bounty(actor, npc, p)
+            if p and p[1] and axr_task_manager and axr_task_manager.bounties_by_id then
+                local tid = axr_task_manager.bounties_by_id[p[1]]
+                local tm = task_manager.get_task_manager()
+                local tsk = tm and tm.task_info and tm.task_info[p[1]]
+                if tsk and tid then tsk.current_target = tid end
+            end
+        end
+    end
+end
+
+-- Assault "Unknown enemy" spot: edge sends plus a 5 s keepalive (peers expire it at 15 s).
+-- smart_control's target functor is not hooked: its cache_info.smart_id read is broken in vanilla.
+local _enemy_spot_sent = {}   -- task_id -> { squad_id, t } (last show sent)
+
+local function enemy_spot_tick(task_id)
+    local actor = db.actor
+    local var = actor and load_var(actor, task_id)
+    local sent = _enemy_spot_sent[task_id]
+    -- The status functor blanks var.squad_id during its ~3 s re-scan while the spot
+    -- persists; the spot, not var, is the visibility source of truth.
+    local squad_id = (var and var.squad_id) or (sent and sent.squad_id)
+    local shown = squad_id and alife_object(squad_id) ~= nil
+        and level.map_has_object_spot(squad_id, "red_location") == 1
+    if shown then
+        if not sent or sent.squad_id ~= squad_id
+           or time_global() - sent.t > 5000 then
+            if not sent then
+                printf("[xrRazom][quest] enemy spot SHOW task=%s squad=%s",
+                    task_id, tostring(squad_id))
+            end
+            XrrAlife():SendTaskEnemySpot(task_id, true, squad_id)
+            _enemy_spot_sent[task_id] = { squad_id = squad_id, t = time_global() }
+        end
+    elseif sent then
+        printf("[xrRazom][quest] enemy spot HIDE task=%s", task_id)
+        XrrAlife():SendTaskEnemySpot(task_id, false, 0)
+        _enemy_spot_sent[task_id] = nil
+    end
+end
+
+local _enemy_relay_installed = false
+
+local function install_enemy_spot_relay()
+    if _enemy_relay_installed then return end
+    _enemy_relay_installed = true
+    local inner = task_functor.assault_task_target_functor
+    if type(inner) ~= "function" then return end
+    task_functor.assault_task_target_functor = function(task_id, field, p, tsk, ...)
+        local r = inner(task_id, field, p, tsk, ...)
+        if field == "target" and XrrIsHosted() then
+            local ok, err = pcall(enemy_spot_tick, task_id)
+            if not ok then
+                printf("[xrRazom][quest] enemy_spot_tick error task=%s err=%s",
+                    tostring(task_id), tostring(err))
+            end
+        end
+        return r
+    end
+end
+
+-- Vanilla distance_to_barrier measures object id 0, the evaluating machine's own actor.
+local BARRIER_SMART = "mil_smart_terrain_3_8"
+
+-- XZ only, matching vanilla dist2d_sqr — the 80/90 m thresholds were tuned flat.
+-- Client positions: the server entity position goes stale for online objects.
+local function min_party_dist2d_sqr(pos)
+    local best
+    if db.actor and db.actor:alive() then
+        local a = db.actor:position()
+        best = (pos.x - a.x) ^ 2 + (pos.z - a.z) ^ 2
+    end
+    local players = XrrPlayers()
+    if players then
+        for i = 1, players:GetPeerCount() do
+            local cid = players:GetPeerLocalIdAt(i)
+            if cid and cid > 0 and cid ~= 65535 then
+                local obj = level.object_by_id(cid)
+                if obj and obj:alive() then
+                    local p = obj:position()
+                    local d = (pos.x - p.x) ^ 2 + (pos.z - p.z) ^ 2
+                    if not best or d < best then best = d end
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function install_barrier_party_distance()
+    if type(xr_conditions.distance_to_barrier) ~= "function" then return end
+    xr_conditions.distance_to_barrier = function(actor, npc, p)
+        if not XrrIsHost() then return false end
+        if not (p and p[1] and p[2] and tonumber(p[2])) then
+            printf("![xrRazom] distance_to_barrier: bad args, expected (le|ge:number)")
+            return false
+        end
+        -- SIMBOARD is nil between levels.
+        local sm = SIMBOARD and SIMBOARD.smarts_by_names[BARRIER_SMART]
+        if not sm then return false end
+        local dist = min_party_dist2d_sqr(sm.position)
+        if not dist then return false end   -- nobody alive to measure
+        local d = tonumber(p[2]) ^ 2
+        if p[1] == "le" then return dist <= d end
+        if p[1] == "ge" then return dist >= d end
+        printf("![xrRazom] distance_to_barrier: unknown comparison '%s'", tostring(p[1]))
+        return false
+    end
+end
+
+-- Hand-copied from barrier_defense_*_complete, which pays db.actor directly. Its
+-- weapon-matched ammo is not shared: vanilla derives it from the receiver's weapons.
+local BARRIER_REWARD = {
+    zombie   = { money = 25000, items = { "vodka", "drug_psy_blockade", "drug_psy_blockade" } },
+    monolith = { money = 40000, items = { "joint" } },
+}
+
+local function install_barrier_completion_share()
+    if type(tasks_defense) ~= "table" then return end
+    _G.xrr_story_quest_handlers = _G.xrr_story_quest_handlers or {}
+
+    for variant, reward in pairs(BARRIER_REWARD) do
+        local fname     = "barrier_defense_" .. variant .. "_complete"
+        local task_id   = "barrier_defense_" .. variant
+        -- This route needs barrier_defense_*_finished to reach the peer, so
+        -- those portions must stay out of the info-portion send filter.
+        local pseudo_id = "__barrier_" .. variant .. "_done"
+        local orig      = tasks_defense[fname]
+
+        if type(orig) == "function" then
+            tasks_defense[fname] = function(a, b)
+                if XrrIsClient() then
+                    -- Nothing locally: the reward comes back through OnQuestReward.
+                    local host_id = xrr_pending_npc_lock_host_id()
+                    if host_id and host_id > 0 then
+                        XrrAlife():SendQuestAccept(pseudo_id, host_id)
+                    else
+                        printf("![xrRazom][quest] %s: no host npc id, completion dropped", fname)
+                    end
+                    return
+                end
+                orig(a, b)
+                if XrrIsHosted() then
+                    xrr_quest_reward.add_pending(task_id, reward.money, reward.items)
+                end
+            end
+
+            -- Host end of the peer delegation; re-enters the wrapper above.
+            _G.xrr_story_quest_handlers[pseudo_id] = function(npc_host_id)
+                printf("[xrRazom][quest] peer completed %s -> running host completion", task_id)
+                tasks_defense[fname](nil, nil)
+            end
+        end
+    end
+end
+
+function apply()
+    log("[xrRazom] Patching task functors with peer-side host-guards")
+    _enemy_spot_sent = {}   -- stale entries from a previous session would send a spurious hide
+    apply_host_only_guards()
+    wrap_task_functors()
+    install_host_after_hooks()
+    -- Replaces distance_to_barrier outright — deliberately not in HOST_ONLY.
+    install_barrier_party_distance()
+    install_barrier_completion_share()
+    install_enemy_spot_relay()
+end

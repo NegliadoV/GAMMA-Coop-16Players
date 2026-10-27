@@ -1,0 +1,9 @@
+# Ignore temporary build artifacts, backups, and oversized optional archives
+Launcher/bin/
+Launcher/obj/
+chrome-profile/
+*.orig.bak
+*.bak
+App/launcher_config.json
+xrRazom-1.4/options/FDDA/db/
+xrRazom-1.4/options/UA localization/db/

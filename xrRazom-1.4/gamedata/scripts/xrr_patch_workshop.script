@@ -1,0 +1,54 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Workshop, cooking, repair and melter dialogs: a peer runs the same chain inside
+  the peer-chain window, so its item creates, releases and writes act as on the host.
+]]
+
+local _applied
+
+-- pcall, because an error must not leave the window open for the session.
+local function run_peer_chain(fn, self)
+    XrrNet():SetPeerChainWindow(true)
+    local ok, err = pcall(fn, self)
+    XrrNet():SetPeerChainWindow(false)
+    if not ok then printe("[xrr_patch_workshop] peer chain failed: %s", tostring(err)) end
+end
+
+-- The engine keeps one callback per control and event, so binding after
+-- InitCallBacks wins; self[method] resolves at click time, so later wraps run.
+local function gate_button(cls, control, method)
+    local orig_init = cls.InitCallBacks
+    cls.InitCallBacks = function(self, ...)
+        orig_init(self, ...)
+        self:AddCallback(control, ui_events.BUTTON_CLICKED, function(self)
+            if XrrIsHost() then return self[method](self) end
+            run_peer_chain(self[method], self)
+        end, self)
+    end
+end
+
+-- Engine-called on the host serving a peer's LOOK. id must be a live inventory
+-- item: evaluate_parts reads obj:condition() unguarded.
+function xrr_evaluate_parts_for_capture(id)
+    local obj = level.object_by_id(id)
+    if obj then item_parts.evaluate_parts(obj) end
+end
+_G.xrr_evaluate_parts_for_capture = xrr_evaluate_parts_for_capture
+
+function on_game_start()
+    -- Re-entry would wrap our own wrapper, a link per load.
+    if _applied then return end
+    _applied = true
+
+    gate_button(ui_workshop.UIWorkshopCraft,   "button_craft",   "Craft")
+    gate_button(ui_workshop.UIWorkshopRepair,  "button_repair",  "Repair")
+    gate_button(ui_workshop.UIWorkshopUpgrade, "button_upgrade", "Upgrade")
+    gate_button(item_cooking.UICook,           "btn_cook",       "OnCook")
+    gate_button(item_repair.UIRepair,          "btn_repair",     "OnRepair")
+
+    if grok_artefacts_melter and grok_artefacts_melter.UIRepair then
+        gate_button(grok_artefacts_melter.UIRepair, "btn_repair", "OnRepair")
+    end
+end

@@ -1,0 +1,135 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+
+  Items Model Drop After Usage (model_dropper_mcm): a peer's
+  alife_create drops nothing, so the host creates a peer's debris and releases
+  it once no player is within 65 m.
+]]
+
+local VERB       = "dropper:spawn"
+local CLEAN_DIST = 65 * 65
+local CLEAN_MS   = 5000
+
+local _applied = false
+local _orig_spawn
+local _dropped    = {}   -- host: [id] = where a peer's drop was made
+local _next_clean = 0
+
+-- Peer
+
+-- spawn_object's own section expansion, copied: the host cannot run the
+-- original, which reads its own actor.
+local function dropper_sections(item_sec, alted, out)
+    if haruka_fill and item_sec == "flask" then return out end
+    if not alted then
+        for i = 1, 5 do dropper_sections(item_sec .. "_" .. i, true, out) end
+    end
+    if SYS_GetParam(0, "dropper_" .. item_sec, "visual") then
+        out[#out + 1] = "dropper_" .. item_sec
+    end
+    return out
+end
+
+-- Fire-and-forget: the drop replicates back like any host world spawn.
+local function peer_spawn(item_sec, alted)
+    local sections = dropper_sections(item_sec, alted, {})
+    if #sections == 0 then return true end
+    local pos = model_dropper_mcm.getActorPos()
+    xrr_use_intent.request{
+        verb = VERB, obj_id = 0, state = 0,
+        args = table.concat({ pos.x, pos.y, pos.z, db.actor:level_vertex_id(),
+                              db.actor:game_vertex_id(), table.concat(sections, "|") }, "|"),
+    }
+    return true
+end
+
+-- Host
+
+local function host_spawn_one(section, pos, lvid, gvid)
+    local se_obj = alife_create(section, pos, lvid, gvid)
+    if not se_obj then return end
+    local randomf = model_dropper_mcm.randomf
+    se_obj.angle = vector():set(randomf(-1, 1), randomf(-1, 1), randomf(-1, 1)):mul(math.pi)
+    local data = utils_stpk.get_physic_data(se_obj)
+    data.custom_data = "[collide]\nignore_small_objects\n"
+    utils_stpk.set_physic_data(data, se_obj)
+    _dropped[se_obj.id] = pos
+
+    local deadline = time_global() + 1000
+    CreateTimeEvent("xrr_dropper", "force_" .. se_obj.id, 0, function(id)
+        local obj = level.object_by_id(id)
+        if obj then
+            obj:force_set_position(pos, true)
+            model_dropper_mcm.apply_force(obj)
+            return true
+        end
+        return time_global() > deadline
+    end, se_obj.id)
+end
+
+-- Only dropper sections with a model: the verb cannot mint anything else.
+local function host_spawn(_, _, args, sender_netid)
+    local f = str_explode(args or "", "|", true)
+    local x, y, z = tonumber(f[1]), tonumber(f[2]), tonumber(f[3])
+    local lvid, gvid = tonumber(f[4]), tonumber(f[5])
+    if not (x and y and z and lvid and gvid) then
+        printe("![xrRazom][dropper] from %s: unparsable args '%s' — refused",
+            tostring(sender_netid), tostring(args))
+        return
+    end
+    local pos = vector():set(x, y, z)
+    for i = 6, #f do
+        local section = f[i]
+        if section:find("^dropper_") and SYS_GetParam(0, section, "visual") then
+            host_spawn_one(section, pos, lvid, gvid)
+        end
+    end
+end
+
+local function host_clean()
+    if not (XrrHosting and next(_dropped)) then return end
+    local now = time_global()
+    if now < _next_clean then return end
+    _next_clean = now + CLEAN_MS
+
+    local players = { db.actor:position() }
+    local roster = XrrPlayers()
+    for i = 1, roster:GetPeerCount() do
+        local avatar = level.object_by_id(roster:GetPeerLocalIdAt(i))
+        if avatar then players[#players + 1] = avatar:position() end
+    end
+
+    for id, origin in pairs(_dropped) do
+        local near = false
+        for _, p in ipairs(players) do
+            if p:distance_to_sqr(origin) <= CLEAN_DIST then near = true; break end
+        end
+        if not near then
+            -- Ids recycle: only a dropper is ours to release.
+            local se_obj = alife_object(id)
+            if se_obj and se_obj:section_name():find("^dropper_") then alife_release(se_obj) end
+            _dropped[id] = nil
+        end
+    end
+end
+
+-- Wiring
+
+-- The mod calls spawn_object through its module env, recursion included, so the wrap sees every call.
+function on_game_start()
+    if _applied then return end
+    local M = model_dropper_mcm
+    if not (M and M.spawn_object and M.getActorPos and M.randomf and M.apply_force) then return end
+    _applied = true
+
+    xrr_use_intent.register(VERB, host_spawn)
+
+    _orig_spawn = M.spawn_object
+    function M.spawn_object(item_sec, alted)
+        if XrrSessionActive and not XrrHosting then return peer_spawn(item_sec, alted) end
+        return _orig_spawn(item_sec, alted)
+    end
+
+    RegisterScriptCallback("actor_on_update", host_clean)
+    xrr_register_cleanup(function() _dropped = {} end)
+end

@@ -1,0 +1,142 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+
+  Peer→host use-intent seam (WORLD_USE_INTENT): the host dispatches namespaced
+  verbs ("hf:workshop_stash") to registered handlers. It never replies on a
+  channel of its own, so a peer's request() polls its resolve() until it lands.
+]]
+
+local registry = {}
+local inflight = {}
+
+-- handler(obj_id, state, args, sender_netid_str). state arrives as the raw wire
+-- u8 — compare `state ~= 0`, never truthiness: 0 is truthy in Lua.
+function register(verb, handler)
+    if registry[verb] then
+        printf("[xrRazom][use] verb '%s' re-registered (overwrite)", verb)
+    end
+    registry[verb] = handler
+end
+
+-- Whether the fixture must be online is each handler's concern.
+function dispatch(verb, obj_id, state, args, sender_netid)
+    if not XrrIsHost() then return end
+    local handler = registry[verb]
+    if not handler then
+        printe("![xrRazom][use] unknown verb '%s' (obj=%s) — dropped",
+            tostring(verb), tostring(obj_id))
+        return
+    end
+    handler(obj_id, state, args, sender_netid)
+end
+
+-- nil when the requester has no live avatar to run a mod body under.
+function requester_avatar(sender_netid)
+    local avatar_id = XrrPlayers():PeerAvatarId(sender_netid)
+    return avatar_id ~= -1 and level.object_by_id(avatar_id) or nil
+end
+
+-- Write half of a se_object bridge key; an unchanged value is not re-sent.
+function host_bridge(owner_id, key, value)
+    if not XrrIsHosted() then return end
+    if value == se_load_var(owner_id, nil, key) then return end
+    se_save_var(owner_id, nil, key, value)
+end
+
+-- Resolve-or-request + poll. opts.resolve(obj_id) must be a PURE READ of
+-- replicated state; nil resolve = fire-and-forget. Keyed (verb, obj_id) and
+-- no-op while a poll is live — a duplicate send would deploy a second fixture.
+function request(opts)
+    local resolve, on_ready = opts.resolve, opts.on_ready
+    local act_id = opts.verb .. ":" .. opts.obj_id
+    if resolve then
+        local v = resolve(opts.obj_id)
+        if v ~= nil then
+            if on_ready then on_ready(v) end
+            return
+        end
+        if inflight[act_id] then return end
+    end
+
+    local state = opts.state
+    if type(state) ~= "number" then state = state and 1 or 0 end
+    XrrWorld():SendUseIntent(opts.verb, opts.obj_id, state, opts.args or "")
+    if not resolve then return end
+
+    local timeout_ms = opts.timeout_ms or 12000
+    local poll_s     = opts.poll_s or 0.5
+    local t0         = time_global()
+    inflight[act_id] = true
+    CreateTimeEvent("xrr_use_intent", act_id, poll_s, function()
+        local v = resolve(opts.obj_id)
+        if v ~= nil then
+            inflight[act_id] = nil
+            if on_ready then on_ready(v) end
+            return true
+        end
+        if time_global() - t0 > timeout_ms then
+            inflight[act_id] = nil
+            printe("![xrRazom][use] '%s' on obj %s never resolved — giving up",
+                tostring(opts.verb), tostring(opts.obj_id))
+            return true
+        end
+        ResetTimeEvent("xrr_use_intent", act_id, poll_s)
+        return false
+    end)
+end
+
+function is_inflight(verb, obj_id)
+    return inflight[verb .. ":" .. obj_id] == true
+end
+
+-- Open a resolved linked box once this machine's own copy onlines — a peer's
+-- copy arrives on its own clock.
+function open_box_when_online(stash_id, timeout_ms)
+    if not stash_id then return end
+    local t0       = time_global()
+    local deadline = timeout_ms or 10000
+    CreateTimeEvent("xrr_use_intent", "open_box_" .. stash_id, 0.1, function()
+        local box = level.object_by_id(stash_id)
+        if box then
+            hide_hud_inventory()
+            box:use(db.actor)
+            return true
+        end
+        if time_global() - t0 > deadline then
+            printe("![xrRazom][use] box %s never onlined — not opening",
+                tostring(stash_id))
+            return true
+        end
+        return false
+    end)
+end
+
+-- A resolve() for request(). mirror_fn copies the hit into the mod's own table;
+-- omit it where that table feeds a teardown sweep.
+local function box_resolver(lookup, mirror_fn)
+    return function(owner_id)
+        local stash_id = lookup(owner_id)
+        local se = stash_id and alife_object(stash_id)
+        if not se then return nil end
+        if not IsInvbox(nil, se:clsid()) then return nil end
+        if mirror_fn then mirror_fn(owner_id, stash_id) end
+        return stash_id
+    end
+end
+
+-- Carrier: an se_object bridge key the host writes through host_bridge.
+function linked_box_resolver(key, mirror_fn)
+    return box_resolver(function(owner_id)
+        return se_load_var(owner_id, nil, key)
+    end, mirror_fn)
+end
+
+-- Carrier: a WORLD_MDATA manifest key — the mirror is its only writer on a peer.
+function mdata_box_resolver(table_key)
+    return box_resolver(function(owner_id)
+        local map = alife_storage_manager.get_state()[table_key]
+        return map and map[owner_id]
+    end)
+end
+
+_G.OnWorldUseIntent = dispatch

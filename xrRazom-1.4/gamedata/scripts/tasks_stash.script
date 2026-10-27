@@ -1,0 +1,121 @@
+--[[
+	Modified by Tronex
+	2019/4/22
+	Stash tasks use a single functors, with the ability for showing location info before accepting the task
+--]]
+
+--==========================================< Effects >==========================================--
+local function drx_sl_quest_stash_bonus()
+	local reward_items = {
+		"ammo_11.43x23_fmj", -- [29]    600
+		"ammo_5.45x39_fmj", -- [31]    650
+		"ammo_5.56x45_ss190", -- [34]    700
+		"ammo_9x39_ap",  -- [35]    700
+		"ammo_11.43x23_hydro", -- [39]   1000
+		"ammo_5.45x39_ap", -- [42]   1100
+		"ammo_5.56x45_ap", -- [43]   1150
+		"ammo_gauss",    -- [48]   2000
+		"ammo_pkm_100",  -- [50]   2000
+	}
+
+	return reward_items[math.random(1, #reward_items)]
+end
+
+-- Spawns a quest item in a random available stash location (host only).
+xr_effects.drx_sl_create_quest_stash = function(actor, npc, p)
+	if not (p and p[1] and p[2] and XrrIsHost()) then
+		return
+	end
+
+	local task_id = p[1]
+	local type_id = tonumber(p[2])
+	local var = load_var(db.actor, task_id)
+	local target_id = var and var.target_id
+	if not target_id then
+		target_id = treasure_manager.get_random_stash(nil, nil, true, true)
+	end
+
+	if not target_id then
+		printf("! %s - Unable to get quest stash %s id !!", task_id, type_id)
+		return
+	end
+
+	local se_target = alife_object(target_id)
+	if not se_target then
+		printf("! %s - Unable to get quest stash %s object !!", task_id, type_id)
+		return
+	end
+
+	local level_target = alife():level_name(game_graph():vertex(se_target.m_game_vertex_id):level_id())
+	local tbl = {
+		lvl_task = level.name(),
+		lvl_target = level_target,
+		target_id = target_id,
+		stash_type = type_id
+	}
+
+	save_var(db.actor, task_id, tbl)
+	printdbg("- %s | drx_sl_create_quest_stash | target_id: %s - lvl_target: %s - type: %s", task_id, target_id, level_target, type_id)
+
+	local function postpone_for_next_frame()
+		local news_caption = game.translate_string(task_manager.task_ini:r_string_ex(task_id, "title")) or "error"
+		local news_icon = task_manager.task_ini:r_string_ex(task_id, "icon") or "ui_inGame2_Poslednie_razrabotki"
+		local news_text = game.translate_string("st_location") .. " " .. game.translate_string(level_target)
+		db.actor:give_talk_message2(news_caption, news_text, news_icon, "iconed_answer_item")
+		return true
+	end
+	CreateTimeEvent(0, "setup_bounty_task", 0, postpone_for_next_frame)
+end
+
+--==========================================< Task functors >==========================================--
+-- Returns the id of the current target for the quest item task.
+task_functor.drx_sl_quest_item_task_target = function(task_id, field, p, tsk)
+	if not (db.actor and tsk) then return nil end
+
+	if field ~= "target" then return nil end
+
+	-- If quest item is found then return the quest giver id:
+	if tsk.stage == 1 then return tsk.task_giver_id end
+
+	-- Otherwise return the quest stash location:
+	local var = load_var(db.actor, task_id)
+	if not var then return nil end
+
+	local se_obj = get_story_se_item("drx_sl_quest_item_" .. var.stash_type)
+	if se_obj then return se_obj.id end
+
+	return var.target_id
+end
+
+
+--==========================================< Task Status functors >==========================================--
+task_status_functor.drx_sl_quest_item_task_status = function(tsk, task_id)
+	if (not db.actor) or (not tsk) then
+		return
+	end
+
+	local var = load_var(db.actor, task_id)
+	if not var then
+		return
+	end
+
+	-- Persist stash_created on first entry: set_random_stash returns false once the
+	-- items already exist, so without the flag we would retry here forever.
+	if not var.stash_created and XrrIsHost() then
+		local created = treasure_manager.set_random_stash(nil, nil, { ("drx_sl_quest_item_" .. var.stash_type), drx_sl_quest_stash_bonus() }, var.target_id)
+		var.stash_created = true
+		save_var(db.actor, task_id, var)
+		if created then
+			db.actor:give_info_portion("drx_sl_quest_item_task_" .. var.stash_type .. "_started")
+			printf("- %s | stash created", task_id)
+		end
+		return
+	end
+
+	-- Advance to stage 1 once the actor holds the quest item.
+	if xr_conditions.actor_has_item(db.actor, db.actor, { "drx_sl_quest_item_" .. var.stash_type }) then
+		tsk.stage = 1
+	else
+		tsk.stage = 0
+	end
+end

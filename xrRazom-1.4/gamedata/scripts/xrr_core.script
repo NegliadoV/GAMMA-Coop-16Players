@@ -1,0 +1,239 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Core: session globals and predicates, accessor facades, alife wrappers.
+]]
+
+local INVALID_ID = 65535
+
+printf("[xrRazom] xrr_core loaded; XrrNet=%s", tostring(XrrNet()))
+
+_G.GameLoaded     = false
+
+local cleanup_hooks = {}
+
+_G.xrr_register_cleanup = function(fn)
+    cleanup_hooks[#cleanup_hooks + 1] = fn
+end
+
+_G.xrr_session_cleanup = function()
+    log("[xrRazom] xrr_session_cleanup")
+    local gm = XrrNet and XrrNet()
+    if gm then gm:SetGameLoaded(false) end
+    _G.GameLoaded     = false
+    -- Emptied, never nil'd: a nil global read is an auto_load file-system probe.
+    _G.xrr_synced_task_targets = {}
+    _G.xrr_synced_task_text = {}
+    _G.xrr_shadow_dedup = {}
+    _G.xrr_weather_forced = false
+    db.actors = {}
+    for _, fn in ipairs(cleanup_hooks) do
+        local ok, err = pcall(fn)
+        if not ok then
+            printe("![xrRazom] cleanup hook error: %s", tostring(err))
+        end
+    end
+end
+
+-- luabind mints a fresh userdata per call; a Lua closure over one userdata also
+-- stays JIT-compiled, where a C function call would abort the trace.
+for _, name in ipairs({ "XrrNet", "XrrPlayers", "XrrMirrors", "XrrAlife",
+                        "XrrWorld", "XrrMcm", "XrrPda" }) do
+    local facade = _G[name]()
+    _G[name] = function() return facade end
+end
+_G.XrrIsConnected = function() return XrrNet():IsConnected() end
+_G.XrrIsHosted    = function() return XrrNet():IsListening() end
+_G.XrrIsHost      = function()
+    if not (XrrIsHosted() or XrrIsConnected()) then return true end
+    return XrrNet():IsHost()
+end
+_G.XrrIsClient    = function() return not XrrIsHost() end
+
+-- Plain globals so per-frame code learns "no session" without a luabind crossing.
+-- C++ rewrites them on change; this only seeds them when the VM loads.
+do
+    local n = XrrNet()
+    _G.XrrHosting       = n and n:IsListening() or false
+    _G.XrrSessionActive = n and (n:IsListening() or n:IsConnected()) or false
+    _G.XrrPeerCount     = n and XrrPlayers():GetPeerCount() or 0
+end
+
+-- Seeded so no reader ever meets nil. Readers test truthiness; writers assign
+-- false / {}, never nil.
+_G.xrr_synced_task_targets     = _G.xrr_synced_task_targets or {}
+_G.xrr_synced_task_text        = _G.xrr_synced_task_text or {}
+_G.xrr_shadow_dedup            = _G.xrr_shadow_dedup or {}
+_G.xrr_weather_forced          = _G.xrr_weather_forced or false
+_G.xrr_restoring_tasks         = _G.xrr_restoring_tasks or false
+_G.xrr_applying_remote_task    = _G.xrr_applying_remote_task or false
+_G.xrr_host_driven_task_effect = _G.xrr_host_driven_task_effect or false
+_G.xrr_completing_task_id      = _G.xrr_completing_task_id or false
+_G.XrrDebugTasks               = _G.XrrDebugTasks or false
+
+-- Install-time host predicate: XrrIsHosted() stays false through on_game_start,
+-- as the engine opens its socket only once the actor is live.
+_G.XrrWillHost    = function() return XrrNet():WillHost() end
+
+_G.IsSquad = function(o, c)
+    c = c or (o and o:clsid())
+    return c == clsid.online_offline_group or c == clsid.online_offline_group_s
+end
+
+_G.alife_object = function(id)
+    if not id or id >= INVALID_ID then return end
+    local sim = alife()
+    if not sim then return end
+    return sim:object(id)
+end
+
+-- Accepts either a vector + lid/gid or an object reference (server or client shape).
+local function _extract_pos(pos_or_obj, lid, gid)
+    if type(pos_or_obj) == "userdata" and not pos_or_obj.x then
+        local obj = pos_or_obj
+        if type(obj.id) == "function" then
+            return obj:position(), obj:level_vertex_id(), obj:game_vertex_id()
+        elseif obj.id then
+            return obj.position, obj.m_level_vertex_id, obj.m_game_vertex_id
+        else
+            callstack()
+            printe("!ERROR: alife_create | invalid userdata type")
+            return nil
+        end
+    end
+    return pos_or_obj, lid, gid
+end
+
+local function _validate_create(sec, pos, lid, gid)
+    if not (sec and ini_sys:section_exist(sec)) then
+        callstack()
+        printe("!ERROR: alife_create | section [%s] is invalid!", sec)
+        return false
+    end
+    if not (pos and lid and gid) then
+        callstack()
+        printe("!ERROR: alife_create | invalid position parameters for [%s]", sec)
+        return false
+    end
+    return true
+end
+
+local function _do_create(sec, pos, lid, gid, id, state)
+    if state ~= nil then
+        return alife():create(sec, pos, lid, gid, id, state)
+    elseif id then
+        return alife():create(sec, pos, lid, gid, id)
+    else
+        return alife():create(sec, pos, lid, gid)
+    end
+end
+
+_G.alife_create = function(sec, pos, lid, gid, id, state)
+    pos, lid, gid = _extract_pos(pos, lid, gid)
+    if not _validate_create(sec, pos, lid, gid) then return end
+    local se_obj = _do_create(sec, pos, lid, gid, id, state)
+    if not se_obj then
+        printe("!ERROR: alife_create | failed to create [%s]", sec)
+        return
+    end
+    alife_record(se_obj, true)
+    return se_obj
+end
+
+_G.alife_release = function(se_obj, msg)
+    if se_obj and type(se_obj.id) == "function" then
+        se_obj = alife_object(se_obj:id())
+    end
+    if not se_obj then
+        callstack()
+        printe("!ERROR: alife_release | no server object!")
+        return
+    end
+    if msg then
+        printf("~ alife_release [%s] (%s) | %s", se_obj:section_name(), se_obj.id, msg)
+    end
+    local cls = se_obj:clsid()
+    if IsStalker(nil, cls) or IsMonster(nil, cls) then
+        local squad = se_obj.group_id and se_obj.group_id ~= INVALID_ID and alife_object(se_obj.group_id)
+        if squad then
+            squad:remove_npc(se_obj.id, true)
+            return true
+        end
+    elseif cls == clsid.online_offline_group_s or cls == clsid.online_offline_group then
+        se_obj:remove_squad()
+        return true
+    else
+        -- Peer: a release the ownership gate will refuse must not first
+        -- unregister a live entity from the script-side registry.
+        if XrrIsConnected() and xrr_is_host_owned(se_obj.id) then
+            -- Inside the peer-chain window (around a dialog click) a host-owned release
+            -- forwards; everywhere else it is refused, which corpse loot and mod sweeps rely on.
+            if XrrNet():PeerChainWindow() then
+                XrrAlife():RequestEntityDespawn(se_obj.id)
+                return true
+            end
+            printf("[xrRazom] alife_release refused: host-owned id=%s sec=%s parent=%s",
+                   tostring(se_obj.id), tostring(se_obj:section_name()),
+                   tostring(se_obj.parent_id))
+            return false
+        end
+        alife_record(se_obj, false)
+        -- Raw alife():release() frees the CSE while the client CObject is only queued for
+        -- async destroy — the orphan's net_Destroy CTDs in CModelPool::DeleteInternal.
+        if XrrIsHosted() or XrrIsConnected() then
+            xrr_release_entity(se_obj.id)
+        else
+            alife():release(se_obj, true)
+        end
+        return true
+    end
+    return false
+end
+
+_G.alife_release_client = function(se_obj, msg)
+    if XrrIsHost() then return alife_release(se_obj, msg) end
+    if not se_obj then
+        callstack()
+        printe("!ERROR: alife_release_client | no server object!")
+        return
+    end
+    if type(se_obj.id) == "function" then
+        se_obj = alife_object(se_obj:id())
+    end
+    XrrAlife():RequestEntityDespawn(se_obj)
+end
+
+_G.alife_release_id          = function(id, msg) return alife_release(alife_object(id), msg) end
+_G.alife_release_client_id   = function(id, msg) return alife_release_client(alife_object(id), msg) end
+
+-- No Lua caller: the engine reads it for join/pstor. Until the actor binder
+-- loads, the actor's pstor is still at game_object[0].pstor_all.
+_G.xrr_get_actor_pstor = function()
+    if db.actor then
+        local st = db.storage and db.storage[db.actor:id()]
+        return st and st.pstor
+    end
+    local m = alife_storage_manager.get_state()
+    local go = m and m.game_object and m.game_object[0]
+    return go and go.pstor_all
+end
+
+-- HOST: NPC pstor for the dialog-lock-grant snapshot; no Lua caller.
+_G.xrr_get_npc_pstor = function(id)
+    local st = db.storage and db.storage[id]
+    return st and st.pstor
+end
+
+-- PEER: no Lua caller; the engine calls it when an NPC lock result arrives.
+_G.xrr_install_npc_pstor_var = function(id, key, value)
+    local obj = level and level.object_by_id(id)
+    if obj then save_var(obj, key, value) end
+end
+
+-- Deliberate no-op binder for [xrr_avatar] (CXrrPeerAvatar): bind_stalker.actor_init
+-- would clobber db.actor, and an empty script_binding value errors in CScriptBinder.
+function bind_avatar(obj)
+end
+
+db.actors = {}

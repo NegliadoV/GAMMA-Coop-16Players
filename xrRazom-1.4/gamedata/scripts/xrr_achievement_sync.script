@@ -1,0 +1,163 @@
+--[[
+  xrRazom — Achievement sync. Mid-game earns replay the per-actor rewards on
+  every recipient; the Phase A join bulk only flips the unlocked bits.
+]]
+
+-- Vanilla hardcodes these per functor; achievements.ltx does not carry them.
+local unlock_msg = {
+    bookworm_food       = "st_achievement_15_unlock",
+    completionist       = "st_achievement_10_unlock",
+    down_to_earth       = "st_achievement_12_unlock",
+    duga_free           = "st_achievement_4_unlock",
+    geologist           = "st_achievement_13_unlock",
+    heavy_pockets       = "st_achievement_1_unlock",
+    infopreneur         = "st_achievement_3_unlock",
+    mechanized_warfare  = "st_achievement_7_unlock",
+    patriarch           = "st_achievement_14_unlock",
+    radiotherapy        = "st_achievement_2_unlock",
+    rag_and_bone        = "st_achievement_9_unlock",
+    silver_or_lead      = "st_achievement_6_unlock",
+    tourist             = "st_achievement_8_unlock",
+    well_dressed        = "st_achievement_5_unlock",
+    wishful_thinking    = "st_achievement_11_unlock",
+    infantile_pleasure  = "st_achievement_16_unlock",
+    recycler            = "st_achievement_17_unlock",
+    artificer_eagerness = "st_achievement_18_unlock",
+    unforeseen_guest    = "st_achievement_19_unlock",
+    absolver            = "st_achievement_20_unlock",
+    collaborator        = "st_achievement_21_unlock",
+    iron_curtain        = "st_achievement_22_unlock",
+    murky_spirit        = "st_achievement_23_unlock",
+    invictus            = "st_achievement_24_unlock",
+}
+
+local function already_unlocked(name)
+    local entry = game_statistics.actor_achievements[name]
+    return entry and entry.unlocked == true
+end
+
+-- The local list is mode-filtered (e.g. ironman), so the entry may be missing.
+local function set_unlocked_bit(name)
+    local entry = game_statistics.actor_achievements[name]
+    if entry then
+        entry.unlocked = true
+    else
+        game_statistics.actor_achievements[name] = { unlocked = true }
+    end
+end
+
+-- Mirrors the vanilla actor_on_achievement_earned listener without
+-- SendScriptCallback — firing it would re-enter our own outbound hook.
+local function apply_local_rewards(name)
+    if not db.actor then return end
+
+    local msg = unlock_msg[name]
+    if msg then
+        news_manager.send_tip(db.actor, msg, nil, name, nil, nil)
+    end
+
+    local entry = game_statistics.actor_achievements[name]
+    if entry then
+        if entry.rank then game_statistics.increment_rank(entry.rank) end
+        if entry.rept then game_statistics.increment_reputation(entry.rept) end
+    end
+
+    if name == "iron_curtain" then
+        db.actor:give_money(40000)
+    elseif name == "wishful_thinking" then
+        if axr_main and axr_main.config then
+            axr_main.config:w_value("unlocked_factions", "renegade", true)
+            axr_main.config:save()
+        end
+    elseif name == "absolver" then
+        if axr_main and axr_main.config then
+            axr_main.config:w_value("unlocked_factions", "greh", true)
+            axr_main.config:save()
+        end
+    elseif name == "collaborator" then
+        if axr_main and axr_main.config then
+            axr_main.config:w_value("unlocked_factions", "isg", true)
+            axr_main.config:save()
+        end
+    end
+end
+
+-- Host only: stash sync replicates the host's spawns to peers.
+local function apply_host_rewards(name)
+    if name == "tourist" then
+        for i = 1, 3 do
+            treasure_manager.create_random_stash(nil, "Curious stash", nil)
+        end
+        if db.actor and has_alife_info("tourist_achievement_delay") then
+            db.actor:disable_info_portion("tourist_achievement_delay")
+        end
+    end
+end
+
+-- Engine → Lua handlers
+
+-- Mid-game earn, peer side (host broadcast).
+function OnAchievementEarned(name)
+    if not name or name == "" then return end
+    if already_unlocked(name) then return end
+    set_unlocked_bit(name)
+    apply_local_rewards(name)
+    log("[xrRazom][achv] OnAchievementEarned applied: " .. tostring(name))
+end
+
+-- Mid-game earn, host side (peer originator); the engine fans out to the
+-- other peers AFTER this handler returns.
+function OnPeerAchievementEarned(name)
+    if not name or name == "" then return end
+    if already_unlocked(name) then return end
+    set_unlocked_bit(name)
+    apply_local_rewards(name)
+    apply_host_rewards(name)
+    log("[xrRazom][achv] OnPeerAchievementEarned applied: " .. tostring(name))
+end
+
+-- Phase A join bulk, peer side (silent bit-flip only).
+function OnAchievementBulk(names)
+    if not names then return end
+    local applied = 0
+    for _, name in ipairs(names) do
+        if not already_unlocked(name) then
+            set_unlocked_bit(name)
+            applied = applied + 1
+        end
+    end
+    log("[xrRazom][achv] OnAchievementBulk applied "
+        .. tostring(applied) .. "/" .. tostring(#names) .. " names")
+end
+
+-- Lua → C++ outbound (locally-earned)
+
+-- Fires after vanilla game_statistics.actor_on_achievement_earned (dispatch is
+-- registration order), so the local table already says unlocked=true here.
+local function on_actor_achievement_earned(achievement, _)
+    if not achievement then return end
+    if not (XrrIsHosted() or XrrIsConnected()) then return end
+    if XrrPda() and XrrPda():IsApplyingRemoteAchievement() then return end
+    XrrPda():SendAchievementEarned(tostring(achievement))
+    log("[xrRazom][achv] forwarded local earn → wire: " .. tostring(achievement))
+end
+
+-- No Lua caller: the engine calls this to build the join bulk.
+function xrr_collect_achievements_unlocked()
+    local out = {}
+    for name, entry in pairs(game_statistics.actor_achievements) do
+        if entry.unlocked then out[#out + 1] = name end
+    end
+    return out
+end
+
+-- Lifecycle
+
+function on_game_start()
+    RegisterScriptCallback("actor_on_achievement_earned", on_actor_achievement_earned)
+end
+
+_G.OnAchievementEarned              = OnAchievementEarned
+_G.OnAchievementBulk                = OnAchievementBulk
+_G.OnPeerAchievementEarned          = OnPeerAchievementEarned
+_G.xrr_collect_achievements_unlocked = xrr_collect_achievements_unlocked

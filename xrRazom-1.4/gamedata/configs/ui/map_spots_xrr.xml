@@ -1,0 +1,19 @@
+<!-- xrRazom: other players on the PDA map and the minimap.
+     Injected into map_spots.xml / _16 / _21 by modxml_xrr_map_spots.script.
+     heading="1" makes the engine rotate the spot to the owner's facing
+     (CMapLocation::CalcDirection), so the arrow shows where the player looks.
+     The texture is a white chevron; the tint here is the icon colour. -->
+
+	<xrr_player_location>
+		<level_map spot="xrr_player_level_spot" pointer="quest_pointer"/>
+		<mini_map spot="xrr_player_mini_spot" pointer="quest_pointer"/>
+	</xrr_player_location>
+	<xrr_player_level_spot width="20" height="20" heading="1" stretch="1" alignment="c" location_level="5">
+		<texture r="255" g="150" b="40">ui\xrr_map_arrow</texture>
+	</xrr_player_level_spot>
+	<!-- CMiniMapSpot::Load reads an explicit texture region for a path texture
+	     and defaults it to the spot size, which would crop the 32px file to its
+	     top-left corner; the region must name the whole texture. -->
+	<xrr_player_mini_spot width="12" height="12" heading="1" stretch="1" alignment="c" location_level="10">
+		<texture x="0" y="0" width="32" height="32" r="255" g="150" b="40">ui\xrr_map_arrow</texture>
+	</xrr_player_mini_spot>

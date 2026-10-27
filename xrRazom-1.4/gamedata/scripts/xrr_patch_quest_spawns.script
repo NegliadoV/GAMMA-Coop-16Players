@@ -1,0 +1,132 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Host-only spawn effects for story / fetch quests: wraps xr_effects.spawn_*
+  and mlr_utils.spawn_item so alife_create runs only on the host, since a
+  peer running it would create a duplicate entity only that peer can see.
+]]
+
+function apply()
+    log("[xrRazom] Patching xr_effects.spawn_* + mlr_utils.spawn_item with host-only guards")
+
+    xr_effects.spawn_item_at_pos = function(actor, npc, p)
+        if not XrrIsHost() then return end
+        if not (p and p[1]) then return end
+        local pos_itms = {
+            ["drx_x8_documents"]       = { -101.9361038208,    -31.361772537231,  90.615669250488,  636,    5090 },
+            ["drx_x16_documents"]      = { -46.306594848633,    20.461000442505,   2.1229863166809, 2220,   3792 },
+            ["drx_x18_documents"]      = {  23.617618560791,    -5.6467723846436, -18.183609008789, 6311,   3760 },
+            ["drx_x19_documents"]      = {   6.817852973938,    -7.8305835723877, -15.558134078979, 7638,   3842 },
+            ["drx_agr_u_documents"]    = {  46.072761535645,     1.8872995376587,  75.970985412598, 3968,   3630 },
+            ["drx_jup_u_documents"]    = {  27.983295440674,    12.515381813049,   -1.1357840299606,39736,  4861 },
+            ["lx8_history_documents"]  = { -93.635635375977, -27.296674728394, 96.18310546875,  1318,   5079 },
+            ["lx8_history_2_documents"]= { -116.10192871094, -27.196212768555, 82.614562988281,   30,   5090 },
+            ["lx8_history_3_documents"]= { -43.184757232666, -19.527189254761, 67.334884643555, 6770,   5094 },
+            ["wpn_gauss_quest"]        = { -426.44213867188,    26.069364547729, -383.1135559082, 138111,   4140 },
+        }
+        local pos_data = pos_itms[p[1]]
+        if pos_data then
+            alife_create(p[1],
+                vector():set(pos_data[1], pos_data[2], pos_data[3]),
+                pos_data[4], pos_data[5])
+        else
+            printe("!ERROR: spawn_item_at_pos | no info for item [%s]", p[1])
+        end
+    end
+
+    xr_effects.spawn_strelok_notes = function(actor, npc, p)
+        if not XrrIsHost() then return end
+        alife_create("strelok_notes",
+            vector():set(43.601459503174, 1.3544018268585, 75.227851867676), 3762, 3630)
+    end
+
+    xr_effects.spawn_monolith_shard = function()
+        if not XrrIsHost() then return end
+        alife_create("monolith_shard",
+            vector():set(0.072339810431004, -34.356998443604, 17.800102233887), 1849, 4055)
+    end
+
+    xr_effects.spawn_stitch_decoder = function()
+        if not XrrIsHost() then return end
+        local locs = {
+            { 50.247924804688, 3.9755771160126, 156.77543640137, 509188, 5248 },
+            { 51.563461303711, 7.1993789672852, 224.42543029785, 514950, 5155 },
+            { 19.012723922729, 1.1766533851624, 112.65353393555, 472104, 5144 },
+        }
+        local r = locs[math.random(#locs)]
+        local se_obj = alife_create("stitch_decoder", vector():set(r[1], r[2], r[3]), r[4], r[5])
+        if se_obj then item_radio.add_target(se_obj.id, 171, 75) end
+    end
+
+    xr_effects.spawn_contact_lost_pda = function()
+        if not XrrIsHost() then return end
+        local locs = {
+            { -35.871238708496, -4.0057287216187, 139.02619934082, 8109,  2458 },
+            { -18.989786148071, -3.9511435031891, 143.22698974609, 15620, 2477 },
+            { -24.930610656738, -4.015763759613,  139.54330444336, 12734, 2458 },
+        }
+        local r = locs[math.random(#locs)]
+        alife_create("contact_lost_pda", vector():set(r[1], r[2], r[3]), r[4], r[5])
+    end
+
+    xr_effects.spawn_jupiter_documents = function()
+        if not XrrIsHost() then return end
+        local locs = {
+            { 304.7744140625,  28.783397674561, -299.32592773438, 1209997, 4517 },
+            { 324.68350219727, 31.384368896484, -305.80865478516, 1235548, 4517 },
+            { 351.95175170898, 27.543346405029, -343.99871826172, 1276714, 4516 },
+        }
+        local r = locs[math.random(#locs)]
+        alife_create("jupiter_documents", vector():set(r[1], r[2], r[3]), r[4], r[5])
+    end
+
+    xr_effects.jup_b219_restore_gate = function()
+        if not XrrIsHost() then return end
+        local obj = get_story_object("jup_b219_gate_id")
+        if obj then
+            local se_obj = alife_create("jup_b219_gate",
+                vector():set(obj:position()),
+                obj:level_vertex_id(), obj:game_vertex_id())
+            if se_obj then se_obj:set_yaw(0) end
+        end
+    end
+
+    xr_effects.spawn_x8_documents = function()
+        if not XrrIsHost() then return end
+        local locs = {
+            { -79.236862182617, -24.324705123901, 89.061508178711, 3417, 5077 },
+            { -101.86143493652, -31.362953186035, 90.774269104004,  636, 5090 },
+            { -79.810501098633, -15.038819313049, 114.17692565918, 3459, 5098 },
+        }
+        local r = locs[math.random(#locs)]
+        alife_create("x8_documents", vector():set(r[1], r[2], r[3]), r[4], r[5])
+    end
+
+    mlr_utils.spawn_item = function(name)
+        if not XrrIsHost() then return end
+        local SPWN = {
+            spawn_1_11_af_medusa_kmb       = { ["af_medusa"]              = { -245.78, -14.29,  -16.55, 16254, 381    } },
+            spawn_povars_12_70             = { ["ammo_12x70_buck"]        = {   25.58, -11.88, -236.22, 77453, 1986, 5 } },
+            spawn_povars_ammo_pkm_100      = { ["ammo_pkm_100"]           = {   25.58, -11.88, -236.22, 77453, 1986, 5 } },
+            spawn_povars_9_18_6            = { ["ammo_9x18_fmj"]          = {   25.58, -11.88, -236.22, 77453, 1986, 6 } },
+            spawn_povars_5_45_3            = { ["ammo_5.45x39_fmj"]       = {   25.58, -11.88, -236.22, 77453, 1986, 3 } },
+            spawn_povars_5_45_6            = { ["ammo_5.45x39_fmj"]       = {   25.58, -11.88, -236.22, 77453, 1986, 6 } },
+            spawn_povars_7_62              = { ["ammo_7.62x54_7h1"]       = {   25.58, -11.88, -236.22, 77453, 1986, 2 } },
+            spawn_povars_berill            = { ["specops_outfit"]          = {   25.54, -11.88, -234.85, 77112, 1986   } },
+            spawn_wpn_ak74_jurov_task_2_1  = { ["wpn_ak74_jurov_task_2"]  = {  -65.71, -31.52, -352.51, 314724, 571   } },
+            spawn_wpn_ak74_jurov_task_2_2  = { ["wpn_ak74_jurov_task_2"]  = { -106.22, -29.38, -394.22, 232856, 443   } },
+            spawn_wpn_saiga_rookie_pole    = { ["wpn_saiga_rookie_pole"]  = { -164.93,   0.16,   77.97,  80940, 5146  } },
+            wpn_svd_bandit_depo_task_1_1   = { ["wpn_svd_bandit_depo_task_1"] = { -219.37, 1.37,  209.31, 1777, 971   } },
+            wpn_svd_bandit_depo_task_1_2   = { ["wpn_svd_bandit_depo_task_1"] = { -240.83, 3.53,  217.42,  203, 935   } },
+            wpn_svd_bandit_depo_task_1_3   = { ["wpn_svd_bandit_depo_task_1"] = { -213.45, 3.63,  269.33, 2672, 977   } },
+        }
+        local entry = SPWN[name]
+        if not entry then return end
+        for section, v in pairs(entry) do
+            for _ = 1, (v[6] or 1) do
+                alife_create(section, vector():set(v[1], v[2], v[3]), v[4], v[5])
+            end
+        end
+    end
+end

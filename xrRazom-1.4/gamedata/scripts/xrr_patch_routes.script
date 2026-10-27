@@ -1,0 +1,105 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Level-transition routes: the opened_routes flag and per-route discovery are
+  host-only state, so without this a peer hits "Unknown path".
+]]
+
+local _orig_open_route = nil
+
+local function open_route_wrapper(map1, map2, no_msg)
+    _orig_open_route(map1, map2, no_msg)
+    if map1 and map2 and XrrPda() and (XrrIsHosted() or XrrIsConnected()) then
+        XrrPda():SendRouteOpened(tostring(map1), tostring(map2))
+    end
+end
+
+-- C++ → Lua handlers
+
+-- The saved original, not the wrapper: an inbound route must not re-announce.
+function OnRouteOpened(map1, map2)
+    if not (_orig_open_route and map1 and map2) then return end
+    _orig_open_route(map1, map2, false)
+    log("[xrRazom][routes] OnRouteOpened applied: "
+        .. tostring(map1) .. " <-> " .. tostring(map2))
+end
+
+-- Route topology is static and identical on every machine: the peer derives the full set.
+local function open_all_routes_local()
+    if not (_orig_open_route and txr_routes) then return 0 end
+    local couples = txr_routes.list_map(false, true, true) or {}
+    local n = 0
+    for i = 1, #couples do
+        local a, b = couples[i][1], couples[i][2]
+        if a and b then
+            _orig_open_route(a, b, true)
+            n = n + 1
+        end
+    end
+    return n
+end
+
+-- The flag alone adds no PDA spots (se_restrictor:on_register already ran without
+-- it), so every route is opened too.
+function OnRouteBulk(opened, route_pairs)
+    if opened then
+        alife_storage_manager.get_state().opened_routes = true
+        local n = open_all_routes_local()
+        log("[xrRazom][routes] OnRouteBulk: opened_routes=true, opened all "
+            .. tostring(n) .. " route(s) for map display")
+        return
+    end
+
+    local applied = 0
+    if _orig_open_route and route_pairs then
+        for i = 1, #route_pairs do
+            local p = route_pairs[i]
+            if p and p[1] and p[2] and p[1] ~= "" and p[2] ~= "" then
+                _orig_open_route(p[1], p[2], true)  -- silent
+                applied = applied + 1
+            end
+        end
+    end
+    log("[xrRazom][routes] OnRouteBulk: applied "
+        .. tostring(applied) .. " discovered route(s)")
+end
+
+-- Host-side collector for the JOIN_ROUTES bulk
+
+function xrr_collect_open_routes()
+    local st  = alife_storage_manager.get_state()
+    local out = { opened_routes = (st.opened_routes == true), routes = {} }
+    if out.opened_routes then return out end
+
+    local couples = txr_routes.list_map(false, true, true) or {}
+    local seen = {}
+    for i = 1, #couples do
+        local a, b = couples[i][1], couples[i][2]
+        if a and b then
+            local key = (a < b) and (a .. "|" .. b) or (b .. "|" .. a)
+            if not seen[key] and txr_routes.is_route_discovered(a, b) then
+                seen[key] = true
+                out.routes[#out.routes + 1] = { a, b }
+            end
+        end
+    end
+    return out
+end
+
+-- Lifecycle
+
+function on_game_start()
+    if not (txr_routes and type(txr_routes.open_route) == "function") then
+        log("[xrRazom] route sync: txr_routes.open_route missing — skipped")
+        return
+    end
+    _orig_open_route = txr_routes.open_route
+    txr_routes.open_route = open_route_wrapper
+    log("[xrRazom] route sync: wrapped txr_routes.open_route")
+end
+
+-- Engine-called: a script's module env is not _G.
+_G.OnRouteOpened          = OnRouteOpened
+_G.OnRouteBulk            = OnRouteBulk
+_G.xrr_collect_open_routes = xrr_collect_open_routes

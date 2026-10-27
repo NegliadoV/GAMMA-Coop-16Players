@@ -1,0 +1,152 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://qconsulting.ca/fo3/ModConfig5.0.xsd">
+  <moduleName>xrRazom Co-op</moduleName>
+  <requiredInstallFiles>
+    <folder source="gamedata" destination="gamedata"/>
+  </requiredInstallFiles>
+  <installSteps order="Explicit">
+    <installStep name="Engine files / Файли рушія">
+      <optionalFileGroups order="Explicit">
+        <group name="Copy both from the archive&apos;s Anomaly folder, then tick them / Скопіюйте обидві з папки Anomaly в архіві й позначте" type="SelectAny">
+          <plugins order="Explicit">
+            <plugin name="I&apos;ve copied the bin folder / Я скопіював папку bin">
+              <description>Copy bin and gamedata from the archive&apos;s Anomaly folder into your game folder.
+
+Скопіюйте bin і gamedata з папки Anomaly в архіві у папку гри.</description>
+              <conditionFlags><flag name="bin_copied">On</flag></conditionFlags>
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+            <plugin name="I&apos;ve copied the gamedata folder / Я скопіював папку gamedata">
+              <description>Copy bin and gamedata from the archive&apos;s Anomaly folder into your game folder.
+
+Скопіюйте bin і gamedata з папки Anomaly в архіві у папку гри.</description>
+              <conditionFlags><flag name="gamedata_copied">On</flag></conditionFlags>
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+    <installStep name="Engine files not copied / Файли рушія не скопійовано">
+      <visible operator="Or">
+        <flagDependency flag="bin_copied" value=""/>
+        <flagDependency flag="gamedata_copied" value=""/>
+      </visible>
+      <optionalFileGroups order="Explicit">
+        <group name="xrRazom will not work without them / Без них xrRazom не працюватиме" type="SelectAll">
+          <plugins order="Explicit">
+            <plugin name="Go back and copy them first / Спершу поверніться та скопіюйте їх">
+              <description>Press Back, copy both folders and tick both checkboxes.
+
+Натисніть Back, скопіюйте обидві папки й активуйте обидва прапорці.</description>
+              <conditionFlags><flag name="engine_missing">On</flag></conditionFlags>
+              <typeDescriptor><type name="Required"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+    <installStep name="Your install / Ваша збірка">
+      <optionalFileGroups order="Explicit">
+        <group name="What is this MO2 managing? / Чим керує цей MO2?" type="SelectExactlyOne">
+          <plugins order="Explicit">
+            <plugin name="Anomaly">
+              <description>Anomaly with your own mods.
+
+Anomaly з вашими модами.</description>
+              <conditionFlags><flag name="gamma">Off</flag></conditionFlags>
+              <typeDescriptor><type name="Recommended"/></typeDescriptor>
+            </plugin>
+            <plugin name="G.A.M.M.A.">
+              <description>Add-ons are switched off for GAMMA.
+
+Для GAMMA доповнення вимкнені.</description>
+              <conditionFlags><flag name="gamma">On</flag></conditionFlags>
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+    <installStep name="Add-ons / Доповнення">
+      <optionalFileGroups order="Explicit">
+        <group name="Optional, bundled for convenience / Необов&apos;язкові, додані для зручності" type="SelectAny">
+          <plugins order="Explicit">
+            <plugin name="Mod Configuration Menu (MCM)">
+              <description>Untick if you already have MCM.
+
+Зніміть позначку, якщо MCM у вас уже є.</description>
+              <files>
+                <folder source="options\MCM\gamedata" destination="gamedata"/>
+              </files>
+              <typeDescriptor>
+                <dependencyType>
+                  <defaultType name="Recommended"/>
+                  <patterns>
+                    <pattern>
+                      <dependencies><flagDependency flag="gamma" value="On"/></dependencies>
+                      <type name="NotUsable"/>
+                    </pattern>
+                  </patterns>
+                </dependencyType>
+              </typeDescriptor>
+            </plugin>
+            <plugin name="Food, Drug and Drinks Animations (FDDA)">
+              <description>Animations for eating, drinking and medicine.
+
+Анімації їжі, напоїв і ліків.</description>
+              <files>
+                <folder source="options\FDDA\db" destination="db"/>
+              </files>
+              <typeDescriptor>
+                <dependencyType>
+                  <defaultType name="Recommended"/>
+                  <patterns>
+                    <pattern>
+                      <dependencies><flagDependency flag="gamma" value="On"/></dependencies>
+                      <type name="NotUsable"/>
+                    </pattern>
+                  </patterns>
+                </dependencyType>
+              </typeDescriptor>
+            </plugin>
+            <plugin name="Ukrainian translation and voices / Український переклад та голоси">
+              <description>Ukrainian text and voices.
+
+Український текст і голоси.</description>
+              <files>
+                <folder source="options\UA localization\db" destination="db"/>
+              </files>
+              <typeDescriptor>
+                <dependencyType>
+                  <defaultType name="Recommended"/>
+                  <patterns>
+                    <pattern>
+                      <dependencies><flagDependency flag="gamma" value="On"/></dependencies>
+                      <type name="NotUsable"/>
+                    </pattern>
+                  </patterns>
+                </dependencyType>
+              </typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+    <installStep name="Last step / Останній крок">
+      <optionalFileGroups order="Explicit">
+        <group name="After this installer closes / Коли інсталятор закриється" type="SelectAll">
+          <plugins order="Explicit">
+            <plugin name="Enable xrRazom Co-op and give it the highest priority / Увімкніть xrRazom Co-op і дайте йому найвищий пріоритет">
+              <description>Tick xrRazom Co-op in MO2&apos;s left-hand list, then right-click it -&gt; Send to... -&gt; Highest priority.
+
+Увімкніть xrRazom Co-op у лівому списку MO2, потім клацніть по ньому правою кнопкою -&gt; Send to... -&gt; Highest priority.</description>
+              <conditionFlags><flag name="finish">On</flag></conditionFlags>
+              <typeDescriptor><type name="Required"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>

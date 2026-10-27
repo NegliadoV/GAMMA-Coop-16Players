@@ -1,0 +1,46 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Stealth Kill Detection (Catspaw, GAMMA): the host judges a peer's silent kill
+  with db.actor swapped to the avatar; the stat goes to the peer, not the host.
+]]
+
+local STAT_ID = "silent_kills"
+
+function on_game_start()
+    local skd = stealth_kill_detection
+    if not skd then return end
+
+    local orig = skd.trigger_stealth_kill_callback
+    if type(orig) ~= "function" then
+        log("[xrRazom][stealthkill] INSTALL FAILED: stealth_kill_detection.trigger_stealth_kill_callback missing")
+        return
+    end
+
+    -- Catspaw creates this entry only in the trigger, which never runs on a peer,
+    -- and increment_statistic silently skips a missing key.
+    if XrrSessionActive and not XrrHosting then
+        local stats = game_statistics.actor_statistics
+        stats[STAT_ID] = stats[STAT_ID] or { count = 0, rank = 5, rept = 0 }
+    end
+
+    -- Catspaw's pr wrapper looks this field up at call time.
+    skd.trigger_stealth_kill_callback = function(was_melee)
+        local avatar_id = XrrPeerCount > 0 and db.actor and db.actor:id()
+        if not (avatar_id and XrrPlayers():IsPlayerDummy(avatar_id)) then
+            return orig(was_melee)
+        end
+        local netid = XrrPlayers():PlayerDummyPeerNetid(avatar_id)
+        if skd.add_statistic and netid ~= "0" then
+            -- rank/rept 0: the peer's own entry supplies Catspaw's values.
+            XrrPda():SendStatIncrement(netid, STAT_ID, 1, 0, 0)
+        end
+        local saved = skd.add_statistic
+        skd.add_statistic = false
+        local ok, err = pcall(orig, was_melee)
+        skd.add_statistic = saved
+        if not ok then error(err, 0) end
+    end
+    log("[xrRazom][stealthkill] peer silent kills credit the peer")
+end

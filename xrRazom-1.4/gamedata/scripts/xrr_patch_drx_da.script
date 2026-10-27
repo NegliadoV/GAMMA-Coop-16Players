@@ -1,0 +1,156 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+
+  Dynamic Anomalies Overhaul patch: the flash mine's clock jump is applied once
+  by the host, and the world-mutating lifecycle runs on the host only.
+]]
+
+local _applied    = false
+local _orig_flash = nil
+
+-- One blast hits every actor on its own machine, so the same mine reports twice;
+-- a second jump inside the window is that double count, not a second mine.
+local FLASH_DEDUPE_MS = 10000
+local _last_flash     = {}
+
+function host_apply_flash_time(zone_id, hours, minutes)
+    local now  = time_global()
+    local last = _last_flash[zone_id]
+    if last and (now - last) < FLASH_DEDUPE_MS then
+        printf("[xrRazom][drx_da] flash_time zone=%s already applied — skipped",
+               tostring(zone_id))
+        return
+    end
+    _last_flash[zone_id] = now
+    printf("[xrRazom][drx_da] flash_time zone=%s applying +%s:%s",
+           tostring(zone_id), tostring(hours), tostring(minutes))
+
+    -- change_game_time broadcasts TIME_SYNC on its own (engine chokepoint).
+    level.change_game_time(0, hours, minutes)
+    level_weathers.get_weather_manager():select_weather(true)
+    surge_manager.get_surge_manager().time_forwarded = true
+    psi_storm_manager.get_psi_storm_manager().time_forwarded = true
+
+    XrrWorld():SendWeatherChanged(true)
+end
+
+local function on_flash_time_intent(obj_id, state, args, sender_netid)
+    local h, m = string.match(tostring(args), "^(%d+):(%d+)$")
+    h, m = tonumber(h), tonumber(m)
+    if not (h and m) or h > 12 or m > 59 then
+        printe("![xrRazom][drx_da] flash_time from %s: bad args '%s' — dropped",
+               tostring(sender_netid), tostring(args))
+        return
+    end
+    host_apply_flash_time(obj_id, h, m)
+end
+
+-- DAO's zone_mine_flash with the clock block lifted out; the local actor effects
+-- stay per-machine and read the same roll that was applied.
+local function flash_time_travel(s_hit, bone_id, flags, actor)
+    local health         = actor.health
+    local change_hours   = math.random(3, 8)
+    local change_minutes = math.random(1, 59)
+    local zone_id        = s_hit.draftsman:id()
+
+    if XrrIsClient() then
+        -- Fire-and-forget: the jump comes back as the ordinary time sync.
+        xrr_use_intent.request{
+            verb   = "drx_da:flash_time",
+            obj_id = zone_id,
+            state  = true,
+            args   = change_hours .. ":" .. change_minutes,
+        }
+    else
+        host_apply_flash_time(zone_id, change_hours, change_minutes)
+    end
+
+    s_hit.power = 0.001
+
+    local fatigue_light_state = true
+    if fatigue_light then
+        fatigue_light_state = fatigue_light.enabled
+        fatigue_light.enabled = false
+    end
+    demonized_time_events.CreateTimeEvent("zone_mine_flash", "zone_mine_flash", 0.1, function()
+        actor:set_health_ex(health)
+        actor:change_health(-random_float(0.01, 0.04))
+
+        -- Params are vanilla's actor_status_sleep / actor_status_thirst.
+        local check_after_sec = 300
+        local elapsed_sec     = change_hours * 3600 + change_minutes * 60
+        thirst_sleep_changer.change_sleep(round(elapsed_sec / check_after_sec * 27 * 0.01))
+        thirst_sleep_changer.change_thirst(round(elapsed_sec / check_after_sec * 30 * 0.01))
+
+        if fatigue_light then
+            fatigue_light.enabled = fatigue_light_state
+        end
+
+        return true
+    end)
+end
+
+-- Each of these spawns or deletes entities off this machine's own tables and
+-- clock, so on a peer it would delete the host's world locally.
+local PEER_NOP = {
+    "drx_da_update_dynamic_anomalies",
+    "clean_dynamic_anomalies_on_level",
+    "clean_old_dynamic_anomalies_on_level",
+    "clean_dynamic_anomalies_global",
+    "force_clean_dynamic_anomalies_global",
+    "clean_artefacts_on_level",
+    "spawn_artefacts_on_level",
+    "update_dynamic_anomalies_on_level_after_surge",
+    "remove_anomaly_obj",
+}
+
+-- DAO's callbacks are captured at on_game_start, but their bodies call these
+-- by name, so the table swap still reaches them.
+local function gate_peer_lifecycle()
+    for i = 1, #PEER_NOP do
+        local name = PEER_NOP[i]
+        local orig = drx_da_main[name]
+        if not orig then
+            printe("![xrRazom][drx_da] %s is gone from the mod — not gated", name)
+        else
+            drx_da_main[name] = function(...)
+                if XrrIsConnected() then return end
+                return orig(...)
+            end
+        end
+    end
+end
+
+-- The mod forgets an artefact only in its own actor_on_item_take, which a peer's
+-- pickup never fires here; else clean_artefacts_on_level releases it later.
+local function on_peer_item_take(avatar_id, item_id)
+    local obj = level.object_by_id(item_id)
+    if not (obj and IsArtefact(obj)) then return end
+    drx_da_main.actor_on_item_take(obj)
+    if drx_da_main_artefacts_movement and drx_da_main_artefacts_movement.actor_on_item_take then
+        drx_da_main_artefacts_movement.actor_on_item_take(obj)
+    end
+end
+
+function on_game_start()
+    if _applied then return end
+    if not (drx_da_main and drx_da_main.anomalies_hit_functions) then return end
+    _applied = true
+
+    RegisterScriptCallback("xrr_on_peer_item_take", on_peer_item_take)
+    xrr_use_intent.register("drx_da:flash_time", on_flash_time_intent)
+
+    _orig_flash = drx_da_main.anomalies_hit_functions.zone_mine_flash
+    drx_da_main.anomalies_hit_functions.zone_mine_flash =
+        function(s_hit, bone_id, flags, actor)
+            if not (XrrIsHosted() or XrrIsConnected()) then
+                return _orig_flash(s_hit, bone_id, flags, actor)
+            end
+            return flash_time_travel(s_hit, bone_id, flags, actor)
+        end
+
+    gate_peer_lifecycle()
+
+    printf("[xrRazom][drx_da] patch applied: flash-mine time travel is host-authoritative, "
+        .. "%s lifecycle functions are peer NOPs", tostring(#PEER_NOP))
+end

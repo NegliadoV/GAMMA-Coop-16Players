@@ -1,0 +1,240 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Options → xrRazom page, the co-op keybind group, and the one-shot MCM → console-var
+  migration. The modxml_ filename is load-bearing: dxml_core globs it for on_xml_read.
+]]
+
+-- No option declares a def: a def forks a second copy of the value into
+-- axr_options.ltx, which is why options_builder.check (it forces def = false) is out.
+local function chk(id, cmd, curr)
+    return { id = id, type = "check", val = 1, cmd = cmd,
+             curr = curr or { get_console_cmd, 1, cmd } }
+end
+
+-- val = 2 wants a number; get_console_cmd(0, ...) hands back the string form.
+local function curr_num(cmd)
+    return tonumber(get_console_cmd(0, cmd))
+end
+
+-- Locked on a peer: show the host's value, not the local console's leftover.
+local function curr_party_fast_travel()
+    return xrr_group_action.party_fast_travel()
+end
+
+local function curr_gather_radius()
+    return xrr_group_action.gather_radius()
+end
+
+local function curr_rescue()
+    return XrrPlayers():RescueEnabled()
+end
+
+local function curr_rescue_medkit()
+    return XrrPlayers():RescueNeedsMedkit()
+end
+
+local function slide(page_id)
+    return { id = "slide_" .. page_id, type = "slide",
+             link = "ui_options_slider_other", text = "ui_mm_menu_" .. page_id,
+             size = { 512, 50 } }
+end
+
+local function build_page()
+    local ob = options_builder
+    return {
+        id = "xrrazom", gr = {
+            { id = "xrr_player", sh = true, gr = {
+                slide("xrr_player"),
+                ob.input { id = "player_name", cmd = "xrr_player_name",
+                           curr = { get_console_cmd, 0, "xrr_player_name" } },
+                chk("show_marks",      "xrr_show_marks"),
+                chk("show_names",      "xrr_show_names"),
+                chk("show_players_hp", "xrr_show_players_hp"),
+                chk("show_net_health", "xrr_show_net_health"),
+                -- Wire-carried, but it is the placer's own value: not a peer-locked session rule.
+                ob.track { id = "tag_duration", cmd = "xrr_tag_duration", step = 5,
+                           curr = { curr_num, "xrr_tag_duration" } },
+                chk("chat_enable",     "xrr_chat_enable"),
+                chk("chat_sound",      "xrr_chat_sound"),
+            }, },
+            { id = "xrr_hosting", sh = true, gr = {
+                slide("xrr_hosting"),
+                chk("host_session", "xrr_host_session"),
+                chk("host_steam",   "xrr_host_steam"),
+                -- An input, not a track: GAMMA UI's Callback_Input coerces on val == 1
+                -- (vanilla: val == 2); CCC_Integer does the range check.
+                ob.input { id = "host_lan_port", cmd = "xrr_host_lan_port",
+                           curr = { get_console_cmd, 0, "xrr_host_lan_port" } },
+                -- track pulls min/max off the console variable.
+                ob.track { id = "max_players", cmd = "xrr_max_players", step = 1,
+                           curr = { curr_num, "xrr_max_players" } },
+                slide("xrr_danger"),
+                chk("skip_mod_check", "xrr_skip_mod_check"),
+            }, },
+            { id = "xrr_session", sh = true, gr = {
+                slide("xrr_session"),
+                chk("friendly_fire",        "xrr_friendly_fire"),
+                chk("rescue",               "xrr_rescue",        { curr_rescue }),
+                chk("rescue_medkit",        "xrr_rescue_medkit", { curr_rescue_medkit }),
+                chk("allow_peer_save_load", "xrr_allow_peer_save_load"),
+                chk("sync_teleport",        "xrr_sync_teleport"),
+                ob.track { id = "teleport_radius", cmd = "xrr_teleport_radius", step = 5,
+                           curr = { curr_num, "xrr_teleport_radius" } },
+                chk("party_fast_travel",    "xrr_party_fast_travel",
+                    { curr_party_fast_travel }),
+                ob.track { id = "gather_radius", cmd = "xrr_gather_radius", step = 5,
+                           curr = { curr_gather_radius } },
+            }, },
+        }
+    }
+end
+
+local SESSION_PATH = "xrrazom/xrr_session"
+
+-- Session rules are the host's: visible on a peer, not editable.
+local function lock_session_panel(_, path)
+    if path ~= SESSION_PATH then return false end
+    local gm = XrrNet and XrrNet()
+    return (gm and gm:IsConnected()) and true or false
+end
+
+-- The medkit rule means nothing while rescue is off. Reads the checkbox, not the
+-- variable, so it follows an unapplied click.
+local function sync_medkit_row(dlg)
+    local rescue = dlg._Check[SESSION_PATH .. "/rescue"]
+    local medkit = dlg._Check[SESSION_PATH .. "/rescue_medkit"]
+    if rescue and medkit then medkit:Enable(rescue:GetCheck()) end
+end
+
+-- Must run after the lock installs: a locked panel stays fully disabled.
+local function install_medkit_row_dependency(cls)
+    local reset, clicked = cls.Reset_opt, cls.Callback_Check
+
+    cls.Reset_opt = function(self, curr_tree, path, flags)
+        reset(self, curr_tree, path, flags)
+        if path == SESSION_PATH and not lock_session_panel(nil, path) then
+            sync_medkit_row(self)
+        end
+    end
+
+    cls.Callback_Check = function(self, ctrl, path, opt, v)
+        clicked(self, ctrl, path, opt, v)
+        if path == SESSION_PATH and opt == "rescue" then sync_medkit_row(self) end
+    end
+end
+
+-- Carries no strings: the captions live in the additive ui_xrrazom.xml table in
+-- all three locales, so dxml_core's eng/rus-only filter never applies.
+local KB_GROUP = [[
+	<group name="kb_grp_xrrazom">
+		<command id="kb_xrr_tag"						exe="xrr_tag"/>
+		<command id="kb_xrr_chat"						exe="xrr_chat"/>
+	</group>
+]]
+
+local function inject_keybinds()
+    RegisterScriptCallback("on_xml_read", function(xml_file_name, xml_obj)
+        if xml_file_name == [[ui\ui_keybinding.xml]] then
+            xml_obj:insertFromXMLString(KB_GROUP)
+        end
+    end)
+end
+
+-- One-shot migration off the MCM store
+local MIGRATE = {
+    { "player_name",          "xrr_player_name",          "str"  },
+    { "host_session",         "xrr_host_session",         "bool" },
+    { "host_steam",           "xrr_host_steam",           "bool" },
+    { "host_lan_port",        "xrr_host_lan_port",        "num"  },
+    { "max_players",          "xrr_max_players",          "num"  },
+    { "friendly_fire",        "xrr_friendly_fire",        "bool" },
+    { "allow_peer_save_load", "xrr_allow_peer_save_load", "bool" },
+    { "sync_teleport",        "xrr_sync_teleport",        "bool" },
+    { "teleport_radius",      "xrr_teleport_radius",      "num"  },
+    { "tag_duration",         "xrr_tag_duration",         "num"  },
+    { "show_marks",           "xrr_show_marks",           "bool" },
+    { "show_name",            "xrr_show_names",           "bool" },
+    { "show_players_hp",      "xrr_show_players_hp",      "bool" },
+    { "show_net_health",      "xrr_show_net_health",      "bool" },
+    { "chat_enable",          "xrr_chat_enable",          "bool" },
+    { "chat_sound",           "xrr_chat_sound",           "bool" },
+}
+
+local function migrated_value(cfg, mcm_id, kind)
+    -- def = nil so a missing key reads as nil and the compiled default stands.
+    if kind == "bool" then
+        local v = cfg:r_value("mcm", "xrrazom/" .. mcm_id, 1, nil)
+        return v ~= nil and (v and "on" or "off") or nil
+    end
+    if kind == "num" then
+        local v = cfg:r_value("mcm", "xrrazom/" .. mcm_id, 2, nil)
+        return v and tostring(v) or nil
+    end
+    -- The name was stored quoted for CInifile; user.ltx is raw console lines.
+    local v = cfg:r_value("mcm", "xrrazom/" .. mcm_id, nil, nil)
+    if not v then return nil end
+    v = (v:match('^"(.*)"$') or v):match("^%s*(.-)%s*$")
+    return v ~= "" and v or nil
+end
+
+local _migrated_count = nil
+
+-- Registered as a module function, not a closure: the callback registry keys on
+-- the function object, so a fresh closure per launch could not be matched again.
+function persist_migration()
+    if not _migrated_count then return end
+    local n = _migrated_count
+    _migrated_count = nil
+
+    local cfg = axr_main and axr_main.config
+    if not cfg then return end
+    -- Not before the main menu: a cfg_save ahead of execUserScript() loading
+    -- user.ltx would write every console variable at its compiled default.
+    if n > 0 then
+        exec_console_cmd("cfg_save")
+        log("[xrRazom] settings: migrated " .. n .. " values from MCM")
+    end
+    -- The marker goes down either way, or a fresh install re-scans every launch.
+    cfg:w_value("xrrazom", "settings_migrated", true)
+    cfg:save()
+end
+
+-- The [mcm] xrrazom/* keys are only read, never removed: they are the rollback path.
+local function migrate_from_mcm()
+    local cfg = axr_main and axr_main.config
+    if not cfg then return end
+    if cfg:r_value("xrrazom", "settings_migrated", 1, false) then return end
+
+    local n = 0
+    for _, row in ipairs(MIGRATE) do
+        local value = migrated_value(cfg, row[1], row[3])
+        if value then
+            exec_console_cmd(row[2] .. " " .. value)
+            n = n + 1
+        end
+    end
+    _migrated_count = n
+    RegisterScriptCallback("main_menu_on_init", persist_migration)
+end
+
+function on_xml_read()
+    -- Vanilla exe / xrRazom dll absent: no variables to bind, so ship no page.
+    if not get_console_cmd(0, "xrr_player_name") then return end
+
+    migrate_from_mcm()
+
+    local base = ui_options.init_opt_base
+    ui_options.init_opt_base = function()
+        base()
+        -- Append, never insert: init_opt_coder addresses vanilla subtrees by
+        -- hardcoded index, and re-running it re-appends the whole radio playlist.
+        table.insert(ui_options.options, build_page())
+    end
+
+    xrr_ui_option_lock.install(ui_options, "UIOptions", lock_session_panel,
+                               "ui_xrr_session_host_owned")
+    install_medkit_row_dependency(ui_options.UIOptions)
+    inject_keybinds()
+end

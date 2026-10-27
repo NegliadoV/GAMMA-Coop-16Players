@@ -1,0 +1,153 @@
+--[[
+  xrRazom — peer m_data surrogate: a peer never saves, so the save_state / load_state
+  registry never fires for it. prime() and apply() fire it at session boundaries;
+  between them the engine sweeps the manifest keys off the live m_data.
+]]
+
+-- Top-level m_data keys that belong to the peer alone; a key absent here stays
+-- empty every session. Never list a key another channel replicates live — this
+-- blob applies last and would beat it.
+manifest = {
+	-- Skill System (haru_skills) — skill name → level.
+	"skills_levels",
+
+	-- Doom-like weapon inspection — section name → seen flag.
+	"inspected_weapons",
+
+	-- Psy health (arszi_psy).
+	"psy_table",
+
+	-- Body Health System head-injury state (zzz_player_injuries).
+	"head_tbl",
+
+	-- Undercover / Modular Tweaks disguise flag (gameplay_disguise).
+	"disguise_state",
+
+	-- Campfires seen on the map — keyed by world ids, valid on both machines.
+	"visited_campfires",
+
+	-- SortingPlus favourite / junk marks — keyed by item SECTION, not id.
+	"rax_favorite_itms",
+	"rax_junk_itms",
+
+	-- BaS NVG scope toggle.
+	"snk_bas_nvg_flag",
+
+	-- Per-weapon-section ADS / grenade-mode FOV overrides (scope_fov_mcm).
+	"snk_saved_hud_fov",
+	"snk_saved_gl_fov",
+
+	-- Radio tuning frequency (item_radio).
+	"RF_freq",
+
+	-- "Angered the garrison" flags (Bar peace zone, Duty outpost).
+	"gameplay_peace_zone",
+	"gameplay_duty_outpost_storage_data",
+
+	-- Artefact perk cooldowns (perk_based_artefacts), on a campaign-absolute timebase.
+	"perk_based_artefacts_cooldowns",
+}
+
+-- Keys whose table mixes peer-owned with host/transient state: key → the sub-keys
+-- that travel. An absent key travels whole.
+sub_filter = {}
+
+-- Call from on_game_start: the engine reads the manifest when the sweep arms.
+-- `subs` nil means the key travels whole.
+function register(key, subs)
+	for _, k in ipairs(manifest) do
+		if k == key then
+			if subs then sub_filter[key] = subs end
+			return
+		end
+	end
+	manifest[#manifest + 1] = key
+	sub_filter[key] = subs
+end
+
+-- Log per-sweep timing once a minute.
+dump_timing = false
+
+-- Log every tick send; off by default because skills_levels changes on every step.
+dump_sends = false
+
+-- The PSTOR codec's table recursion limit for this channel; the engine side
+-- passes the same 8. Deeper sub-tables serialise as nil, so the walk stops too.
+local MAX_DEPTH = 8
+
+-- CTime is the one userdata class vanilla supports inside m_data. The engine
+-- encodes it as { __xrr_ctime = <CTime_to_table> }; rebuild it here.
+local CTIME_TAG = "__xrr_ctime"
+
+local function decode_value(v, depth)
+	if type(v) ~= "table" then
+		return v
+	end
+	if v[CTIME_TAG] then
+		return utils_data.CTime_from_table(v[CTIME_TAG])
+	end
+	if depth <= 0 then
+		return v
+	end
+	local out = {}
+	for k, sub in pairs(v) do
+		out[k] = decode_value(sub, depth - 1)
+	end
+	return out
+end
+
+-- No Lua caller: the engine reads both in one call when the sweep arms, so the
+-- two cannot drift apart within a session.
+function xrr_peer_mdata_manifest()
+	return manifest, sub_filter
+end
+
+-- No Lua caller; needs a live world. Refreshes keys a mod rebuilds in save_state and
+-- aliases live tables into m_data for the sweep. Fired on the real m_data: mods
+-- read get_state(), not the callback argument.
+function xrr_peer_mdata_prime()
+	SendScriptCallback("save_state", alife_storage_manager.get_state())
+end
+
+-- No save_state fire here: at world-create those bodies would read a db.actor
+-- that does not exist yet.
+function xrr_peer_mdata_apply(surrogate)
+	local m = alife_storage_manager.get_state()
+
+	local n = 0
+	for _, key in ipairs(manifest) do
+		local v = surrogate[key]
+		if v ~= nil then
+			local subs = sub_filter[key]
+			if subs then
+				-- Merge, never replace: the rest of a filtered key is the half the peer
+				-- rebuilds locally (e.g. EF's nls_storage).
+				local live = m[key]
+				if type(live) ~= "table" then
+					live = {}
+					m[key] = live
+				end
+				for _, sub in ipairs(subs) do
+					if v[sub] ~= nil then
+						live[sub] = decode_value(v[sub], MAX_DEPTH - 1)
+					end
+				end
+			else
+				m[key] = decode_value(v, MAX_DEPTH)
+			end
+			n = n + 1
+		end
+	end
+	-- Every declared rider key gets a table before load_state, so each mod aliases
+	-- one the later riders reach.
+	if xrr_item_mdata_ensure_tables then xrr_item_mdata_ensure_tables(m) end
+	SendScriptCallback("load_state", m)
+	return n
+end
+
+_G.xrr_peer_mdata_apply    = xrr_peer_mdata_apply
+_G.xrr_peer_mdata_manifest = xrr_peer_mdata_manifest
+_G.xrr_peer_mdata_prime    = xrr_peer_mdata_prime
+
+-- Every m_data channel decodes here; all of them encode engine-side.
+_G.xrr_mdata_decode = decode_value

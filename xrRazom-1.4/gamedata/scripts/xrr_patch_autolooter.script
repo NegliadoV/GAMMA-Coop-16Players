@@ -1,0 +1,151 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Autolooter (GAMMA mod 294): the host refuses a peer's delete-leftovers
+  releases, so the peer asks the host to run the delete per container.
+]]
+
+local VERB = "autolooter:delete"
+
+local orig_handle_delete
+
+local function looter() return z_auto_looter end
+
+-- Host
+
+-- FDDA's body search would run its steps on a freed object.
+local function host_is_looting(id)
+    local gui = ui_inventory.GUI
+    if gui and gui:IsShown() and gui.npc_id == id then return true end
+    if lam2 and lam2.is_running and lam2.is_running() then
+        local a = lam2.get_current_action()
+        if a and a.obj_id == id then return true end
+        a = lam2.get_next_action and lam2.get_next_action()
+        if a and a.obj_id == id then return true end
+    end
+    return false
+end
+
+xrr_use_intent.register(VERB, function(obj_id, state, args, sender)
+    local al   = looter()
+    local cont = level.object_by_id(obj_id)
+    if not (al and orig_handle_delete and cont) then return end
+
+    local corpse = IsStalker(cont) and not cont:alive()
+    if not (corpse or IsInvbox(cont)) or al.is_placable_stash(cont) then
+        printf("![xrRazom][autolooter] delete of %s from %s refused: not a corpse or box",
+               tostring(obj_id), tostring(sender))
+        return
+    end
+
+    if host_is_looting(obj_id) then
+        printf("[xrRazom][autolooter] delete of %s from %s refused: the host is looting it",
+               tostring(obj_id), tostring(sender))
+        return
+    end
+
+    -- Not via the mod: its body branch closes the host's own loot window.
+    if corpse and al.config.delete_body then
+        local sim = alife()
+        local se  = sim:object(obj_id)
+        if se then sim:release(se) end
+        return
+    end
+
+    orig_handle_delete(cont)
+end)
+
+-- Peer
+
+local SETTLE_POLL_S   = 0.25
+local SETTLE_MIN_MS   = 1000   -- the unload has no resolve of its own: a round trip for its rounds
+local SETTLE_QUIET_MS = 500    -- the container unchanged for this long
+local SETTLE_MAX_MS   = 6000
+local pending_delete  = {}     -- container id → true while its wait runs
+
+local function contents_key(items)
+    local ids = {}
+    for id in pairs(items) do ids[#ids + 1] = id end
+    table.sort(ids)
+    return table.concat(ids, ",")
+end
+
+local function strips_inflight(items)
+    for id, item in pairs(items) do
+        if IsWeapon(item) and xrr_use_intent.is_inflight("wpo:fieldstrip", id) then
+            return true
+        end
+    end
+    return false
+end
+
+-- The mod looted before the host's unload, disassembly and strip mints came
+-- back; wait for the container to settle, loot again, then ask.
+local function request_delete_when_settled(al, cont)
+    local cont_id = cont:id()
+    if pending_delete[cont_id] then return end
+    pending_delete[cont_id] = true
+
+    local t0, last_key, quiet_since, looted = time_global(), nil, 0, false
+    CreateTimeEvent("xrr_autolooter", "delete_" .. cont_id, SETTLE_POLL_S, function()
+        local c = level.object_by_id(cont_id)
+        if not c then
+            pending_delete[cont_id] = nil
+            return true
+        end
+        if looted then
+            pending_delete[cont_id] = nil
+            xrr_use_intent.request{ verb = VERB, obj_id = cont_id }
+            return true
+        end
+        local now   = time_global()
+        local items = al.collect_items(c)
+        local key   = contents_key(items)
+        if key ~= last_key then last_key, quiet_since = key, now end
+
+        local settled = now - t0 >= SETTLE_MIN_MS and now - quiet_since >= SETTLE_QUIET_MS
+                        and not strips_inflight(items)
+        if not settled and now - t0 < SETTLE_MAX_MS then
+            ResetTimeEvent("xrr_autolooter", "delete_" .. cont_id, SETTLE_POLL_S)
+            return false
+        end
+
+        -- Takes flush from XrrNetManager::update but the request sends inline,
+        -- so the delete waits one poll to reach the host after the loot.
+        al.handle_loot(c)
+        looted = true
+        ResetTimeEvent("xrr_autolooter", "delete_" .. cont_id, SETTLE_POLL_S)
+        return false
+    end)
+end
+
+local function install()
+    local al = looter()
+    if not al then return end   -- no Autolooter in this install
+    if type(al.handle_delete) ~= "function" then
+        log("[xrRazom][autolooter] INSTALL WARNING: handle_delete missing — not patched")
+        return
+    end
+
+    orig_handle_delete = al.handle_delete
+    al.handle_delete = function(cont)
+        if not (cont and XrrIsConnected()) then return orig_handle_delete(cont) end
+
+        local cfg = al.config
+        if not (cfg.delete_body or cfg.delete_weapon or cfg.delete_armor or cfg.delete_misc) then
+            return
+        end
+
+        -- As the mod does; the host decides from the same host-authored config.
+        if cfg.delete_body and IsStalker(cont) and not cont:alive()
+           and ui_inventory.GUI and ui_inventory.GUI:IsShown() then
+            ui_inventory.GUI:Close()
+        end
+
+        request_delete_when_settled(al, cont)
+    end
+end
+
+-- File scope, ahead of any mod's on_game_start that could capture handle_delete.
+install()

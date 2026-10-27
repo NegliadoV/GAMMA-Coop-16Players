@@ -1,0 +1,21 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Experience Framework: a peer never saves, so its own progression rides the
+  peer m_data blob. nls_storage (NPC levels) is left out on purpose: the peer
+  rolls it locally per mirror, so it already disagrees with the host's and
+  carrying it would persist that.
+]]
+
+function on_game_start()
+    if not experience_core then return end
+
+    xrr_peer_mdata.register("experience_framework_savedata", {
+        "XP",
+        "skills_savedata",
+        "traits_savedata",
+        "tasks_manager",   -- the mod's own XP tasks, not quest tasks
+        "potion_xp_buff",
+    })
+end

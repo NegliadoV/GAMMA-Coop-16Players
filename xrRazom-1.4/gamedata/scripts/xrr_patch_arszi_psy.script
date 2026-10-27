@@ -1,0 +1,24 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  arszi_psy (GAMMA psy rework): its psy health has no reset once lethal, so a
+  revived player would be re-downed every second; revive lifts it off the floor.
+]]
+
+-- Must match arszi_psy's own lethal-write threshold.
+local PSY_LETHAL       = 0.001
+local PSY_REVIVE_FLOOR = 0.3  -- same fraction as XRR_WND_REVIVE_HP
+
+local function on_revived()
+    local psy = arszi_psy.get_psy_health()
+    if psy and psy <= PSY_LETHAL then
+        arszi_psy.set_psy_health(PSY_REVIVE_FLOOR)
+        printf("[xrRazom][arszi_psy] revived: psy %s -> %s", tostring(psy), tostring(PSY_REVIVE_FLOOR))
+    end
+end
+
+function on_game_start()
+    if not (arszi_psy and arszi_psy.get_psy_health and arszi_psy.set_psy_health) then return end
+    RegisterScriptCallback("xrr_on_actor_revived", on_revived)
+end

@@ -1,0 +1,90 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Host-authoritative fast-travel / backpack-travel options and group-action
+  session rules, riding the MCM authority overlay. Peers' travel modules
+  re-read on the on_option_change the delta handler already fires.
+]]
+
+local PREFIX = "options/"  -- keeps these keys clear of real MCM paths
+
+local DECLARED = {
+    "gameplay/fast_travel/state",
+    "gameplay/fast_travel/on_combat",
+    "gameplay/fast_travel/on_overweight",
+    "gameplay/fast_travel/on_damage",
+    "gameplay/fast_travel/on_emission",
+    "gameplay/fast_travel/long_names",
+    "gameplay/fast_travel/visit_message",
+    "gameplay/fast_travel/time",
+    "gameplay/backpack_travel/state",
+    "gameplay/backpack_travel/on_combat",
+    "gameplay/backpack_travel/on_overweight",
+    "gameplay/backpack_travel/on_damage",
+    "gameplay/backpack_travel/on_emission",
+    "gameplay/backpack_travel/time",
+}
+
+local _installed = false
+local _dirty_at  = nil
+local FLUSH_DELAY_MS = 250
+
+local function may_push()
+    return not (XrrIsConnected and XrrIsConnected())
+end
+
+local function push(path)
+    return xrr_mcm_authority.push_authored(ui_options.get, path, PREFIX .. path)
+end
+
+-- ui_options.get can't reach these: their page is appended without re-running
+-- init_opt_coder, so they are read from their cvars.
+local function push_session_rules()
+    local mcm = XrrMcm()
+    local r = tonumber(get_console_cmd(0, "xrr_gather_radius"))
+    if r then mcm:AuthoritySetNumber(PREFIX .. "xrrazom/xrr_session/gather_radius", r) end
+    mcm:AuthoritySetBool(PREFIX .. "xrrazom/xrr_session/party_fast_travel",
+                         get_console_cmd(1, "xrr_party_fast_travel") and true or false)
+    mcm:AuthoritySetBool(PREFIX .. "xrrazom/xrr_session/rescue",
+                         get_console_cmd(1, "xrr_rescue") and true or false)
+    mcm:AuthoritySetBool(PREFIX .. "xrrazom/xrr_session/rescue_medkit",
+                         get_console_cmd(1, "xrr_rescue_medkit") and true or false)
+end
+
+-- C++ drops unchanged values, so the flush carries only the delta.
+local function collect()
+    for _, path in ipairs(DECLARED) do push(path) end
+    push_session_rules()
+    XrrMcm():AuthorityFlush()
+end
+
+-- Carries no argument, so every unrelated Apply fires it too: defer the sweep.
+local function on_option_change()
+    _dirty_at = time_global()
+end
+
+local function actor_on_update()
+    if not _dirty_at then return end
+    if time_global() - _dirty_at < FLUSH_DELAY_MS then return end
+    _dirty_at = nil
+    if may_push() then collect() end
+end
+
+local function should_lock(curr_tree)
+    if not (XrrIsConnected and XrrIsConnected()) then return false end
+    return curr_tree.id == "fast_travel" or curr_tree.id == "backpack_travel"
+end
+
+-- Must run after xrr_mcm_authority installs.
+function apply()
+    if _installed then return end
+    if not XrrNet then return end
+    _installed = true
+
+    if may_push() then collect() end
+    RegisterScriptCallback("on_option_change", on_option_change)
+    RegisterScriptCallback("actor_on_update", actor_on_update)
+    xrr_ui_option_lock.install(ui_options, "UIOptions", should_lock, "ui_xrr_travel_host_owned")
+    log("[xrRazom] travel settings authority: installed")
+end

@@ -1,0 +1,38 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Guitar Animation (GAMMA mod 382): guitar_a/harmonica_a bypass itms_manager's
+  broadcasting use_guitar/use_harmonica, so only their player heard the song.
+]]
+
+-- Wraps the mod's play step, which runs after its draw delay: the avatar starts with the player.
+local function announcing(orig, motion, section)
+    return function(...)
+        local real = sound_object
+        local track, snd
+        -- Swapped for this one synchronous call to learn which track the mod picks.
+        _G.sound_object = function(name, ...)
+            track, snd = name, real(name, ...)
+            return snd
+        end
+        local ok, err = pcall(orig, ...)
+        _G.sound_object = real
+        if not ok then error(err, 0) end
+
+        if snd and XrrSessionActive then
+            XrrPlayers():SendPeerAnimLoopItem(motion, snd:length() / 1000, track, section)
+        end
+    end
+end
+
+-- `section` is the item the mod's ltx routes to `fn`; the avatar's prop comes from it.
+local function install(mod, fn, motion, section)
+    if not (mod and type(mod[fn]) == "function") then return end
+    mod[fn] = announcing(mod[fn], motion, section)
+end
+
+-- File scope (pass 1): ahead of any mod capturing these in its own on_game_start.
+-- Outside GAMMA the modules are nil and nothing is installed.
+install(guitar_anim,    "play_guitar",    "guitar_0",    "guitar_a")
+install(harmonica_anim, "play_harmonica", "harmonica_0", "harmonica_a")

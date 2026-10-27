@@ -1,0 +1,104 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Help-wounded dialogs: the heal's effects on the NPC are host-authoritative,
+  so a peer consumes its own item and forwards the rest to the host.
+]]
+
+local MEDKITS = { "medkit", "medkit_army", "medkit_scientic" }  -- vanilla's search order
+
+-- nil when unresolved, so the relation is skipped rather than given to the host.
+local function acting_peer_proxy()
+    local conn = _G.xrr_quest_accept_conn
+    if not conn then return nil end
+    local pid = XrrPlayers():GetPeerLocalIdByConn(conn)
+    if not (pid and pid > 0) then return nil end
+    return level.object_by_id(pid)
+end
+
+-- Vanilla dialogs.transfer_medkit minus the consumption, relation aimed at the peer.
+local function host_help_medkit(npc_host_id)
+    local npc = npc_host_id and level.object_by_id(npc_host_id)
+    if not npc or not npc:alive() then
+        printf("[xrRazom][wounded] __help_wounded HOST: npc %s not online/alive", tostring(npc_host_id))
+        return
+    end
+    xr_wounded.unlock_medkit(npc)
+    if not npc:object("medkit_script") then
+        alife_create_item("medkit_script", npc)
+    end
+    local proxy = acting_peer_proxy()
+    printf("[xrRazom][wounded] __help_wounded HOST npc=%s proxy=%s",
+        tostring(npc_host_id), proxy and proxy:name() or "nil")
+    if proxy then
+        if npc:relation(proxy) >= game_object.enemy then
+            npc:set_relation(game_object.neutral, proxy)
+        else
+            npc:set_relation(game_object.friend, proxy)
+        end
+    end
+end
+
+-- Likewise for transfer_bandage, which has no wound-manager unlock in vanilla either.
+local function host_help_bandage(npc_host_id)
+    local npc = npc_host_id and level.object_by_id(npc_host_id)
+    if not npc or not npc:alive() then
+        printf("[xrRazom][wounded] __help_wounded_bandage HOST: npc %s not online/alive", tostring(npc_host_id))
+        return
+    end
+    alife_create_item("bandage", npc)
+    local proxy = acting_peer_proxy()
+    if proxy then
+        npc:set_relation(game_object.friend, proxy)
+    end
+end
+
+function on_game_start()
+    _G.xrr_story_quest_handlers = _G.xrr_story_quest_handlers or {}
+
+    -- Registered on both machines but only ever fires on the host.
+    _G.xrr_story_quest_handlers["__help_wounded"]         = host_help_medkit
+    _G.xrr_story_quest_handlers["__help_wounded_bandage"] = host_help_bandage
+
+    if XrrIsHost() then return end
+
+    local function consume_own(sections)
+        for i = 1, #sections do
+            if db.actor:object(sections[i]) then
+                itms_manager.relocate_item_from_actor(db.actor, nil, sections[i])
+                return
+            end
+        end
+    end
+
+    local function forward(pseudo_id)
+        local host_id = xrr_pending_npc_lock_host_id()
+        if not (host_id and host_id > 0 and host_id < 65535) then
+            printf("[xrRazom][wounded] %s PEER: no lock host_id, dropping", pseudo_id)
+            return
+        end
+        printf("[xrRazom][wounded] %s PEER -> SendQuestAccept npc=%s", pseudo_id, tostring(host_id))
+        XrrAlife():SendQuestAccept(pseudo_id, host_id)
+    end
+
+    local function peer_transfer_medkit(first_speaker, second_speaker)
+        consume_own(MEDKITS)
+        forward("__help_wounded")
+        game_statistics.increment_statistic("wounded_helped")
+    end
+
+    dialogs.transfer_medkit = peer_transfer_medkit
+    -- Vanilla counts wounded_helped for transfer_medkit only.
+    dialogs.transfer_medkit_to_hip = function(first_speaker, second_speaker)
+        consume_own(MEDKITS)
+        forward("__help_wounded")
+    end
+
+    dialogs.transfer_bandage = function(first_speaker, second_speaker)
+        consume_own({ "bandage" })
+        forward("__help_wounded_bandage")
+    end
+
+    log("[xrRazom] wounded sync: help-wounded dialog actions delegated to host")
+end

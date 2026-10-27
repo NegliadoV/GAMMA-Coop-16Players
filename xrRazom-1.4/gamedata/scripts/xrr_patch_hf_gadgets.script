@@ -1,0 +1,272 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+
+  Gadgets for Hideout Furniture (DoktorDauerfeuer): harvester storage and showcase
+  displays are host entities a peer could not reach; both go through use-intent.
+  Two weapon_showcase.script copies ship in the modlist; this wraps Gadgets', the
+  load-order winner — re-check on a Gadgets update.
+]]
+
+-- se_object[harvester_id] key carrying the box's id: no channel carries that link.
+local KEY = "xrr_harv_stash_id"
+
+-- The mod's STASH_EVENT_NS: the deferred box-open open_harvester_stash queues.
+local OPEN_NS = "hf_artifact_harvester_stash"
+
+-- se_object[case_id] key carrying one showcase's display map. Mounts run host-side:
+-- a peer's gated alife_create_item returns nil, which the mod derefs unguarded.
+local DKEY = "xrr_ws_display"
+
+local _applied = false
+
+local _orig_open_stash
+local _orig_spawn_display, _orig_remove_display, _orig_respawn
+
+-- Peer
+
+-- No mirror_fn: a peer that knew the box link would have
+-- artifact_harvester_wrapper:net_destroy release the box on every offline switch.
+local peer_resolve = xrr_use_intent.linked_box_resolver(KEY)
+
+local function peer_open_harvester_stash(harvester_id)
+    xrr_use_intent.request{
+        verb = "hf:harvester_stash", obj_id = harvester_id, state = true,
+        resolve = peer_resolve,
+        on_ready = xrr_use_intent.open_box_when_online,
+    }
+end
+
+local function ws_tables()
+    local ws = weapon_showcase
+    ws.weapon_displays         = ws.weapon_displays or {}
+    ws.weapon_display_slots    = ws.weapon_display_slots or {}
+    ws.weapon_display_sections = ws.weapon_display_sections or {}
+    return ws.weapon_displays, ws.weapon_display_slots, ws.weapon_display_sections
+end
+
+-- One case's map on the wire: "item_id:world_id:slot:section" per entry.
+local function encode_displays(case_id)
+    local guns, slots, secs = ws_tables()
+    local case = guns[case_id]
+    if not case then return "" end
+    local cslots, csecs = slots[case_id] or {}, secs[case_id] or {}
+    local f = {}
+    for item_id, world_id in pairs(case) do
+        local slot = ""
+        for s, id in pairs(cslots) do
+            if id == world_id then slot = tostring(s) break end
+        end
+        f[#f + 1] = tostring(item_id) .. ":" .. tostring(world_id) .. ":"
+            .. slot .. ":" .. (csecs[item_id] or "")
+    end
+    return table.concat(f, "|")
+end
+
+local function apply_displays(case_id, blob)
+    local guns, slots, secs = ws_tables()
+    if blob == "" then
+        guns[case_id], slots[case_id], secs[case_id] = nil, nil, nil
+        return
+    end
+    local g, sl, sc = {}, {}, {}
+    for _, entry in ipairs(str_explode(blob, "|", true)) do
+        local f = str_explode(entry, ":", true)
+        local item_id, world_id = tonumber(f[1]), tonumber(f[2])
+        if item_id and world_id then
+            g[item_id] = world_id
+            local slot = tonumber(f[3])
+            if slot then sl[slot] = world_id end
+            if f[4] and f[4] ~= "" then sc[item_id] = f[4] end
+        end
+    end
+    guns[case_id], slots[case_id], secs[case_id] = g, sl, sc
+end
+
+-- Applying inside the resolve is the point: while a request is pending, the poll
+-- is the peer's only pump for the bridge key.
+local function display_resolver(case_id, item_id, want_mounted)
+    return function()
+        local blob = se_load_var(case_id, nil, DKEY)
+        if blob == nil then return nil end
+        apply_displays(case_id, blob)
+        local guns = weapon_showcase.weapon_displays or {}
+        local mounted = (guns[case_id] and guns[case_id][item_id]) ~= nil
+        if mounted == want_mounted then return blob end
+        return nil
+    end
+end
+
+local function peer_spawn_display(case_id, item_id, item_sec)
+    xrr_use_intent.request{
+        verb = "hf:showcase_mount", obj_id = item_id, state = 1,
+        args = tostring(case_id) .. "|" .. (item_sec or ""),
+        resolve = display_resolver(case_id, item_id, true),
+    }
+    return nil   -- as the gated vanilla create returns; callers tolerate it
+end
+
+local function peer_remove_display(item_id, case_id)
+    xrr_use_intent.request{
+        verb = "hf:showcase_mount", obj_id = item_id, state = 0,
+        args = tostring(case_id),
+        resolve = display_resolver(case_id, item_id, false),
+    }
+    return true
+end
+
+local _seen_display_blob = {}
+
+local function resweep_displays(pos, radius)
+    local cases = weapon_showcase.valid_stash or {}
+    level.iterate_nearest(pos, radius, function(o)
+        if not (o and cases[o:section()]) then return false end
+        local id   = o:id()
+        local blob = se_load_var(id, nil, DKEY)
+        if blob ~= nil and blob ~= _seen_display_blob[id] then
+            _seen_display_blob[id] = blob
+            printf("[xrRazom][ws] case %s map -> '%s'", tostring(id), blob)
+            apply_displays(id, blob)
+        end
+        return false
+    end)
+end
+
+-- Host
+
+-- Run the mod's own open_harvester_stash (only it writes the box↔harvester
+-- mapping), then drop the box-open it queued — the box belongs to the requester.
+-- The open sound is left playing; it is positional.
+local function host_harvester_stash(harvester_id)
+    if not level.object_by_id(harvester_id) then
+        printe("![xrRazom][use] hf:harvester_stash obj=%s: harvester offline host-side — refused",
+            tostring(harvester_id))
+        return
+    end
+    _orig_open_stash(harvester_id)
+    RemoveTimeEvent(OPEN_NS, "open_" .. tostring(harvester_id))
+
+    -- The mod's own save hook is what publishes harvester_stashes into m_data;
+    -- reading it any other way can see a stale table.
+    local m_data = alife_storage_manager.get_state()
+    bind_artifact_harvester.harvester_save_state(m_data)
+    local stash_id = m_data.harvester_stashes and m_data.harvester_stashes[harvester_id]
+    if not stash_id then
+        printe("![xrRazom][use] hf:harvester_stash obj=%s: no box after open_harvester_stash",
+            tostring(harvester_id))
+        return
+    end
+    xrr_use_intent.host_bridge(harvester_id, KEY, stash_id)
+end
+
+-- state: 1 mount, 0 unmount. obj_id is the ITEM so two mounts onto one case in
+-- quick succession don't dedupe against each other.
+local function host_showcase_mount(item_id, state, args, sender_netid)
+    local f = str_explode(args or "", "|", true)
+    local case_id = tonumber(f[1])
+    if not case_id then
+        printe("![xrRazom][use] hf:showcase_mount item=%s: bad args '%s' — refused",
+            tostring(item_id), tostring(args))
+        return
+    end
+    if state ~= 0 then
+        local sec = (f[2] and f[2] ~= "") and f[2] or nil
+        _orig_spawn_display(case_id, item_id, nil, sec)
+    else
+        local guns = weapon_showcase.weapon_displays or {}
+        local world_id = guns[case_id] and guns[case_id][item_id]
+        if world_id then _orig_remove_display(item_id, world_id, case_id) end
+    end
+    xrr_use_intent.host_bridge(case_id, DKEY, encode_displays(case_id))
+end
+
+-- The host's own mounts publish the map too; the peer has no other source.
+local function host_spawn_display(case_id, item_id, gun_number, item_sec)
+    local world_id = _orig_spawn_display(case_id, item_id, gun_number, item_sec)
+    xrr_use_intent.host_bridge(case_id, DKEY, encode_displays(case_id))
+    return world_id
+end
+
+local function host_remove_display(item_id, world_item_id, case_id)
+    local ok = _orig_remove_display(item_id, world_item_id, case_id)
+    xrr_use_intent.host_bridge(case_id, DKEY, encode_displays(case_id))
+    return ok
+end
+
+function on_game_start()
+    if _applied then return end
+    -- Harvester and showcase are separate features; either can be absent alone.
+    local has_harvester = bind_artifact_harvester
+        and bind_artifact_harvester.open_harvester_stash
+        and bind_artifact_harvester.harvester_save_state
+    local has_showcase = weapon_showcase
+        and weapon_showcase.spawn_displayed_item
+        and weapon_showcase.remove_displayed_item
+    if not (has_harvester or has_showcase) then return end
+    _applied = true
+
+    if has_harvester then
+        _orig_open_stash = bind_artifact_harvester.open_harvester_stash
+        xrr_use_intent.register("hf:harvester_stash", host_harvester_stash)
+    end
+
+    if has_showcase then
+        _orig_spawn_display  = weapon_showcase.spawn_displayed_item
+        _orig_remove_display = weapon_showcase.remove_displayed_item
+        xrr_use_intent.register("hf:showcase_mount", host_showcase_mount)
+    end
+
+    if has_harvester then
+        function bind_artifact_harvester.open_harvester_stash(obj_id)
+            if not XrrIsClient() then return _orig_open_stash(obj_id) end
+            peer_open_harvester_stash(obj_id)
+        end
+    end
+
+    if has_showcase then
+        function weapon_showcase.spawn_displayed_item(case_id, item_id, gun_number, item_sec)
+            if not XrrIsClient() then
+                return host_spawn_display(case_id, item_id, gun_number, item_sec)
+            end
+            return peer_spawn_display(case_id, item_id, item_sec)
+        end
+
+        function weapon_showcase.remove_displayed_item(item_id, world_item_id, case_id)
+            if not XrrIsClient() then
+                return host_remove_display(item_id, world_item_id, case_id)
+            end
+            return peer_remove_display(item_id, case_id)
+        end
+
+        -- Nothing tells Lua when a bridge key changes, so the map is re-read when a
+        -- display spawns nearby. A late map lets a peer pick up a free copy:
+        -- actor_on_item_before_pickup refuses only the displays the map names.
+        if XrrIsClient() then
+            xrr_register_cleanup(function() _seen_display_blob = {} end)
+
+            -- Weapons only: keeps a level load's spawn burst off the spatial query.
+            RegisterScriptCallback("game_object_on_net_spawn", function(obj)
+                if not (obj and IsWeapon(obj)) then return end
+                resweep_displays(obj:position(), 5)
+            end)
+
+            -- Slow fallback for map changes with no entity behind them — an
+            -- unmount, or a display that onlined before its case did.
+            CreateTimeEvent("xrr_ws", "display_pump", 5, function()
+                if db.actor then resweep_displays(db.actor:position(), 30) end
+                ResetTimeEvent("xrr_ws", "display_pump", 5)
+                return false
+            end)
+        end
+
+        -- Re-minting on a peer would release host-owned display entities. A peer
+        -- reloading before on_game_start() still gets one vanilla pass here (the
+        -- time event captured load_state by value); the wraps above keep it inert.
+        if weapon_showcase.respawn_weapon_displays then
+            _orig_respawn = weapon_showcase.respawn_weapon_displays
+            function weapon_showcase.respawn_weapon_displays()
+                if XrrIsClient() then return true end
+                return _orig_respawn()
+            end
+        end
+    end
+end

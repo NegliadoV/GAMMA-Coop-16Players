@@ -1,0 +1,25 @@
+; CActor-derived peer avatar (class CXrrPeerAvatar). Inherits the full [actor]
+; parameter set (camera, conditions, immunities, damage) — the class reads them
+; exactly like the real player. script_binding = deliberate no-op:
+; bind_stalker.actor_init on a second actor would clobber db.actor, and an
+; empty value feeds "" to CScriptBinder's functor lookup (error per spawn).
+; character_profile actor_stalker puts every avatar in one community;
+; per-faction variants are a relations concern, still open.
+[xrr_avatar]:actor
+class             = XRRAVATR
+script_binding    = xrr_core.bind_avatar
+character_profile = actor_stalker
+
+; ── Squad-registry map beacon ────────────────────────────────────────────────
+; Inert offline se-object the peer materializes for a same-level, policy-passing
+; squad that has NO commander mirror (the squad is off every player's bubble).
+; SQUAD_REGISTRY MOVE deltas keep its graph position fresh, and unmodified
+; CMapLocation machinery renders the squad-leader spot from it — exactly as
+; vanilla renders an offline squad's spot from the commander's se-object.
+;
+; Inherits space_restrictor (class SPC_RS_S = no visual, no AI, no physics
+; collision). The peer pins it in C++ (xrr_squad_sync.cpp ensure_beacon):
+; can_switch_online(false) so it never onlines / never runs bind_restrictor,
+; and flCanSave=FALSE so it never enters a peer save — it is re-derived from the
+; registry every session and dies with the level's a-life on a transition.
+[xrr_squad_beacon]:space_restrictor

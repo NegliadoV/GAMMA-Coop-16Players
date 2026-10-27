@@ -1,0 +1,117 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Wounded / rescue: the state lives in C++; this file blocks input while the
+  local player is down and handles the rescue's Lua-side edges.
+]]
+
+-- Movement, mouse-look, torch and NV deliberately stay live while wounded.
+local BLOCKED = {}
+
+local function build_blocklist()
+    local names = {
+        "kINVENTORY", "kARTEFACT", "kNEXT_SLOT", "kPREV_SLOT", "kUSE", "kDROP",
+        "kACTIVE_JOBS", "kCAM_1", "kCAM_2", "kCAM_3",
+        "kWPN_1", "kWPN_2", "kWPN_3", "kWPN_4", "kWPN_5", "kWPN_6",
+        "kQUICK_USE_1", "kQUICK_USE_2", "kQUICK_USE_3", "kQUICK_USE_4",
+    }
+    for _, n in ipairs(names) do
+        local bind = key_bindings[n]
+        if bind then BLOCKED[bind] = true end
+    end
+end
+
+-- C++ owns the flag; key events are rare enough for a facade call each.
+local function is_wounded()
+    return XrrNet and XrrPlayers():IsLocalWounded()
+end
+
+local function on_before_key_press(dik, bind, dis, flags)
+    if is_wounded() then
+        if BLOCKED[bind] then flags.ret_value = false end
+        return
+    end
+    -- Rescue hold: intercept kUSE only while aiming at a downed teammate in
+    -- range (C++ validates); swallowing keeps ActorUse (talk/search) quiet.
+    if bind == key_bindings.kUSE and XrrPlayers():RescueKeyDown() then
+        flags.ret_value = false
+    end
+end
+
+local function on_before_key_hold(dik, bind, dis, flags)
+    if is_wounded() and BLOCKED[bind] then
+        flags.ret_value = false
+    end
+end
+
+local function on_before_key_release(dik, bind, dis, flags)
+    if bind == key_bindings.kUSE and XrrNet then
+        XrrPlayers():RescueKeyUp()
+    end
+end
+
+-- Fired when the local player is back up: (reason, medkit_section) — 0 = rescued
+-- (medkit_section names what was spent, "" for a rescue without one), 1 =
+-- self-recovery (section ""). Mods
+-- with their own lethal-health state should hook here: a rescue never dies.
+AddScriptCallback("xrr_on_actor_revived")
+
+-- The engine calls these by name.
+
+-- Local player went down: close anything the input blocks would strand open.
+function on_wounded_enter(cause)
+    hide_hud_inventory()
+    hide_hud_pda()
+    if db.actor and db.actor:is_talking() then
+        db.actor:stop_talk()
+    end
+end
+
+-- reason: 0 rescued, 1 self-recovered, 2 died, 3 state dropped without a revive.
+function on_wounded_exit(reason, medkit_section)
+    if reason == 0 or reason == 1 then
+        SendScriptCallback("xrr_on_actor_revived", reason, medkit_section or "")
+    end
+end
+
+function on_peer_wounded(nick)
+    if not db.actor then return end
+    news_manager.send_tip(db.actor,
+        string.format(game.translate_string("st_xrr_news_down"), nick), nil, nil, 8000)
+end
+
+function on_peer_recovered(nick, rescuer_nick, reason)
+    if not db.actor then return end
+    local msg
+    if reason == 0 and rescuer_nick ~= "" then
+        msg = string.format(game.translate_string("st_xrr_news_rescued"), nick, rescuer_nick)
+    elseif reason == 2 then                          -- the death news flow covers it
+        return
+    else
+        msg = string.format(game.translate_string("st_xrr_news_recovered"), nick)
+    end
+    news_manager.send_tip(db.actor, msg, nil, nil, 8000)
+end
+
+-- Granted rescue: consume the promised medkit (picked cheapest at request
+-- time); fall back to any rescue medkit if that section vanished meanwhile.
+function on_rescue_granted(section)
+    if not db.actor then return end
+    local candidates = { section, "medkit", "medkit_army", "medkit_scientic" }
+    for i = 1, #candidates do
+        local s = candidates[i]
+        if s and s ~= "" and db.actor:object(s) then
+            itms_manager.relocate_item_from_actor(db.actor, nil, s)
+            return
+        end
+    end
+    printf("![xrRazom][wounded] on_rescue_granted: no medkit left to consume (%s)", tostring(section))
+end
+
+function on_game_start()
+    build_blocklist()
+    RegisterScriptCallback("on_before_key_press", on_before_key_press)
+    RegisterScriptCallback("on_before_key_hold", on_before_key_hold)
+    RegisterScriptCallback("on_before_key_release", on_before_key_release)
+end

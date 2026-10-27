@@ -1,0 +1,39 @@
+--[[
+  xrRazom — the host→peer world m_data mirror.
+
+  A peer never saves, so load_state leaves its m_data WORLD registries empty.
+  C++ broadcasts each manifest key out of the host's live m_data on change; the
+  host copy is authoritative.
+]]
+
+-- WORLD-class m_data keys the host owns and peers only read.
+manifest = {
+	-- Player-deployed stashes, id → item section (Craft From Stashes et al.).
+	"player_created_stashes",
+
+	-- Hideout Furniture workbench → its hidden box; mods walk the whole table.
+	"workshop_stashes",
+}
+
+-- Must match VALUE_DEPTH engine-side — both walks bottom out together or the
+-- peer decodes a table the host truncated.
+local MAX_DEPTH = 8
+
+-- The manifest as a flat array — C++ reads it once when the rotation arms.
+function xrr_world_mdata_manifest()
+	return manifest
+end
+
+-- Peer: replaced wholesale with no callback or merge; a peer-local edit is
+-- meant to be overwritten on the next rotation.
+function xrr_world_mdata_apply(key, value)
+	local m = alife_storage_manager.get_state()
+	if value ~= nil then
+		m[key] = xrr_mdata_decode(value, MAX_DEPTH)
+	else
+		m[key] = nil
+	end
+end
+
+_G.xrr_world_mdata_manifest = xrr_world_mdata_manifest
+_G.xrr_world_mdata_apply    = xrr_world_mdata_apply

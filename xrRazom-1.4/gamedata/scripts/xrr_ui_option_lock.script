@@ -1,0 +1,94 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Read-only lock for an options panel whose values this machine does not own.
+  The panel stays visible; disabled controls never populate opt_temp, so Apply
+  and Default no-op.
+]]
+
+-- The control registries are emptied at the top of every Reset_opt, so once it
+-- returns they hold exactly the panel just rendered.
+local CTL_REGISTRIES = { "_Track", "_Check", "_List", "_Input", "_Radio" }
+
+local function disable_ctl(c)
+    local t = type(c)
+    if t == "userdata" then
+        if c.Enable then c:Enable(false) end
+    elseif t == "table" then
+        -- _Track entries are tables of controls plus strings; recurse.
+        for _, sub in pairs(c) do disable_ctl(sub) end
+    end
+end
+
+local function lock_panel_controls(dlg)
+    for _, name in ipairs(CTL_REGISTRIES) do
+        local reg = dlg[name]
+        if type(reg) == "table" then
+            for _, c in pairs(reg) do disable_ctl(c) end
+        end
+    end
+end
+
+local _checks_captured = {}
+
+-- Register_Check keeps no handle on its control and never fills _Check; the
+-- control is reachable only as the argument of the Register call it makes.
+-- Keyed "<path>/<option id>".
+local function set_register(dlg, fn) dlg.Register = fn end
+
+local function capture_checks(cls)
+    local orig = cls.Register_Check
+    if not orig or _checks_captured[cls] then return end
+    _checks_captured[cls] = true
+
+    cls.Register_Check = function(self, xml, handler, path, opt, ...)
+        local register = self.Register
+        local function capture(wnd, ctrl, id)
+            self._Check[tostring(path) .. "/" .. tostring(opt)] = ctrl
+            return register(wnd, ctrl, id)
+        end
+        -- A dialog that refuses the instance shadow renders as before, uncaptured.
+        if not pcall(set_register, self, capture) then
+            return orig(self, xml, handler, path, opt, ...)
+        end
+        local ok, h = pcall(orig, self, xml, handler, path, opt, ...)
+        -- Not nil: the instance slot must keep answering if a nil does not unshadow.
+        set_register(self, register)
+        if not ok then error(h, 0) end
+        return h
+    end
+end
+
+-- Chaining several installs is safe only while the panels they claim are disjoint.
+function install(ui_module, class_name, should_lock, note_key)
+    local cls = ui_module and ui_module[class_name]
+    if not (cls and cls.Reset_opt) then
+        log("[xrRazom] option lock: " .. tostring(class_name) .. ".Reset_opt missing — skipped")
+        return
+    end
+    capture_checks(cls)
+
+    local note = { id = "xrr_locked_note", type = "desc",
+                   text = note_key, clr = { 255, 200, 75, 75 } }
+    local orig_reset = cls.Reset_opt
+
+    cls.Reset_opt = function(self, curr_tree, path, flags)
+        if not (curr_tree and should_lock(curr_tree, path)) then
+            return orig_reset(self, curr_tree, path, flags)
+        end
+        -- Strip presets for this render only: a preset click fills opt_temp for
+        -- the whole panel. The tree is shared with solo play — restore it after.
+        local saved_presets = curr_tree.presets
+        curr_tree.presets = nil
+        table.insert(curr_tree.gr, 1, note)
+        local ok, err = pcall(orig_reset, self, curr_tree, path, flags)
+        if curr_tree.gr[1] == note then table.remove(curr_tree.gr, 1) end
+        curr_tree.presets = saved_presets
+        if not ok then
+            log("[xrRazom] option lock: Reset_opt failed on locked panel: " .. tostring(err))
+            return
+        end
+        lock_panel_controls(self)
+    end
+end

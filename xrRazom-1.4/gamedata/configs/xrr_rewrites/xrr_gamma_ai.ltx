@@ -1,0 +1,111 @@
+; xrRazom — GAMMA's AI stack, made to see more than one player.
+;
+; Three mod-owned scripts that each assume "the player" is id 0 and that there
+; is exactly one of them. Every site below is a literal or a table key the
+; scoped identity swaps in xrr_patch_common structurally cannot reach.
+;
+; Nothing here matches on plain Anomaly: the base visual_memory_manager.script
+; is 18 lines and holds none of these strings, the base xr_danger.script has no
+; `killer:id() == 0`, and schemes_ai_gamma is mod-only. A miss logs INSTALL
+; FAILED and the file runs untouched, so this deploys safely to every install.
+;
+; Diagnosis by Nito (GAMMA AI multiplayer compatibility pack). Their two
+; wrapper scripts are deliberately not imported: the hit wrapper collapses to
+; the one row below, the hearing wrapper is unreachable (see [xr_danger]), and
+; the stealth one wraps get_visible_value a second time on top of
+; xrr_patch_stealth.
+;
+; Pairs are applied in ascending N over a progressively rewritten buffer, each
+; exactly once. The invariant to keep when editing: no from_N may match text an
+; earlier to_M introduced. (to_5 does contain its own from_5 verbatim, which is
+; harmless only because a pair is applied once and nothing searches after it —
+; do not add a later pair looking for that text.)
+
+; ── G.A.M.M.A. AI Rework ─────────────────────────────────────────────────────
+; A squad turning on the player who killed one of its own. Useful Idiots owns
+; is_danger and clears the way this far already — its corpse branch resolves the
+; killer through db.storage and asks IsStalker, both of which xrr_patch_common
+; answers for an avatar (evaluator_danger:evaluate runs under the proxy swap,
+; character_community is patched globally). These two literals are the last step
+; that still refuses a peer.
+;
+; ⚠ Load-bearing and easy to miss: the killer lookup is
+; `db.storage[death_by_id].object`, and the ONLY writer of db.storage for a peer
+; avatar is the helicopter-target poll in xrr_callbacks.script (bind_avatar is a
+; deliberate no-op). Delete that poll and this path goes quietly inert. The poll
+; runs every 1.5 s, so a kill inside the first window resolves on a later think
+; rather than immediately.
+[xr_danger]
+; Corpse investigation, stage 2: the squad force_set_goodwill's the killer.
+from_1 = "st.stage >= 2 and killer and killer:id() == 0"
+to_1   = "st.stage >= 2 and killer and XrrIsPlayerId(killer:id())"
+
+; Corpse investigation, already-hostile killer: make_object_visible_somewhen.
+from_2 = "elseif (killer and killer:id() == 0"
+to_2   = "elseif (killer and XrrIsPlayerId(killer:id())"
+
+; NOT rewritten: npc_on_hear_callback's player branch. It gates on
+; `s_type == "WPN_hit"`, and SOUND_TYPE_WEAPON_BULLET_HIT has only readers in
+; the engine — nothing ever plays a sound of that type, so the branch is dead
+; for every player, host included.
+
+; ── G.A.M.M.A. AI Rework: hit bookkeeping ────────────────────────────────────
+; verification_npc[npc] counts toward 15 and gates the camper/cover branch that
+; xrr_patch_ai_rework already teaches to see an avatar as its enemy; being shot
+; resets it to 0. xr_motivator sends npc_on_hit_callback with no IsStalker gate
+; on `who`, so a peer's hit arrives here — it just isn't recognised as a player.
+[schemes_ai_gamma]
+from_1 = "if who:id() == AC_ID then"
+to_1   = "if XrrIsPlayerId(who:id()) then"
+
+; ── Stealth Overhaul visibility bookkeeping ──────────────────────────────────
+; The live copy of visual_memory_manager.script is 290- Atmospherics Shaders
+; Weathers and Reshade (resolved against the flattened MO2 merge, NOT Stealth
+; Overhaul's own copy as one might assume) — but all five sites are byte-
+; identical in all three shipped variants, so a merge-order change does not
+; strand these rows.
+;
+; Both tables are keyed by the observing NPC alone, which is correct while there
+; is exactly one player and wrong the moment there are two. get_visible_value
+; runs per NPC per target per think, so the gate is the plain XrrPeerCount
+; global (C++ keeps it current) and the composite key is arithmetic — a string
+; key would allocate on that path. Ids are u16, so npc*65536+who is exact and
+; collision-free.
+;
+; The gate is peers present, not hosting: these are the mod's own bugs and they
+; are wrong in single-player too, but fixing SP is not ours to do, and a host
+; waiting alone in the menu is single-player for this purpose. `marked` is
+; never iterated, sized or saved (three touch points in the whole file), so
+; changing its key encoding is invisible to everything else.
+;
+; ⚠ This changes the HOST's experience too, not just the peer's: an NPC the
+; peer shot no longer lights the host up. That is the fix, and it is what the
+; in-game test should look for — shoot an NPC as the peer, and the host should
+; NOT become instantly visible to it while the peer should.
+[visual_memory_manager]
+; Remembering a newly-seen target wiped every other target this NPC remembered,
+; so two players each erased the other's vision memory on every fresh sighting.
+from_1 = "vision_memory[npc:id()] = {}"
+to_1   = "vision_memory[npc:id()] = XrrPeerCount > 0 and vision_memory[npc:id()] or {}"
+
+; A mark means "this NPC was shot by a player" and is worth +50000 visibility.
+; Keyed by observer only, one player shooting an NPC lit the OTHER player up.
+; Key it by the pair, and rewrite the whole assignment so the read side of the
+; original line cannot keep addressing the old key.
+from_2 = "marked[npc:id()] = marked[npc:id()] or true"
+to_2   = "marked[XrrPeerCount > 0 and (npc:id() * 65536 + shit.draftsman:id()) or npc:id()] = true"
+
+; The same mark, spread to the victim's squad.
+from_3 = "marked[member:id()] = marked[member:id()] or true"
+to_3   = "marked[XrrPeerCount > 0 and (member:id() * 65536 + shit.draftsman:id()) or member:id()] = true"
+
+; The read. `who` is get_visible_value's target parameter, so this asks "was I
+; shot by THIS one", which is what the blanket flag was standing in for.
+from_4 = "if marked[npc:id()] then"
+to_4   = "if marked[XrrPeerCount > 0 and (npc:id() * 65536 + who:id()) or npc:id()] then"
+
+; actor_marked is a file-local, not a per-call local, and is only assigned
+; inside a branch that a dead or non-creature `who` skips — so a skipped
+; evaluation silently reused the previous target's +50000.
+from_5 = "local memory_factor = 0"
+to_5   = "local memory_factor = 0 if XrrPeerCount > 0 then actor_marked = 0 end"

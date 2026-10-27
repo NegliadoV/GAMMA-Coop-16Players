@@ -1,0 +1,270 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Main-menu behaviour: connect flow, peer guards, faction screen branch, session
+  teardown. The class is patched at main_menu_on_init, never at dxml gather, so
+  load order does not matter; the menu object is rebuilt per construction.
+]]
+
+-- C++ join handlers read this by name.
+INSTANCE = nil
+
+-- Last host address, in axr_options.ltx — one of the few stores readable at the
+-- cold-start menu. Empty = "remember" was unchecked.
+local XRR_IP_SECTION, XRR_IP_KEY = "xrrazom", "last_ip"
+
+local function xrr_saved_ip()
+    if not (axr_main and axr_main.config) then return "" end
+    return axr_main.config:r_value(XRR_IP_SECTION, XRR_IP_KEY, nil, "") or ""
+end
+
+local function xrr_store_ip(ip)
+    if not (axr_main and axr_main.config) then return end
+    axr_main.config:w_value(XRR_IP_SECTION, XRR_IP_KEY, ip)
+    axr_main.config:save()
+end
+
+local function xrr_end_session_safe()
+    local gm = XrrNet and XrrNet()
+    if gm and gm.EndSession then
+        pcall(function() gm:EndSession() end)
+    end
+end
+
+-- Both exits from the "Connecting..." dialog, i.e. the connect succeeded.
+local function clear_connecting(menu)
+    if not menu.xrr_connecting then return end
+    menu.xrr_connecting = false
+    menu.xrr_msg_box:HideDialog()
+    menu.mbox_mode = 0
+end
+
+-- luabind resolves method names through the class rep on every call, so
+-- assigning after the class is defined reaches existing and future instances.
+
+local mm_class = nil
+
+local function install_methods()
+    if mm_class then return end
+    local cls = ui_main_menu.main_menu
+    mm_class = cls
+
+    local orig_update           = cls.Update
+    local orig_msg_yes          = cls.OnMsgYes
+    local orig_load_clicked     = cls.OnButton_load_clicked
+    local orig_save_clicked     = cls.OnButton_save_clicked
+    local orig_last_save        = cls.OnButton_last_save
+    local orig_show_faction_ui  = cls.ShowFactionUI
+    local orig_quit_game        = cls.OnMessageQuitGame
+    local orig_quit_win         = cls.OnMessageQuitWin
+
+    cls.Update = function(self, ...)
+        orig_update(self, ...)
+
+        local gm = XrrNet and XrrNet()
+        if not gm then return end
+
+        -- Auto-rejoin after a same-level reload disconnect: the GNS connection
+        -- is still alive.
+        if not level.present() and gm:ConsumePendingAutoRejoin() then
+            self:StartGame()
+        end
+
+        -- Raise the "Connecting..." dialog for any connect in flight. No
+        -- ClearPendingError() here: the loss-fallback below still needs the reason.
+        if gm:ConsumeShowConnecting() and not self.xrr_connecting then
+            self.xrr_connecting = true
+            self.xrr_msg_box:InitMessageBox("msg_box_xrr_connecting")
+            self.xrr_msg_box:SetText(game.translate_string("ui_xrr_connecting"))
+            self.xrr_msg_box:ShowDialog(true)
+            self.mbox_mode = 5
+        end
+
+        -- Fallback for a session lost while "Connecting..." is up and the Lua
+        -- OnSessionLost callback didn't fire.
+        if self.xrr_connecting and not gm:IsConnected() then
+            local reason = gm:PendingError()
+            gm:ClearPendingError()
+            self:OnXrrConnectFailed(reason)
+        end
+
+        -- Show pending error from mid-game session loss (persists across disconnect).
+        if not self.xrr_connecting then
+            local err = gm:PendingError()
+            if err and err ~= "" then
+                gm:ClearPendingError()
+                self.xrr_msg_box:InitMessageBox("message_box_ok")
+                self.xrr_msg_box:SetText(game.translate_string(err))
+                self.xrr_msg_box:ShowDialog(true)
+                self.mbox_mode = 0
+            end
+        end
+    end
+
+    -- Mode 4 is the direct-IP box; the base copy owns 0/1/2.
+    cls.OnMsgYes = function(self, ...)
+        if self.mbox_mode ~= 4 then return orig_msg_yes(self, ...) end
+
+        local input = self.message_box:GetHost()
+        input = (input and input:match("^%s*(.-)%s*$")) or ""
+        if input == "" then input = "127.0.0.1" end
+        -- GetHost() reformats "IP:PORT" as "IP/port=PORT" — store the typed form.
+        xrr_store_ip(self.message_box:GetRemember() and (input:gsub("/port=", ":")) or "")
+
+        local gm = XrrNet()
+        local ok, err = pcall(gm.Connect, gm, input)
+        self.message_box:Show(false)
+        self.mbox_mode = 0
+        if not ok then
+            printf("![xrRazom] Connect threw: %s", tostring(err))
+            gm:SetPendingError(tostring(err))
+            return
+        end
+
+        if not gm:IsConnected() then
+            self.xrr_msg_box:InitMessageBox("message_box_ok")
+            self.xrr_msg_box:SetText(game.translate_string("ui_xrr_invalid_address"))
+            self.xrr_msg_box:ShowDialog(true)
+        end
+        -- Connect in flight; Update raises the dialog on the ConsumeShowConnecting edge.
+    end
+
+    cls.OnButton_multiplayer_clicked = function(self)
+        self.message_box:InitMessageBox("msg_box_xrr_direct_ip")
+        local ip = xrr_saved_ip()
+        if ip ~= "" then
+            self.message_box:SetHost(ip)
+            self.message_box:SetRemember(true)
+        end
+        self.message_box:ShowDialog(true)
+        self.mbox_mode = 4
+    end
+
+    cls.OnXrrMsgOk = function(self)
+        if not self.xrr_connecting then return end
+        local gm = XrrNet and XrrNet()
+        if gm then gm:EndSession() end
+        self.xrr_connecting = false
+        self.mbox_mode = 0
+    end
+
+    cls.OnXrrConnectFailed = function(self, reason)
+        if not self.xrr_connecting then return end
+        self.xrr_connecting = false
+        self.mbox_mode = 0
+        self.xrr_msg_box:HideDialog()
+        -- Reason may be a string-table token; free text passes through unchanged.
+        local text = reason and reason ~= ""
+            and game.translate_string(reason) or game.translate_string("ui_xrr_connection_failed")
+        self.xrr_msg_box:InitMessageBox("message_box_ok")
+        self.xrr_msg_box:SetText(text)
+        self.xrr_msg_box:ShowDialog(true)
+    end
+
+    -- Peer saves live host-side and the console commands are blocked.
+    cls.OnButton_load_clicked = function(self, ...)
+        if XrrIsClient and XrrIsClient() then return end
+        return orig_load_clicked(self, ...)
+    end
+
+    cls.OnButton_save_clicked = function(self, ...)
+        if XrrIsClient and XrrIsClient() then return end
+        return orig_save_clicked(self, ...)
+    end
+
+    -- "Last save" stays clickable on a peer: it delegates load_last_save to the host.
+    cls.OnButton_last_save = function(self, ...)
+        if XrrIsClient and XrrIsClient() then
+            if XrrNet() then
+                XrrPlayers():SendPeerLoadLastSaveRequest()
+            end
+            return
+        end
+        return orig_last_save(self, ...)
+    end
+
+    cls.ShowFactionUI = function(self, ...)
+        clear_connecting(self)
+
+        local gm = XrrNet and XrrNet()
+        if not (gm and gm:IsConnected() and not gm:IsHost()) then
+            return orig_show_faction_ui(self, ...)
+        end
+
+        if self.peer_faction_dlg == nil then
+            self.peer_faction_dlg = xrr_ui_peer_faction.UIPeerFaction(self)
+        end
+        -- The cached dialog may hold a stale nickname or a previous host's difficulty tier.
+        self.peer_faction_dlg:RefreshPlayerName()
+        self.peer_faction_dlg:UpdateAll()
+        self.peer_faction_dlg:ShowDialog(true)
+        self:HideDialog()
+        self:Show(false)
+    end
+
+    cls.OnMessageQuitGame = function(self, ...)
+        xrr_end_session_safe()
+        return orig_quit_game(self, ...)
+    end
+
+    cls.OnMessageQuitWin = function(self, ...)
+        xrr_end_session_safe()
+        return orig_quit_win(self, ...)
+    end
+
+    -- A replacement, not a wrap: "main_menu off" is dropped from the middle of
+    -- the base body.
+    cls.StartGame = function(self)
+        clear_connecting(self)
+        if alife() ~= nil then
+            exec_console_cmd("disconnect")
+        end
+        device():pause(false)
+        exec_console_cmd("start server(all/single/alife/new) client(localhost)")
+    end
+
+    log("[xrRazom] menu: 12 methods installed on ui_main_menu.main_menu")
+end
+
+-- Fires as the last statement of main_menu:__init, so shniaga, message_box
+-- and the callback table all exist.
+function on_main_menu_init(menu)
+    install_methods()
+
+    menu.xrr_msg_box = CUIMessageBoxEx()
+    menu:Register(menu.xrr_msg_box, "xrr_msg_box")
+
+    -- The registry stores the function VALUE, so a class assignment never reaches
+    -- an already-registered callback; each instance re-registers here. AddCallback
+    -- replaces a (control, event) pair, never appends.
+    for _, cb in ipairs({
+        { "btn_multiplayer", ui_events.BUTTON_CLICKED,                "OnButton_multiplayer_clicked" },
+        { "btn_load",        ui_events.BUTTON_CLICKED,                "OnButton_load_clicked"        },
+        { "btn_save",        ui_events.BUTTON_CLICKED,                "OnButton_save_clicked"        },
+        { "btn_lastsave",    ui_events.BUTTON_CLICKED,                "OnButton_last_save"           },
+        { "msg_box",         ui_events.MESSAGE_BOX_YES_CLICKED,       "OnMsgYes"                     },
+        { "msg_box",         ui_events.MESSAGE_BOX_QUIT_GAME_CLICKED, "OnMessageQuitGame"            },
+        { "msg_box",         ui_events.MESSAGE_BOX_QUIT_WIN_CLICKED,  "OnMessageQuitWin"             },
+        { "xrr_msg_box",     ui_events.MESSAGE_BOX_OK_CLICKED,        "OnXrrMsgOk"                   },
+    }) do
+        menu:AddCallback(cb[1], cb[2], mm_class[cb[3]], menu)
+    end
+
+    if XrrIsClient and XrrIsClient() and level.present() then
+        menu.shniaga:SetButtonDisabled("btn_save", true)
+        menu.shniaga:SetButtonDisabled("btn_load", true)
+    end
+
+    -- The faction screen is pre-game, so on_game_start is too late. Idempotent.
+    xrr_patch_currency.apply_menu()
+
+    INSTANCE = menu
+end
+
+-- Only our cached dialog: the base copy's own handler clears the ones it owns.
+function on_localization_change()
+    if INSTANCE then INSTANCE.peer_faction_dlg = nil end
+end
+
+RegisterScriptCallback("on_localization_change", on_localization_change)

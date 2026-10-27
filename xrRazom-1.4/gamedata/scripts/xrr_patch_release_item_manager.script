@@ -1,0 +1,37 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Module: release_item_manager (base game) — keep the aged-item tracker right for
+  peers' pickups and drops.
+
+  A peer's pickup or drop reaches the host as a reparent, so no engine take or
+  drop callback fires: the tracker would keep a picked-up item as litter and
+  never mark a dropped one.
+]]
+
+local function on_peer_item_take(avatar_id, item_id)
+    if release_item_manager and release_item_manager.unmark_item then
+        release_item_manager.unmark_item(item_id)
+    end
+end
+
+-- Mirrors the module's own npc_on_item_drop entry: { name, drop time }.
+local function on_peer_item_drop(avatar_id, item_id)
+    local marked = release_item_manager and release_item_manager.items_marked_for_removal
+    if type(marked) ~= "table" then return end
+    local se = alife_object(item_id)
+    if not (se and se.parent_id == 65535) then return end
+    marked[item_id] = { se:name(), utils_data.CTime_to_table(game.get_game_time()) }
+end
+
+function on_game_start()
+    RegisterScriptCallback("xrr_on_peer_item_take", on_peer_item_take)
+    RegisterScriptCallback("xrr_on_peer_item_drop", on_peer_item_drop)
+    local m = release_item_manager
+    if m and type(m.items_marked_for_removal) ~= "table" then
+        log("[xrRazom][release] INSTALL FAILED: items_marked_for_removal not reachable — "
+            .. "peer drops stay unmarked")
+    end
+    log("[xrRazom][release] peer pickups un-mark and peer drops mark the aged-item tracker")
+end

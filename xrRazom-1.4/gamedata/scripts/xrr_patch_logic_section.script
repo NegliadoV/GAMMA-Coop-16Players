@@ -1,0 +1,93 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  Section replication: applies a host-driven xr_logic section switch (doors,
+  restrictors) to the local binder, queuing ids whose binder hasn't bound yet.
+]]
+
+-- Sections that arrived before the object's binder bound.
+local pending_sections = {}
+
+local function classify(to)
+    if to.ph_door then return "door" end
+    if to.stype == modules.stype_restrictor then return "restrictor" end
+    return nil
+end
+
+local function try_apply_logic_section(obj_id, section)
+    if not section or section == "" then return true end
+    local to = db.storage[obj_id]
+    if not to or not to.ini then return false end
+
+    local kind = classify(to)
+    if not kind then return true end
+
+    -- Restrictors are host-authoritative; a peer never legitimately sends one.
+    if XrrIsHost() and kind ~= "door" then return true end
+    -- Runs vanilla on every machine already; never overwritten by replication.
+    if kind == "restrictor" and to.xrr_local then return true end
+
+    if section == "nil" then
+        if kind == "door" then
+            -- A save bakes "nil" in as deactivation; a real door section always names one.
+            printf("![xrRazom] logic_section REJECTED: id=%s section=nil (door deactivation)", obj_id)
+            return true
+        end
+    elseif not to.ini:section_exist(section) then
+        printf("![xrRazom] logic_section REJECTED: id=%s section=%s (unknown section)", obj_id, section)
+        return true
+    end
+
+    local target = (section ~= "nil") and section or nil
+    if to.active_section == target then return true end
+
+    local npc = level.object_by_id(obj_id)
+    if not npc then return false end
+
+    -- The peer's switch gate (xrr_patch_restrictor_logic) refuses restrictor switches
+    -- unless this is raised; pcall keeps it cleared even if switch_to_section throws.
+    _G.xrr_applying_logic_section = true
+    local ok, err = pcall(xr_logic.switch_to_section, npc, to.ini, section)
+    _G.xrr_applying_logic_section = false
+    if not ok then
+        printf("![xrRazom] logic_section switch_to_section threw: id=%s section=%s err=%s",
+            obj_id, section, tostring(err))
+    end
+    return true
+end
+
+function _G.xrr_apply_logic_section(obj_id, section)
+    if not try_apply_logic_section(obj_id, section) then
+        pending_sections[obj_id] = section
+    end
+end
+
+function take_pending(obj_id)
+    local section = pending_sections[obj_id]
+    pending_sections[obj_id] = nil
+    return section
+end
+
+local _applied = false
+
+function apply()
+    -- One-shot: a re-apply would double-register the actor_on_update poller.
+    if _applied then return end
+    _applied = true
+
+    _G.xrr_applying_logic_section = _G.xrr_applying_logic_section or false
+
+    local function pending_poll()
+        for id, section in pairs(pending_sections) do
+            if try_apply_logic_section(id, section) then
+                pending_sections[id] = nil
+            end
+        end
+    end
+    RegisterScriptCallback("actor_on_update", pending_poll)
+
+    xrr_register_cleanup(function()
+        pending_sections = {}
+    end)
+end

@@ -1,0 +1,9 @@
+; xrRazom — glowstick tracking table, for xrr_patch_glowstick.script.
+; zz_glowstick_mcm keeps its live glowstick set (id -> {section, charge}) in a
+; file-local the module.fn patch idiom cannot reach; the engine's Lua
+; unlocalizer promotes it to a zz_glowstick_mcm field. Interaction Dot Marks
+; declares the same variable, and sections merge additively across unlocalizer
+; files — this is our own copy so the patch does not depend on that mod.
+
+[zz_glowstick_mcm]
+glowsticks

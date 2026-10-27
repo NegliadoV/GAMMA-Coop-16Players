@@ -1,0 +1,50 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+  Разом нас багато. (Together we are many.)
+
+  New Storylines (Hidden Threat): its restrictors run cutscenes through the mod's own
+  effects in utils_slht, which act on db.actor. They go to the restrictor's audience,
+  like the vanilla effects beside them in the same condlists.
+]]
+
+local R = xrr_patch_restrictor_logic
+
+-- utils_slht's own section and offset for the ambush mine.
+local MINE_SECTION  = "tch_ht_quest_mine_blow"
+local MINE_OFFSET_X = -1
+
+R.register_effect("ht_pri_b35_teleport_actor",         R.GATED)
+R.register_effect("ht_pri_a17_play_sound",             R.GATED)
+R.register_effect("ht_run_postprocess",                R.GATED)
+R.register_effect("ht_run_cam_effector_global",        R.GATED)
+R.register_effect("ht_stop_postprocess",               R.ALWAYS)
+-- Teleports to the cutscene spot and spawns the spirit in one call.
+R.register_effect("ht_ds_domik_st_prestart_cut_scene", R.MOVES)
+-- Vanilla, and already broadcast under a relayed id: the mod pairs it with its own
+-- ht_run_cam_effector_global, which a peer runs under the id the condlist names.
+-- Only with the mod installed, so base-game routing stays untouched without it.
+if getFS():exist("$game_scripts$", "utils_slht.script") then
+    R.register_effect("stop_cam_effector",             R.ALWAYS)
+end
+
+-- Vanilla drops one mine beside db.actor, which here is the host wherever it stands.
+local function patch_add_mine()
+    local orig = xr_effects.ht_add_mine
+    if type(orig) ~= "function" then return end
+    xr_effects.ht_add_mine = function(actor, npc, p)
+        local aud = R.audience_of(npc)
+        if not aud then return orig(actor, npc, p) end
+        for id in pairs(aud) do
+            local who = level.object_by_id(id)
+            if who then
+                local pos = who:position()
+                alife_create(MINE_SECTION, vector():set(pos.x + MINE_OFFSET_X, pos.y, pos.z),
+                    who:level_vertex_id(), who:game_vertex_id())
+            end
+        end
+    end
+end
+
+function on_game_start()
+    patch_add_mine()
+end

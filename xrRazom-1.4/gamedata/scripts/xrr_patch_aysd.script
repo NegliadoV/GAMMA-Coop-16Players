@@ -1,0 +1,89 @@
+--[[
+  xrRazom — STALKER Anomaly Co-op
+
+  Ashot and Yar's Special Delivery (451- FreeStalkerLhan): the stage bump in a
+  dialog text getter reaches nobody from a peer, so the host re-advances it.
+]]
+
+local TASK_ID = "jup_b19_freedom_yar_task_1"
+local ASHOT   = "jup_a6_freedom_trader_ashot"
+local YAR     = "jup_b19_freedom_yar"
+local VERB    = "aysd:advance"
+
+local _applied = false
+
+local function task_entry()
+    local tm = task_manager.get_task_manager()
+    return tm and tm.task_info and tm.task_info[TASK_ID]
+end
+
+-- The mod's own parity rule (is_message_receiver): Ashot answers even stages,
+-- Yar odd ones. Re-checked host-side so a peer cannot advance out of turn.
+local function receiver_ok(sid, stage)
+    local parity = math.fmod(stage, 2)
+    return (sid == ASHOT and parity == 0) or (sid == YAR and parity == 1)
+end
+
+-- Registered on every machine; xrr_use_intent.dispatch only runs it on the host.
+local function host_advance(npc_id, _, args)
+    local expected = tonumber(args)
+    local tsk      = task_entry()
+    local current  = tsk and tonumber(tsk.stage)
+    if not (expected and current) then return end
+
+    -- Doubles as the replay guard: requests from one peer snapshot carry the same
+    -- expected stage. A repeat click on the still-listed topic never advances twice,
+    -- unlike solo, where it re-advances and farms a reward tier.
+    if current ~= expected then
+        printf("[xrRazom][aysd] advance dropped: stage moved to %s, request wanted %s",
+               tostring(current), tostring(expected))
+        return
+    end
+    if not receiver_ok(get_object_story_id(npc_id), current) then
+        printf("[xrRazom][aysd] advance dropped: npc %s is not the stage-%s receiver",
+               tostring(npc_id), tostring(current))
+        return
+    end
+
+    tsk.stage = current + 1
+    printf("[xrRazom][aysd] stage %s -> %s", tostring(current), tostring(tsk.stage))
+end
+
+function on_game_start()
+    if _applied then return end
+    -- Vanilla defines this function too: the mod's presence is its `aysd` module.
+    local orig = aysd and dialogs_jupiter and dialogs_jupiter.dm_ashot_and_yar_generate_dialog
+    if type(orig) ~= "function" then return end   -- mod absent
+    _applied = true
+
+    xrr_use_intent.register(VERB, host_advance)
+
+    dialogs_jupiter.dm_ashot_and_yar_generate_dialog = function(a, b)
+        if not XrrIsClient() then return orig(a, b) end
+
+        local tsk    = task_entry()
+        local before = tsk and tonumber(tsk.stage)
+        local npc    = dialogs.who_is_npc(a, b)
+        local npc_id = npc and npc:id()
+
+        local reply = orig(a, b)
+
+        -- The reply ignores the stage, so undoing the bump loses nothing. Undo only
+        -- the one bump this call made: anything else means the mod changed shape.
+        if not (before and tsk) or tonumber(tsk.stage) ~= before + 1 then return reply end
+        tsk.stage = before
+
+        -- The talk's NPC lock holds the host id for the whole conversation (cleared
+        -- on release, never on grant); without it the host has no id to accept.
+        local lock_id = tonumber(xrr_pending_npc_lock_host_id()) or 0
+        if lock_id <= 0 or lock_id ~= npc_id then
+            printf("[xrRazom][aysd] advance not sent: talking to %s under lock %s",
+                   tostring(npc_id), tostring(lock_id))
+            return reply
+        end
+
+        xrr_use_intent.request{ verb = VERB, obj_id = lock_id, state = 1,
+                                args = tostring(before) }
+        return reply
+    end
+end
