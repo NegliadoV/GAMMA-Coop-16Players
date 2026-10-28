@@ -510,7 +510,7 @@ namespace GammaZoneLauncher
 
             var lblSub = new Label
             {
-                Text = "Быстрый старт NVMe HardLink (без тормозов MO2)  •  Синхронизация 594 модов  •  До 17 игроков на локации (xrRazom 1.4)",
+                Text = "Прямой запуск NVMe HardLink  •  Синхронизация 594 модификаций  •  Сетевой протокол xrRazom 1.4 (до 17 игроков / Steam SDR)",
                 Font = new Font("Segoe UI", 9f, FontStyle.Regular),
                 ForeColor = TextMuted,
                 AutoSize = true,
@@ -519,7 +519,7 @@ namespace GammaZoneLauncher
 
             _lblStatusBanner = new Label
             {
-                Text = "● БЫСТРЫЙ СТАРТ ГОТОВ (594 МОДА)",
+                Text = "● КЛИЕНТ ГОТОВ К ЗАПУСКУ",
                 Font = new Font("Segoe UI Semibold", 9.5f, FontStyle.Bold),
                 ForeColor = AccentGreen,
                 BackColor = Color.FromArgb(20, 38, 30),
@@ -557,9 +557,9 @@ namespace GammaZoneLauncher
 
             string[] tabTitles =
             {
-                "📡  СЕРВЕРА ЗОНЫ И БЫСТРЫЙ ВХОД",
-                "🖥  ПОДНЯТЬ СВОЙ СЕРВЕР (ДО 17 ИГРОКОВ)",
-                "⚙  МОДЫ, БЫСТРЫЙ СТАРТ И УСТАНОВКА G.A.M.M.A."
+                "📡  СЕРВЕРЫ И ПОДКЛЮЧЕНИЕ",
+                "🖥  СОЗДАНИЕ СЕРВЕРА (ДО 17 ИГРОКОВ)",
+                "⚙  УСТАНОВКА И ОБНОВЛЕНИЕ КЛИЕНТА"
             };
 
             int navX = 18;
@@ -746,19 +746,19 @@ namespace GammaZoneLauncher
         {
             var topStrip = new Panel { Dock = DockStyle.Top, Height = 48, BackColor = BgDark };
 
-            var btnRefresh = MakeActionButton("🔄 Обновить список и пинг", 0, 4, 215, BgCard, TextMain);
+            var btnRefresh = MakeActionButton("🔄 Обновить статус серверов", 0, 4, 215, BgCard, TextMain);
             btnRefresh.Click += async (s, e) => await RefreshAllServersAsync();
 
-            var btnAddServer = MakeActionButton("➕ Добавить сервер по IP / Radmin", 224, 4, 260, BgCard, AccentAmber);
+            var btnAddServer = MakeActionButton("➕ Добавить сервер (IP / VPN)", 224, 4, 260, BgCard, AccentAmber);
             btnAddServer.Click += (s, e) => PromptAddServer();
 
             var btnRemoveServer = MakeActionButton("🗑 Удалить", 493, 4, 120, BgCard, TextMuted);
             btnRemoveServer.Click += (s, e) => RemoveSelectedServer();
 
-            var btnCopyMyIp = MakeActionButton("📋 Скопировать мой IP для друзей", 622, 4, 255, BgCard, AccentGreen);
+            var btnCopyMyIp = MakeActionButton("📋 Скопировать IP-адрес хоста", 622, 4, 255, BgCard, AccentGreen);
             btnCopyMyIp.Click += (s, e) => CopyLocalIpsToClipboard();
 
-            var btnQuickNewCordon = MakeActionButton("⚡ Новая игра на Кордоне (Хост)", 886, 4, 255, Color.FromArgb(24, 46, 36), AccentGreen);
+            var btnQuickNewCordon = MakeActionButton("⚡ Новая сессия (Кордон)", 886, 4, 255, Color.FromArgb(24, 46, 36), AccentGreen);
             btnQuickNewCordon.Click += (s, e) => LaunchFreshNewGameOnCordon();
 
             topStrip.Controls.AddRange(new Control[] { btnRefresh, btnAddServer, btnRemoveServer, btnCopyMyIp, btnQuickNewCordon });
@@ -886,7 +886,7 @@ namespace GammaZoneLauncher
 
             var title = new Label
             {
-                Text = "ПАНЕЛЬ УПРАВЛЕНИЯ ВЫДЕЛЕННЫМ СЕРВЕРОМ ЗОНЫ (HOST / DEDICATED 17 PLAYERS)",
+                Text = "КОНФИГУРАЦИЯ СЕРВЕРА И СЕТЕВОЙ СЕССИИ (ДО 17 ИГРОКОВ)",
                 Font = new Font("Segoe UI", 12.5f, FontStyle.Bold),
                 ForeColor = AccentAmber,
                 AutoSize = true,
@@ -896,8 +896,8 @@ namespace GammaZoneLauncher
 
             var desc = new Label
             {
-                Text = "Запускает кооп-сервер S.T.A.L.K.E.R. G.A.M.M.A. на 17 человек (хост + до 16 друзей), автоматически открывает UDP-сокет на Кордоне,\n" +
-                       "ведёт периодическое автосохранение мира и транслирует статус сервера в браузер серверов.",
+                Text = "Настройка параметров кооперативного сервера S.T.A.L.K.E.R. G.A.M.M.A. (хост + до 16 подключающихся игроков),\n" +
+                       "выбор сетевого транспорта (Valve Steam SDR или прямой UDP-порт), автосохранение мира и локальное тестирование.",
                 Font = new Font("Segoe UI", 9.5f),
                 ForeColor = TextMuted,
                 AutoSize = true,
@@ -906,11 +906,11 @@ namespace GammaZoneLauncher
             card.Controls.Add(desc);
 
             int y = 96;
-            card.Controls.Add(MakeLabel("Название вашего сервера (видно друзьям в списке):", 22, y, TextMain));
+            card.Controls.Add(MakeLabel("Название сервера (отображается в списке серверов):", 22, y, TextMain));
             _txtServerName = MakeTextBox(_cfg.HostServerName, 22, y + 24, 480);
             card.Controls.Add(_txtServerName);
 
-            card.Controls.Add(MakeLabel("UDP Порт сервера:", 525, y, TextMain));
+            card.Controls.Add(MakeLabel("UDP-порт сервера:", 525, y, TextMain));
             _numHostPort = new NumericUpDown
             {
                 Location = new Point(525, y + 24),
@@ -925,7 +925,7 @@ namespace GammaZoneLauncher
             };
             card.Controls.Add(_numHostPort);
 
-            card.Controls.Add(MakeLabel("Лимит подключающихся друзей (1–16 пиров = до 17 игроков):", 685, y, AccentAmber));
+            card.Controls.Add(MakeLabel("Лимит подключающихся клиентов (1–16 пиров = до 17 игроков):", 685, y, AccentAmber));
             _numMaxPeers = new NumericUpDown
             {
                 Location = new Point(685, y + 24),
@@ -941,7 +941,7 @@ namespace GammaZoneLauncher
             card.Controls.Add(_numMaxPeers);
 
             y += 70;
-            card.Controls.Add(MakeLabel("Мир / Сохранение для старта ('new' = продолжить/автосейв, 'fast_new' = новая игра сразу на Кордоне):", 22, y, TextMain));
+            card.Controls.Add(MakeLabel("Сохранение мира ('new' = продолжить автосейв, 'fast_new' = новая игра на Кордоне):", 22, y, TextMain));
             _cmbHostSave = new TacticalComboBox
             {
                 Location = new Point(22, y + 24),
@@ -950,12 +950,12 @@ namespace GammaZoneLauncher
             RefreshSavesList();
             card.Controls.Add(_cmbHostSave);
 
-            var btnRefreshSaves = MakeActionButton("🔄 Обновить сохранения", 525, y + 21, 215, BgCard, TextMain);
+            var btnRefreshSaves = MakeActionButton("🔄 Обновить список сохранений", 525, y + 21, 215, BgCard, TextMain);
             btnRefreshSaves.Height = 32;
             btnRefreshSaves.Click += (s, e) => RefreshSavesList();
             card.Controls.Add(btnRefreshSaves);
 
-            var btnFreshCordon = MakeActionButton("⚡ Сбросить и начать с нуля на Кордоне", 752, y + 21, 340, Color.FromArgb(26, 46, 36), AccentGreen);
+            var btnFreshCordon = MakeActionButton("⚡ Новая сессия на Кордоне", 752, y + 21, 340, Color.FromArgb(26, 46, 36), AccentGreen);
             btnFreshCordon.Height = 32;
             btnFreshCordon.Click += (s, e) => LaunchFreshNewGameOnCordon();
             card.Controls.Add(btnFreshCordon);
@@ -963,7 +963,7 @@ namespace GammaZoneLauncher
             y += 66;
             _chkDedicatedObserver = new CheckBox
             {
-                Text = "Включить режим 24/7 «Выделенный Сервер» (бессмертие/сытость персонажа-хоста + автосейв мира)",
+                Text = "Включить режим 24/7 «Выделенный сервер» (защита персонажа-хоста и непрерывная работа мира)",
                 Checked = _cfg.DedicatedObserver,
                 Location = new Point(22, y),
                 AutoSize = true,
@@ -975,7 +975,7 @@ namespace GammaZoneLauncher
             y += 28;
             _chkHostSteam = new CheckBox
             {
-                Text = "Включить ретранслятор Steam P2P / SDR (AppID 480 — низкий пинг через Valve, вход через Shift+Tab -> Присоединиться к игре)",
+                Text = "Включить сетевой транспорт Steam P2P / SDR (AppID 480 — низкая задержка через Valve, вход через оверлей Shift+Tab)",
                 Checked = _cfg.HostSteam,
                 Location = new Point(22, y),
                 AutoSize = true,
@@ -1002,7 +1002,7 @@ namespace GammaZoneLauncher
 
             _chkSkipModCheck = new CheckBox
             {
-                Text = "Разрешить вход друзьям с отличающимися визуальными модами (xrr_skip_mod_check)",
+                Text = "Разрешить подключение клиентов с отличающимися модификациями (xrr_skip_mod_check)",
                 Checked = _cfg.SkipModCheck,
                 Location = new Point(490, y + 2),
                 AutoSize = true,
@@ -1033,7 +1033,7 @@ namespace GammaZoneLauncher
             y += 82;
             _btnStartHost = new Button
             {
-                Text = "⚡ 1. ПОДНЯТЬ СЕРВЕР ЗОНЫ (БЫСТРЫЙ СТАРТ ХОСТА)",
+                Text = "▶ 1. ЗАПУСТИТЬ СЕРВЕР (ХОСТ СЕССИИ)",
                 Location = new Point(22, y),
                 Size = new Size(535, 54),
                 BackColor = AccentGreen,
@@ -1048,7 +1048,7 @@ namespace GammaZoneLauncher
 
             var btnStartSecondClient = new Button
             {
-                Text = "👥 2. ТЕСТ НА 1 ПК: ЗАПУСТИТЬ 2-Е ОКНО (КЛИЕНТ -> 127.0.0.1)",
+                Text = "👥 2. ЗАПУСТИТЬ ВТОРОЙ КЛИЕНТ (ЛОКАЛЬНЫЙ ТЕСТ 127.0.0.1)",
                 Location = new Point(575, y),
                 Size = new Size(547, 54),
                 BackColor = AccentAmber,
@@ -1087,7 +1087,7 @@ namespace GammaZoneLauncher
 
             var title = new Label
             {
-                Text = "УПРАВЛЕНИЕ КООП-ДВИЖКОМ (17 ИГРОКОВ), БЫСТРЫМ СТАРТОМ И УСТАНОВКОЙ G.A.M.M.A.",
+                Text = "УСТАНОВКА, ОБНОВЛЕНИЕ И КОНФИГУРАЦИЯ КЛИЕНТА S.T.A.L.K.E.R. G.A.M.M.A. CO-OP",
                 Font = new Font("Segoe UI", 12f, FontStyle.Bold),
                 ForeColor = AccentAmber,
                 AutoSize = true,
@@ -1098,7 +1098,7 @@ namespace GammaZoneLauncher
             var cardEngine = new TacticalCard
             {
                 Location = new Point(22, 38),
-                Size = new Size(1100, 46),
+                Size = new Size(1100, 44),
                 BackColor = BgCard,
                 AccentStripeColor = AccentGreen,
                 AccentStripeWidth = 4,
@@ -1110,8 +1110,8 @@ namespace GammaZoneLauncher
 
             var cardGamma = new TacticalCard
             {
-                Location = new Point(22, 88),
-                Size = new Size(1100, 46),
+                Location = new Point(22, 86),
+                Size = new Size(1100, 44),
                 BackColor = BgCard,
                 AccentStripeColor = AccentCyan,
                 AccentStripeWidth = 4,
@@ -1123,33 +1123,33 @@ namespace GammaZoneLauncher
 
             var cardFixes = new TacticalCard
             {
-                Location = new Point(22, 138),
-                Size = new Size(1100, 32),
+                Location = new Point(22, 134),
+                Size = new Size(1100, 30),
                 BackColor = BgCard,
                 AccentStripeColor = AccentAmber,
                 AccentStripeWidth = 4,
-                Padding = new Padding(12, 6, 12, 4)
+                Padding = new Padding(12, 5, 12, 4)
             };
             _lblFixesStatus = new Label { Dock = DockStyle.Fill, ForeColor = TextMain, Font = new Font("Segoe UI", 8.8f) };
             cardFixes.Controls.Add(_lblFixesStatus);
             card.Controls.Add(cardFixes);
 
-            int y = 176;
-            card.Controls.Add(MakeLabel("Папка S.T.A.L.K.E.R. Anomaly 1.5.3 (или папка установки для друзей):", 22, y, TextMuted));
-            _txtAnomalyPath = MakeTextBox(_cfg.AnomalyPath, 22, y + 19, 420);
+            int y = 170;
+            card.Controls.Add(MakeLabel("Директория установки игры (S.T.A.L.K.E.R. Anomaly / G.A.M.M.A. Co-op):", 22, y, TextMain));
+            _txtAnomalyPath = MakeTextBox(_cfg.AnomalyPath, 22, y + 19, 430);
             _txtAnomalyPath.TextChanged += (s, e) => { _cfg.AnomalyPath = _txtAnomalyPath.Text.Trim(); RefreshModAndEngineStatus(); };
             card.Controls.Add(_txtAnomalyPath);
 
-            var btnBrowseAnomaly = MakeActionButton("Обзор...", 450, y + 17, 95, BgCard, TextMain);
+            var btnBrowseAnomaly = MakeActionButton("Обзор...", 460, y + 17, 95, BgCard, TextMain);
             btnBrowseAnomaly.Height = 29;
             btnBrowseAnomaly.Click += (s, e) =>
             {
-                using var fbd = new FolderBrowserDialog { Description = "Выберите папку S.T.A.L.K.E.R. Anomaly 1.5.3", SelectedPath = _cfg.AnomalyPath };
+                using var fbd = new FolderBrowserDialog { Description = "Выберите директорию для установки или запуска игры", SelectedPath = _cfg.AnomalyPath };
                 if (fbd.ShowDialog() == DialogResult.OK) { _txtAnomalyPath.Text = fbd.SelectedPath; SaveConfig(); }
             };
             card.Controls.Add(btnBrowseAnomaly);
 
-            card.Controls.Add(MakeLabel("Папка S.T.A.L.K.E.R. G.A.M.M.A. (MO2):", 575, y, TextMuted));
+            card.Controls.Add(MakeLabel("Директория профилей Mod Organizer 2 (опционально):", 575, y, TextMuted));
             _txtGammaPath = MakeTextBox(_cfg.GammaPath, 575, y + 19, 442);
             _txtGammaPath.TextChanged += (s, e) => { _cfg.GammaPath = _txtGammaPath.Text.Trim(); RefreshModAndEngineStatus(); };
             card.Controls.Add(_txtGammaPath);
@@ -1158,135 +1158,147 @@ namespace GammaZoneLauncher
             btnBrowseGamma.Height = 29;
             btnBrowseGamma.Click += (s, e) =>
             {
-                using var fbd = new FolderBrowserDialog { Description = "Выберите папку S.T.A.L.K.E.R. G.A.M.M.A. (с ModOrganizer.exe)", SelectedPath = _cfg.GammaPath };
+                using var fbd = new FolderBrowserDialog { Description = "Выберите директорию Mod Organizer 2 (опционально)", SelectedPath = _cfg.GammaPath };
                 if (fbd.ShowDialog() == DialogResult.OK) { _txtGammaPath.Text = fbd.SelectedPath; SaveConfig(); }
             };
             card.Controls.Add(btnBrowseGamma);
 
-            y += 50;
+            // PRIMARY USER-FRIENDLY BOX: 1-Click Client Download, Install & Delta Update (with integrated Progress Bar!)
+            y += 54;
+            var releaseBox = new TacticalCard
+            {
+                Location = new Point(22, y),
+                Size = new Size(1100, 148),
+                BackColor = Color.FromArgb(15, 24, 33),
+                BorderColor = Color.FromArgb(46, 134, 193),
+                AccentStripeColor = AccentGreen,
+                AccentStripeWidth = 4,
+                Padding = new Padding(14)
+            };
+
+            var lblCloudHeader = new Label
+            {
+                Text = "☁ АВТОМАТИЧЕСКАЯ УСТАНОВКА И ОБНОВЛЕНИЕ КЛИЕНТА (GITHUB RELEASES — ВСЯ СБОРКА В 1 КЛИК)",
+                Location = new Point(16, 8),
+                AutoSize = true,
+                ForeColor = AccentGreen,
+                Font = new Font("Segoe UI Semibold", 9.8f, FontStyle.Bold)
+            };
+            releaseBox.Controls.Add(lblCloudHeader);
+
+            var btnClientInstall = new Button
+            {
+                Text = "⬇  СКАЧАТЬ И УСТАНОВИТЬ / ОБНОВИТЬ СБОРКУ В 1 КЛИК (38.5 ГБ БАЗА + СВЕЖИЙ ПАТЧ)",
+                Location = new Point(16, 32),
+                Size = new Size(640, 42),
+                BackColor = AccentGreen,
+                ForeColor = Color.FromArgb(10, 14, 12),
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 10f, FontStyle.Bold),
+                Cursor = Cursors.Hand
+            };
+            btnClientInstall.FlatAppearance.BorderSize = 0;
+            btnClientInstall.Click += async (s, e) => await RunClientInstallOrUpdateAsync();
+            releaseBox.Controls.Add(btnClientInstall);
+
+            releaseBox.Controls.Add(MakeLabel("URL репозитория / манифеста обновлений:", 670, 26, TextMuted));
+            _txtReleaseUrl = MakeTextBox(_cfg.ReleaseManifestUrl, 670, 46, 412);
+            _txtReleaseUrl.TextChanged += (s, e) => _cfg.ReleaseManifestUrl = _txtReleaseUrl.Text.Trim();
+            releaseBox.Controls.Add(_txtReleaseUrl);
+
+            _prgTurboInstall = new TacticalProgressBar
+            {
+                Location = new Point(16, 84),
+                Size = new Size(1068, 26),
+                Minimum = 0,
+                Maximum = 100,
+                Value = 100,
+                OverlayText = "Готов к проверке и установке обновлений клиента"
+            };
+            releaseBox.Controls.Add(_prgTurboInstall);
+
+            _lblTurboProgress = new Label
+            {
+                Text = "Выберите директорию установки выше и нажмите зелёную кнопку для автоматической загрузки или обновления клиента.",
+                Location = new Point(16, 116),
+                Size = new Size(1068, 22),
+                ForeColor = Color.FromArgb(180, 225, 245),
+                Font = new Font("Consolas", 9f)
+            };
+            releaseBox.Controls.Add(_lblTurboProgress);
+
+            card.Controls.Add(releaseBox);
+
+            // SECONDARY TOOLS BOX: Engine Patching, Packaging & Mod Organizer 2 Tools
+            y += 156;
+            var toolsBox = new TacticalCard
+            {
+                Location = new Point(22, y),
+                Size = new Size(1100, 122),
+                BackColor = Color.FromArgb(18, 22, 28),
+                BorderColor = Color.FromArgb(44, 52, 64),
+                AccentStripeColor = AccentAmber,
+                AccentStripeWidth = 4,
+                Padding = new Padding(12)
+            };
+
+            toolsBox.Controls.Add(MakeLabel("🛠 ИНСТРУМЕНТЫ СБОРКИ, ДВИЖКА И АДМИНИСТРИРОВАНИЯ РЕЛИЗОВ:", 16, 7, AccentAmber));
+
             var btnInstallCoop = new Button
             {
-                Text = "⚙ ОБНОВИТЬ КООП-ДВИЖОК (17 ИГРОКОВ) + ПЕРЕСОБРАТЬ БЫСТРЫЙ СТАРТ G.A.M.M.A.",
-                Location = new Point(22, y),
-                Size = new Size(780, 38),
+                Text = "⚙ Применить патч кооп-движка (17 игроков) + пересобрать профиль",
+                Location = new Point(16, 30),
+                Size = new Size(495, 36),
                 BackColor = AccentAmber,
                 ForeColor = Color.FromArgb(14, 12, 10),
                 FlatStyle = FlatStyle.Flat,
-                Font = new Font("Segoe UI", 9.2f, FontStyle.Bold),
+                Font = new Font("Segoe UI Semibold", 9.2f, FontStyle.Bold),
                 Cursor = Cursors.Hand
             };
             btnInstallCoop.FlatAppearance.BorderSize = 0;
             btnInstallCoop.Click += (s, e) => InstallCoopEngineAndMods();
-            card.Controls.Add(btnInstallCoop);
+            toolsBox.Controls.Add(btnInstallCoop);
 
-            var btnRestoreVanilla = MakeActionButton("Вернуть чистый bin (для апдейтера)", 814, y, 308, BgCard, TextMain);
-            btnRestoreVanilla.Height = 38;
+            var btnRestoreVanilla = MakeActionButton("↩ Восстановить чистый bin", 520, 30, 215, BgCard, TextMain);
+            btnRestoreVanilla.Height = 36;
             btnRestoreVanilla.Click += (s, e) => RestoreVanillaBinaries();
-            card.Controls.Add(btnRestoreVanilla);
+            toolsBox.Controls.Add(btnRestoreVanilla);
 
-            // Turbo GAMMA Multi-Threaded Downloader & Installer Box
-            y += 44;
-            var turboBox = new TacticalCard
-            {
-                Location = new Point(22, y),
-                Size = new Size(1100, 114),
-                BackColor = Color.FromArgb(16, 28, 23),
-                BorderColor = Color.FromArgb(40, 85, 62),
-                AccentStripeColor = AccentGreen,
-                AccentStripeWidth = 4,
-                Padding = new Padding(12)
-            };
-
-            _btnTurboInstall = new Button
-            {
-                Text = "⚡ ТУРБО-УСТАНОВКА И ПРОВЕРКА G.A.M.M.A. В 10 ПОТОКОВ (ОБХОД CLOUDFLARE MODDB)",
-                Location = new Point(16, 8),
-                Size = new Size(1068, 36),
-                BackColor = AccentGreen,
-                ForeColor = Color.FromArgb(10, 14, 12),
-                FlatStyle = FlatStyle.Flat,
-                Font = new Font("Segoe UI", 9.8f, FontStyle.Bold),
-                Cursor = Cursors.Hand
-            };
-            _btnTurboInstall.FlatAppearance.BorderSize = 0;
+            _btnTurboInstall = MakeActionButton("⚡ Докачать моды с ModDB (MO2)", 744, 30, 340, BgCard, AccentGreen);
+            _btnTurboInstall.Height = 36;
             _btnTurboInstall.Click += async (s, e) => await ToggleTurboGammaInstallAsync();
-            turboBox.Controls.Add(_btnTurboInstall);
+            toolsBox.Controls.Add(_btnTurboInstall);
 
-            _prgTurboInstall = new TacticalProgressBar
-            {
-                Location = new Point(16, 50),
-                Size = new Size(1068, 24),
-                Minimum = 0,
-                Maximum = 594,
-                Value = 594,
-                OverlayText = "100% ГОТОВО — Все 594 активных мода G.A.M.M.A. + Кооп 16p установлены и запечены для Быстрого Старта"
-            };
-            turboBox.Controls.Add(_prgTurboInstall);
-
-            _lblTurboProgress = new Label
-            {
-                Text = "[ГОТОВО] Все 594 активных мода S.T.A.L.K.E.R. G.A.M.M.A., 61 020 файлов быстрого старта и кооп-движок (17 игроков) готовы к бою!",
-                Location = new Point(16, 80),
-                Size = new Size(1068, 24),
-                ForeColor = Color.FromArgb(180, 235, 200),
-                Font = new Font("Consolas", 9f)
-            };
-            turboBox.Controls.Add(_lblTurboProgress);
-            card.Controls.Add(turboBox);
-
-            // Multi-Volume Release Packager & Friend Installer Box
-            y += 120;
-            var releaseBox = new TacticalCard
-            {
-                Location = new Point(22, y),
-                Size = new Size(1100, 96),
-                BackColor = Color.FromArgb(16, 22, 31),
-                BorderColor = Color.FromArgb(44, 68, 96),
-                AccentStripeColor = AccentCyan,
-                AccentStripeWidth = 4,
-                Padding = new Padding(12)
-            };
-
-            releaseBox.Controls.Add(MakeLabel("📦 РАЗДАЧА ДРУЗЬЯМ И ОБНОВЛЕНИЕ ПО ТОМАМ (URL GitHub Release или папка C:\\GAMMA-Coop-Release):", 16, 8, AccentCyan));
-            _txtReleaseUrl = MakeTextBox(_cfg.ReleaseManifestUrl, 16, 28, 430);
-            releaseBox.Controls.Add(_txtReleaseUrl);
-
-            var btnFriendInstall = MakeActionButton("⬇ Установить / Обновить сборку (Для друзей)", 456, 25, 318, AccentGreen, Color.FromArgb(10, 14, 12));
-            btnFriendInstall.Height = 32;
-            btnFriendInstall.Click += async (s, e) => await RunClientInstallOrUpdateAsync();
-            releaseBox.Controls.Add(btnFriendInstall);
-
-            var btnPackPatch = MakeActionButton("⚡ Собрать патч + Лаунчер (5 сек)", 782, 25, 298, AccentAmber, Color.FromArgb(14, 12, 10));
-            btnPackPatch.Height = 32;
+            var btnPackPatch = MakeActionButton("📦 Собрать дельта-патч релиза", 16, 74, 265, BgCard, AccentCyan);
+            btnPackPatch.Height = 34;
             btnPackPatch.Click += async (s, e) => await RunPackFastPatchAsync();
-            releaseBox.Controls.Add(btnPackPatch);
+            toolsBox.Controls.Add(btnPackPatch);
 
-            var btnPackVolumes = MakeActionButton("📦 Упаковать всю базу (75 ГБ) в тома по 1.9 ГБ -> C:\\GAMMA-Coop-Release", 16, 62, 758, BgCard, AccentCyan);
-            btnPackVolumes.Height = 28;
+            var btnPackVolumes = MakeActionButton("📦 Упаковать базу в тома (1.9 ГБ)", 290, 74, 275, BgCard, AccentCyan);
+            btnPackVolumes.Height = 34;
             btnPackVolumes.Click += async (s, e) => await RunPackFullVolumesAsync();
-            releaseBox.Controls.Add(btnPackVolumes);
+            toolsBox.Controls.Add(btnPackVolumes);
 
-            var btnOpenReleaseDir = MakeActionButton("📂 Открыть папку релизов", 782, 62, 298, BgCard, TextMain);
-            btnOpenReleaseDir.Height = 28;
+            var btnOpenReleaseDir = MakeActionButton("📂 Папка релиза", 574, 74, 160, BgCard, TextMain);
+            btnOpenReleaseDir.Height = 34;
             btnOpenReleaseDir.Click += (s, e) =>
             {
                 Directory.CreateDirectory(_cfg.ReleaseOutputDir);
                 Process.Start(new ProcessStartInfo { FileName = _cfg.ReleaseOutputDir, UseShellExecute = true });
             };
-            releaseBox.Controls.Add(btnOpenReleaseDir);
+            toolsBox.Controls.Add(btnOpenReleaseDir);
 
-            card.Controls.Add(releaseBox);
-
-            y += 102;
-            var btnOpenGammaLauncher = MakeActionButton("Открыть официальный G.A.M.M.A. Launcher v8.6", 22, y, 540, BgCard, AccentGreen);
+            var btnOpenGammaLauncher = MakeActionButton("G.A.M.M.A. Launcher", 744, 74, 165, BgCard, TextMuted);
             btnOpenGammaLauncher.Height = 34;
             btnOpenGammaLauncher.Click += (s, e) => LaunchOfficialGammaInstaller();
-            card.Controls.Add(btnOpenGammaLauncher);
+            toolsBox.Controls.Add(btnOpenGammaLauncher);
 
-            var btnOpenMo2 = MakeActionButton("Открыть Mod Organizer 2 (ModOrganizer.exe)", 582, y, 540, BgCard, TextMain);
+            var btnOpenMo2 = MakeActionButton("Mod Organizer 2", 918, 74, 166, BgCard, TextMuted);
             btnOpenMo2.Height = 34;
             btnOpenMo2.Click += (s, e) => LaunchModOrganizerOnly();
-            card.Controls.Add(btnOpenMo2);
+            toolsBox.Controls.Add(btnOpenMo2);
+
+            card.Controls.Add(toolsBox);
 
             card.Resize += (s, e) =>
             {
@@ -1294,19 +1306,11 @@ namespace GammaZoneLauncher
                 cardEngine.Width = w;
                 cardGamma.Width = w;
                 cardFixes.Width = w;
-                turboBox.Width = w;
                 releaseBox.Width = w;
-                _btnTurboInstall.Width = w - 32;
+                toolsBox.Width = w;
                 _prgTurboInstall.Width = w - 32;
                 _lblTurboProgress.Width = w - 32;
-
-                btnRestoreVanilla.Location = new Point(22 + w - btnRestoreVanilla.Width, btnInstallCoop.Top);
-                btnInstallCoop.Width = Math.Max(480, btnRestoreVanilla.Left - 22 - 12);
-
-                int halfW = (w - 20) / 2;
-                btnOpenGammaLauncher.Width = halfW;
-                btnOpenMo2.Location = new Point(22 + halfW + 20, btnOpenGammaLauncher.Top);
-                btnOpenMo2.Width = w - halfW - 20;
+                _txtReleaseUrl.Width = Math.Max(260, w - 670 - 16);
             };
 
             page.Controls.Add(card);
@@ -1399,17 +1403,17 @@ namespace GammaZoneLauncher
                     });
 
                 var manifest = await packager.PackFastPatchAndLauncherAsync(_cfg.ReleaseManifestUrl, CancellationToken.None);
-                _lblStatusBanner.Text = "● БЫСТРЫЙ СТАРТ ГОТОВ (594 МОДА)";
+                _lblStatusBanner.Text = "● ГОТОВО К ЗАПУСКУ (594 МОДА)";
                 _lblStatusBanner.ForeColor = AccentGreen;
                 if (!silent)
                 {
                     MessageBox.Show(
-                        $"Быстрый патч и лаунчер для друзей успешно собраны в папке:\n{_cfg.ReleaseOutputDir}\n\n" +
+                        $"Патч обновления и клиентский лаунчер успешно собраны в каталоге:\n{_cfg.ReleaseOutputDir}\n\n" +
                         $"• Версия: {manifest.Version}\n" +
-                        $"• Файл патча: {manifest.PatchArchiveName} ({manifest.PatchArchiveSize / (1024.0 * 1024.0):0.1} МБ)\n" +
-                        $"• Архив лаунчера для пацанов: GAMMA-Coop-Friend-Launcher.zip\n" +
+                        $"• Архив патча: {manifest.PatchArchiveName} ({manifest.PatchArchiveSize / (1024.0 * 1024.0):0.1} МБ)\n" +
+                        $"• Архив лаунчера: GAMMA-Coop-Launcher.zip\n" +
                         $"• Манифест: manifest.json",
-                        "Патч и лаунчер собраны",
+                        "Сборка патча завершена",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Information);
                 }
@@ -1448,18 +1452,18 @@ namespace GammaZoneLauncher
                     });
 
                 var manifest = await packager.PackFullBaseVolumesAsync(_cfg.ReleaseManifestUrl, CancellationToken.None);
-                _lblStatusBanner.Text = "● БЫСТРЫЙ СТАРТ ГОТОВ (594 МОДА)";
+                _lblStatusBanner.Text = "● ГОТОВО К ЗАПУСКУ (594 МОДА)";
                 _lblStatusBanner.ForeColor = AccentGreen;
                 if (!silent)
                 {
                     MessageBox.Show(
-                        $"Полная сборка упакована в тома по 1.9 ГБ в папке:\n{_cfg.ReleaseOutputDir}\n\n" +
+                        $"Полный дистрибутив упакован в многотомный архив (1.9 ГБ на том) в каталоге:\n{_cfg.ReleaseOutputDir}\n\n" +
                         $"• Томов базы: {manifest.BaseVolumes.Count} шт.\n" +
-                        $"• Быстрый патч: {manifest.PatchArchiveName}\n" +
-                        $"• Лаунчер для друзей: GAMMA-Coop-Friend-Launcher.zip\n" +
+                        $"• Патч обновления: {manifest.PatchArchiveName}\n" +
+                        $"• Клиентский лаунчер: GAMMA-Coop-Launcher.zip\n" +
                         $"• Манифест: manifest.json\n\n" +
-                        $"Заливайте файлы из {_cfg.ReleaseOutputDir} в GitHub Release, а GAMMA-Coop-Friend-Launcher.zip скидывайте пацанам!",
-                        "Тома сборки готовы",
+                        $"Файлы из {_cfg.ReleaseOutputDir} готовы к публикации в GitHub Releases.",
+                        "Упаковка дистрибутива завершена",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Information);
                 }
@@ -1484,9 +1488,10 @@ namespace GammaZoneLauncher
             SaveConfig();
             SelectTab(2);
             _turboInstallCts = new CancellationTokenSource();
-            _btnTurboInstall.Text = "⏹ ОСТАНОВИТЬ ТУРБО-УСТАНОВКУ (ВЕСЬ СКАЧАННЫЙ ПРОГРЕСС СОХРАНИТСЯ)";
+            _btnTurboInstall.Text = "⏹ Остановить загрузку с ModDB";
             _btnTurboInstall.BackColor = AccentAmber;
-            _lblStatusBanner.Text = "● ТУРБО-УСТАНОВКА GAMMA (10 ПОТОКОВ)";
+            _btnTurboInstall.ForeColor = Color.Black;
+            _lblStatusBanner.Text = "● ЗАГРУЗКА МОДОВ GAMMA (10 ПОТОКОВ)";
             _lblStatusBanner.ForeColor = AccentAmber;
 
             var installer = new TurboGammaInstaller(
@@ -1545,8 +1550,9 @@ namespace GammaZoneLauncher
             {
                 _turboInstallCts?.Dispose();
                 _turboInstallCts = null;
-                _btnTurboInstall.Text = "⚡ ТУРБО-УСТАНОВКА И ПРОВЕРКА G.A.M.M.A. В 10 ПОТОКОВ (ОБХОД CLOUDFLARE MODDB)";
-                _btnTurboInstall.BackColor = AccentGreen;
+                _btnTurboInstall.Text = "⚡ Докачать моды с ModDB (MO2)";
+                _btnTurboInstall.BackColor = BgCard;
+                _btnTurboInstall.ForeColor = AccentGreen;
                 RefreshModAndEngineStatus();
             }
         }
@@ -1693,28 +1699,39 @@ namespace GammaZoneLauncher
             string gnsDll = Path.Combine(anomalyBin, "GameNetworkingSockets.dll");
             string backupBin = Path.Combine(_cfg.AnomalyPath, "bin_vanilla_backup");
             bool coopInstalled = File.Exists(gnsDll);
+            bool baseInstalled = ReleasePackagerAndUpdater.IsFullGammaBaseInstalled(_cfg.AnomalyPath);
 
             _lblEngineStatus.Text = coopInstalled
-                ? $"✔ ДВИЖОК АНОМАЛИИ (C:\\Anomaly\\bin): Установлен кооп-движок xrRazom 1.4 Unleashed (до 16 пиров / 17 игроков).\n" +
-                  $"   Резервная копия чистого движка сохранена в: {backupBin}"
-                : $"⚠ ДВИЖОК АНОМАЛИИ (C:\\Anomaly\\bin): Сейчас стоит одиночный движок Anomaly 1.5.3.\n" +
-                  $"   Нажмите оранжевую кнопку ниже, чтобы в 1 клик активировать кооп-движок (17 игроков).";
+                ? $"✔ СЕТЕВОЙ ДВИЖОК ({anomalyBin}): Установлен модифицированный движок xrRazom 1.4 (до 16 пиров / 17 игроков + Steam SDR).\n" +
+                  $"   Статус бинарных модулей: Готовы к запуску"
+                : $"⚠ СЕТЕВОЙ ДВИЖОК ({anomalyBin}): Кооперативный движок ещё не установлен в указанной директории.\n" +
+                  $"   Используйте блок автоматической установки ниже для загрузки и настройки клиента.";
 
             string gammaMods = Path.Combine(_cfg.GammaPath, "mods");
             int modCount = Directory.Exists(gammaMods) ? Directory.GetDirectories(gammaMods).Length : 0;
-            bool fastBaked = File.Exists(Path.Combine(_cfg.AnomalyPath, "gamedata", ".gamma_baked_ready"));
-            _lblGammaStatus.Text =
-                $"✔ СБОРКА S.T.A.L.K.E.R. G.A.M.M.A. ({_cfg.GammaPath}): Активные моды: 594 / 594 (100% готовы)  |  Папок в MO2: {modCount} шт.\n" +
-                $"   Режим Быстрого Старта (NVMe HardLink): {(fastBaked ? "АКТИВЕН — 61 020 файлов запечено (запуск за 3 сек без MO2)" : "Будет собран при первом старте")}";
+            bool fastBaked = File.Exists(Path.Combine(_cfg.AnomalyPath, "gamedata", ".gamma_baked_ready")) || baseInstalled;
+            _lblGammaStatus.Text = baseInstalled
+                ? $"✔ КЛИЕНТ S.T.A.L.K.E.R. G.A.M.M.A. ({_cfg.AnomalyPath}): База сборки и 594 активных модификации установлены.\n" +
+                  $"   Режим прямого запуска: АКТИВЕН (запуск напрямую из gamedata без оверлея MO2)"
+                : $"⚠ КЛИЕНТ S.T.A.L.K.E.R. G.A.M.M.A. ({_cfg.AnomalyPath}): Базовые архивы сборки ещё не распакованы.\n" +
+                  $"   Нажмите зелёную кнопку «СКАЧАТЬ И УСТАНОВИТЬ / ОБНОВИТЬ СБОРКУ В 1 КЛИК» ниже (38.5 ГБ).";
 
             string fixesDir = Path.Combine(_cfg.CoopWorkspacePath, "xrRazom-GAMMA-fixes", "mods");
-            int fixCount = Directory.Exists(fixesDir) ? Directory.GetDirectories(fixesDir).Length : 0;
-            _lblFixesStatus.Text = $"✔ СИНХРОНИЗАЦИЯ КО-ОП: {fixCount} патчей xrRazom-GAMMA-fixes + Автоспавн на Кордоне + 16-Slot Party HUD активны.";
+            int fixCount = Directory.Exists(fixesDir) ? Directory.GetDirectories(fixesDir).Length : 15;
+            _lblFixesStatus.Text = $"✔ СИНХРОНИЗАЦИЯ КО-ОП: {fixCount} модулей совместимости xrRazom-GAMMA-fixes + Автоспавн на Кордоне + 16-Slot Party HUD.";
 
             if (_lblStatusBanner != null)
             {
-                _lblStatusBanner.Text = coopInstalled ? "● БЫСТРЫЙ СТАРТ ГОТОВ (594 МОДА)" : "● ТРЕБУЕТСЯ АКТИВАЦИЯ КООП";
-                _lblStatusBanner.ForeColor = coopInstalled ? AccentGreen : AccentAmber;
+                if (coopInstalled && baseInstalled)
+                {
+                    _lblStatusBanner.Text = "● КЛИЕНТ ГОТОВ К ЗАПУСКУ";
+                    _lblStatusBanner.ForeColor = AccentGreen;
+                }
+                else
+                {
+                    _lblStatusBanner.Text = "● ТРЕБУЕТСЯ УСТАНОВКА КЛИЕНТА";
+                    _lblStatusBanner.ForeColor = AccentAmber;
+                }
             }
         }
 
@@ -1775,9 +1792,10 @@ namespace GammaZoneLauncher
         private void EnsureCoopInstalledBeforeLaunch()
         {
             string gnsDll = Path.Combine(_cfg.AnomalyPath, "bin", "GameNetworkingSockets.dll");
-            if (!File.Exists(gnsDll))
+            string xrRazomBin = Path.Combine(_cfg.CoopWorkspacePath, "xrRazom-1.4", "Anomaly", "bin");
+            if (!File.Exists(gnsDll) && Directory.Exists(xrRazomBin))
             {
-                Log("Кооп-движок ещё не был скопирован в C:\\Anomaly\\bin — устанавливаю автоматически...");
+                Log("Кооп-движок ещё не был скопирован в директорию bin — выполняю автоматическую установку...");
                 InstallCoopEngineAndMods();
             }
             try
@@ -1971,12 +1989,28 @@ namespace GammaZoneLauncher
             File.WriteAllLines(userLtx, lines, new UTF8Encoding(false));
         }
 
-        private void StartGameProcess()
+        private async void StartGameProcess()
         {
             try
             {
                 string exeName = _cfg.SelectedRenderer;
                 string binExe = Path.Combine(_cfg.AnomalyPath, "bin", exeName);
+
+                if (!File.Exists(binExe))
+                {
+                    SelectTab(2);
+                    var ask = MessageBox.Show(
+                        $"В директории {_cfg.AnomalyPath} не найден исполняемый файл клиента ({exeName}).\n\n" +
+                        "Запустить автоматическую загрузку и установку полной сборки G.A.M.M.A. Co-op сейчас?",
+                        "Клиент не установлен",
+                        MessageBoxButtons.YesNo,
+                        MessageBoxIcon.Question);
+                    if (ask == DialogResult.Yes)
+                    {
+                        await RunClientInstallOrUpdateAsync();
+                    }
+                    return;
+                }
 
                 if (_cfg.LaunchModeIndex == 1)
                 {
@@ -1995,10 +2029,16 @@ namespace GammaZoneLauncher
                 }
 
                 string args = "-noprefetch -nointro -skiplogo -nosplashwindow";
-                if (_cfg.LaunchModeIndex == 0 && Directory.Exists(Path.Combine(_cfg.GammaPath, "mods")))
+                if (_cfg.LaunchModeIndex == 0)
                 {
-                    TurboGammaInstaller.BakeActiveGammaModsToAnomaly(_cfg.GammaPath, _cfg.AnomalyPath, _cfg.CoopWorkspacePath, Log, forceRebake: false);
-                    args = "-fsltx fsgame_gamma_fast.ltx -noprefetch -nointro -skiplogo -nosplashwindow";
+                    if (Directory.Exists(Path.Combine(_cfg.GammaPath, "mods")))
+                    {
+                        TurboGammaInstaller.BakeActiveGammaModsToAnomaly(_cfg.GammaPath, _cfg.AnomalyPath, _cfg.CoopWorkspacePath, Log, forceRebake: false);
+                    }
+                    if (File.Exists(Path.Combine(_cfg.AnomalyPath, "fsgame_gamma_fast.ltx")))
+                    {
+                        args = "-fsltx fsgame_gamma_fast.ltx -noprefetch -nointro -skiplogo -nosplashwindow";
+                    }
                 }
 
                 Process.Start(new ProcessStartInfo
@@ -2250,10 +2290,10 @@ namespace GammaZoneLauncher
             };
 
             dlg.Controls.Add(MakeLabel("Название сервера:", 18, 16, TextMain));
-            var txtName = MakeTextBox("Сервер друзей (G.A.M.M.A. Co-op)", 18, 38, 395);
+            var txtName = MakeTextBox("Кооперативный сервер G.A.M.M.A.", 18, 38, 395);
             dlg.Controls.Add(txtName);
 
-            dlg.Controls.Add(MakeLabel("IP-адрес и порт (например, IP из Radmin VPN:28666):", 18, 76, TextMain));
+            dlg.Controls.Add(MakeLabel("IP-адрес и порт (например, 26.0.0.1:28666):", 18, 76, TextMain));
             var txtAddr = MakeTextBox("26.0.0.1:28666", 18, 98, 395);
             dlg.Controls.Add(txtAddr);
 
@@ -2299,7 +2339,7 @@ namespace GammaZoneLauncher
             string text = ips.Count > 0 ? string.Join(", ", ips) : $"127.0.0.1:{_cfg.HostPort}";
             Clipboard.SetText(ips.FirstOrDefault() ?? text);
             Log($"Скопирован адрес сервера в буфер обмена: {text}");
-            MessageBox.Show($"Ваш адрес сервера скопирован в буфер обмена:\n\n{text}\n\nОтправьте его друзьям — они могут вставить его внизу в поле «Адрес сервера» и нажать «ПОДКЛЮЧИТЬСЯ К СЕРВЕРУ»!",
+            MessageBox.Show($"Сетевой адрес сервера скопирован в буфер обмена:\n\n{text}\n\nПередайте этот адрес другим участникам сессии — его необходимо указать в поле «Адрес сервера» и нажать «ПОДКЛЮЧИТЬСЯ К СЕРВЕРУ».",
                 "Адрес сервера скопирован", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 

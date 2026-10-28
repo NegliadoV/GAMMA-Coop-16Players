@@ -276,12 +276,12 @@ namespace GammaZoneLauncher
             string json = JsonSerializer.Serialize(manifest, new JsonSerializerOptions { WriteIndented = true });
             await File.WriteAllTextAsync(manifestPath, json, Encoding.UTF8, ct);
 
-            // Bundle standalone FriendLauncher.zip for sending in Telegram/Discord
-            Report("Создание архива лаунчера для друзей (GAMMA-Coop-Friend-Launcher.zip)...", 3, 4, "GAMMA-Coop-Friend-Launcher.zip");
-            PackFriendLauncherZip(manifest.BaseReleaseUrl);
+            // Bundle standalone client launcher archive
+            Report("Упаковка архива клиентского лаунчера (GAMMA-Coop-Launcher.zip)...", 3, 4, "GAMMA-Coop-Launcher.zip");
+            PackClientLauncherZip(manifest.BaseReleaseUrl);
 
-            Report("Готово! Патч и лаунчер для друзей собраны.", 4, 4, _releaseOutDir);
-            _log($"[РЕЛИЗ-ПАТЧ] Манифест и лаунчер сохранены в: {_releaseOutDir}");
+            Report("Готово! Дельта-патч и клиентский лаунчер собраны.", 4, 4, _releaseOutDir);
+            _log($"[РЕЛИЗ-ПАТЧ] Манифест и клиентский лаунчер сохранены в: {_releaseOutDir}");
             return manifest;
         }
 
@@ -302,7 +302,7 @@ namespace GammaZoneLauncher
             }
 
             string baseArchivePrefix = Path.Combine(_releaseOutDir, "gamma_coop_base.7z");
-            _log($"[ УПАКОВКА БАЗЫ ] Начинаю упаковку готовой игры ({_anomalyPath}) в тома по 1.9 ГБ -> {_releaseOutDir}...");
+            _log($"[ УПАКОВКА БАЗЫ ] Начинаю упаковку базового клиента ({_anomalyPath}) в тома по 1.9 ГБ -> {_releaseOutDir}...");
             Report("Упаковка полной базы (db + bin + gamedata) в тома по 1.9 ГБ (7-Zip Multi-Thread)...", 1, 3, "gamma_coop_base.7z.001...");
 
             var includeItems = new List<string>();
@@ -337,15 +337,17 @@ namespace GammaZoneLauncher
             return await PackFastPatchAndLauncherAsync(baseReleaseUrl, ct);
         }
 
-        private void PackFriendLauncherZip(string defaultReleaseUrl)
+        private void PackClientLauncherZip(string defaultReleaseUrl)
         {
             try
             {
-                string zipPath = Path.Combine(_releaseOutDir, "GAMMA-Coop-Friend-Launcher.zip");
+                string zipPath = Path.Combine(_releaseOutDir, "GAMMA-Coop-Launcher.zip");
+                string compatZipPath = Path.Combine(_releaseOutDir, "GAMMA-Coop-Friend-Launcher.zip");
                 if (File.Exists(zipPath)) File.Delete(zipPath);
+                if (File.Exists(compatZipPath)) File.Delete(compatZipPath);
 
                 string launcherBinDir = AppDomain.CurrentDomain.BaseDirectory;
-                string tempStage = Path.Combine(_releaseOutDir, "_friend_launcher_stage");
+                string tempStage = Path.Combine(_releaseOutDir, "_client_launcher_stage");
                 if (Directory.Exists(tempStage)) Directory.Delete(tempStage, true);
                 Directory.CreateDirectory(tempStage);
 
@@ -363,8 +365,7 @@ namespace GammaZoneLauncher
                     srcFs.CopyTo(dstFs);
                 }
 
-                // Write clean friend launcher_config.json pre-configured for client install
-                var friendCfg = new LauncherConfig
+                var clientCfg = new LauncherConfig
                 {
                     AnomalyPath = @"C:\STALKER-GAMMA-Coop",
                     GammaPath = @"C:\STALKER-GAMMA-Coop",
@@ -374,15 +375,16 @@ namespace GammaZoneLauncher
                 };
                 File.WriteAllText(
                     Path.Combine(tempStage, "launcher_config.json"),
-                    JsonSerializer.Serialize(friendCfg, new JsonSerializerOptions { WriteIndented = true }),
+                    JsonSerializer.Serialize(clientCfg, new JsonSerializerOptions { WriteIndented = true }),
                     Encoding.UTF8);
 
                 ZipFile.CreateFromDirectory(tempStage, zipPath, CompressionLevel.Optimal, false);
+                File.Copy(zipPath, compatZipPath, true);
                 Directory.Delete(tempStage, true);
             }
             catch (Exception ex)
             {
-                _log("[ПРЕДУПРЕЖДЕНИЕ] Не удалось собрать GAMMA-Coop-Friend-Launcher.zip: " + ex.Message);
+                _log("[ПРЕДУПРЕЖДЕНИЕ] Не удалось собрать GAMMA-Coop-Launcher.zip: " + ex.Message);
             }
         }
 
