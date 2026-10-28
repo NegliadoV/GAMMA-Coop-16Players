@@ -411,6 +411,13 @@ namespace GammaZoneLauncher
                 }
             }
 
+            if (string.IsNullOrWhiteSpace(_cfg.ReleaseManifestUrl) ||
+                _cfg.ReleaseManifestUrl.Equals(@"C:\GAMMA-Coop-Release", StringComparison.OrdinalIgnoreCase) ||
+                _cfg.ReleaseManifestUrl.Contains("/releases/tag/", StringComparison.OrdinalIgnoreCase))
+            {
+                _cfg.ReleaseManifestUrl = ReleasePackagerAndUpdater.DefaultGitHubReleaseUrl;
+            }
+
             if (_cfg.SavedServers == null || _cfg.SavedServers.Count == 0)
             {
                 _cfg.SavedServers = new List<ServerEntry>
@@ -1330,7 +1337,25 @@ namespace GammaZoneLauncher
                         }));
                     });
 
-                await updater.InstallOrUpdateClientFromUrlAsync(_cfg.ReleaseManifestUrl, _cfg.AnomalyPath, CancellationToken.None);
+                bool forceDownloadBase = false;
+                if (ReleasePackagerAndUpdater.IsFullGammaBaseInstalled(_cfg.AnomalyPath))
+                {
+                    var ans = MessageBox.Show(
+                        $"В папке {_cfg.AnomalyPath} уже найдена установленная база сборки.\n\n" +
+                        "• Нажмите «Да», если хотите скачать и распаковать заново все 21 том базы (38.5 ГБ) + свежий патч.\n" +
+                        "• Нажмите «Нет», чтобы скачать и установить только свежий дельта-патч синхронизации (92 МБ).",
+                        "Режим установки / обновления",
+                        MessageBoxButtons.YesNoCancel,
+                        MessageBoxIcon.Question);
+                    if (ans == DialogResult.Cancel) return;
+                    forceDownloadBase = (ans == DialogResult.Yes);
+                }
+
+                string normUrl = ReleasePackagerAndUpdater.NormalizeReleaseUrl(_cfg.ReleaseManifestUrl);
+                if (_txtReleaseUrl != null && _txtReleaseUrl.Text != normUrl)
+                    _txtReleaseUrl.Text = normUrl;
+
+                await updater.InstallOrUpdateClientFromUrlAsync(normUrl, _cfg.AnomalyPath, CancellationToken.None, forceDownloadBase: forceDownloadBase, forceApplyPatch: true);
                 EnsureWindowedActiveUserLtx(Path.Combine(_cfg.AnomalyPath, "appdata"));
                 RefreshModAndEngineStatus();
                 _lblStatusBanner.Text = "● БЫСТРЫЙ СТАРТ ГОТОВ (594 МОДА)";

@@ -66,10 +66,80 @@ namespace GammaZoneLauncher
             _onProgress = onProgress ?? (_ => { });
         }
 
+        public const string DefaultGitHubReleaseUrl = "https://github.com/NegliadoV/GAMMA-Coop-16Players/releases/download/v1.0.0";
+
+        public static string NormalizeReleaseUrl(string rawUrl)
+        {
+            if (string.IsNullOrWhiteSpace(rawUrl))
+                return DefaultGitHubReleaseUrl;
+
+            string u = rawUrl.Trim();
+            // If it's a local path that exists and contains manifest.json, keep it
+            if (Directory.Exists(u) && File.Exists(Path.Combine(u, "manifest.json")))
+                return u;
+            if (File.Exists(u) && Path.GetFileName(u).Equals("manifest.json", StringComparison.OrdinalIgnoreCase))
+                return u;
+
+            // If it's the old local default C:\GAMMA-Coop-Release and doesn't exist on this PC, use GitHub
+            if (!u.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
+                !u.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            {
+                return DefaultGitHubReleaseUrl;
+            }
+
+            // Convert /releases/tag/<tag> -> /releases/download/<tag>
+            if (u.Contains("/releases/tag/", StringComparison.OrdinalIgnoreCase))
+            {
+                u = u.Replace("/releases/tag/", "/releases/download/", StringComparison.OrdinalIgnoreCase);
+            }
+            else if (u.EndsWith("/GAMMA-Coop-16Players", StringComparison.OrdinalIgnoreCase) ||
+                     u.EndsWith("/GAMMA-Coop-16Players/", StringComparison.OrdinalIgnoreCase) ||
+                     u.EndsWith("/releases", StringComparison.OrdinalIgnoreCase) ||
+                     u.EndsWith("/releases/latest", StringComparison.OrdinalIgnoreCase))
+            {
+                return DefaultGitHubReleaseUrl;
+            }
+
+            return u;
+        }
+
         public static string ResolveSevenZipExe(string gammaPath)
         {
-            string local7z = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "7z.exe");
-            if (File.Exists(local7z)) return local7z;
+            var searchDirs = new List<string>();
+            if (!string.IsNullOrEmpty(Environment.ProcessPath))
+            {
+                string procDir = Path.GetDirectoryName(Environment.ProcessPath);
+                if (!string.IsNullOrEmpty(procDir))
+                {
+                    searchDirs.Add(procDir);
+                    var parent = Directory.GetParent(procDir)?.FullName;
+                    if (!string.IsNullOrEmpty(parent))
+                    {
+                        searchDirs.Add(parent);
+                        searchDirs.Add(Path.Combine(parent, "gamma-cli", "resources"));
+                    }
+                    searchDirs.Add(Path.Combine(procDir, "gamma-cli", "resources"));
+                }
+            }
+            if (!string.IsNullOrEmpty(AppDomain.CurrentDomain.BaseDirectory))
+            {
+                string baseDir = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\', '/');
+                searchDirs.Add(baseDir);
+                var parent = Directory.GetParent(baseDir)?.FullName;
+                if (!string.IsNullOrEmpty(parent))
+                {
+                    searchDirs.Add(Path.Combine(parent, "gamma-cli", "resources"));
+                }
+            }
+
+            foreach (var dir in searchDirs.Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                foreach (var exeName in new[] { "7z.exe", "7zz.exe" })
+                {
+                    string candidate = Path.Combine(dir, exeName);
+                    if (File.Exists(candidate)) return candidate;
+                }
+            }
 
             if (!string.IsNullOrWhiteSpace(gammaPath))
             {
@@ -87,7 +157,7 @@ namespace GammaZoneLauncher
                 if (File.Exists(p)) return p;
             }
 
-            throw new FileNotFoundException("Не найден архиватор 7z.exe.");
+            throw new FileNotFoundException("Не найден архиватор 7z.exe / 7zz.exe.");
         }
 
         public static void EnsureBundledSevenZipInLauncherDir(string gammaPath)
@@ -316,19 +386,35 @@ namespace GammaZoneLauncher
             }
         }
 
+        public static bool IsFullGammaBaseInstalled(string targetInstallDir)
+        {
+            if (string.IsNullOrWhiteSpace(targetInstallDir) || !Directory.Exists(targetInstallDir))
+                return false;
+
+            return Directory.Exists(Path.Combine(targetInstallDir, "db")) &&
+                   Directory.Exists(Path.Combine(targetInstallDir, "gamedata", "configs")) &&
+                   Directory.Exists(Path.Combine(targetInstallDir, "gamedata", "meshes")) &&
+                   Directory.Exists(Path.Combine(targetInstallDir, "gamedata", "sounds")) &&
+                   File.Exists(Path.Combine(targetInstallDir, "bin", "AnomalyDX11AVX.exe"));
+        }
+
         /// <summary>
         /// Downloads and installs the full build (if not installed) or applies the fast delta patch from BaseReleaseUrl / manifest.json.
         /// </summary>
-        public async Task InstallOrUpdateClientFromUrlAsync(string manifestOrReleaseUrl, string targetInstallDir, CancellationToken ct)
+        public async Task InstallOrUpdateClientFromUrlAsync(
+            string manifestOrReleaseUrl,
+            string targetInstallDir,
+            CancellationToken ct,
+            bool forceDownloadBase = false,
+            bool forceApplyPatch = false)
         {
-            if (string.IsNullOrWhiteSpace(manifestOrReleaseUrl))
-                throw new ArgumentException("Укажите URL релиза (или путь к папке с томами / manifest.json).");
+            string normalizedUrl = NormalizeReleaseUrl(manifestOrReleaseUrl);
 
             Directory.CreateDirectory(targetInstallDir);
             EnsureBundledSevenZipInLauncherDir(_gammaPath);
             string sevenZip = ResolveSevenZipExe(_gammaPath);
 
-            string trimmedUrl = manifestOrReleaseUrl.Trim();
+            string trimmedUrl = normalizedUrl.Trim();
             bool isLocalDir = Directory.Exists(trimmedUrl) || (File.Exists(trimmedUrl) && Path.GetFileName(trimmedUrl).Equals("manifest.json", StringComparison.OrdinalIgnoreCase));
 
             ReleaseManifest manifest;
@@ -337,13 +423,15 @@ namespace GammaZoneLauncher
             using var http = new HttpClient(new SocketsHttpHandler
             {
                 AutomaticDecompression = DecompressionMethods.All,
+                AllowAutoRedirect = true,
+                MaxAutomaticRedirections = 10,
                 MaxConnectionsPerServer = 16,
-                ConnectTimeout = TimeSpan.FromSeconds(20)
+                ConnectTimeout = TimeSpan.FromSeconds(25)
             })
             {
-                Timeout = TimeSpan.FromHours(2)
+                Timeout = TimeSpan.FromHours(4)
             };
-            http.DefaultRequestHeaders.UserAgent.ParseAdd("GammaZoneLauncher/1.4");
+            http.DefaultRequestHeaders.UserAgent.ParseAdd("GammaZoneLauncher/1.5");
 
             if (isLocalDir)
             {
@@ -360,7 +448,8 @@ namespace GammaZoneLauncher
                     : trimmedUrl.TrimEnd('/') + "/manifest.json";
                 baseSourceUrlOrDir = manifestUrl[..manifestUrl.LastIndexOf('/')];
 
-                _log($"[АПДЕЙТЕР] Загрузка манифеста сборки: {manifestUrl}...");
+                _log($"[АПДЕЙТЕР] Загрузка манифеста сборки с GitHub: {manifestUrl}...");
+                Report("Подключение к GitHub Releases и чтение manifest.json...", 1, 1000, "manifest.json");
                 string json = await http.GetStringAsync(manifestUrl, ct);
                 manifest = JsonSerializer.Deserialize<ReleaseManifest>(json);
             }
@@ -368,51 +457,96 @@ namespace GammaZoneLauncher
             if (manifest == null)
                 throw new InvalidOperationException("Не удалось прочитать manifest.json.");
 
-            _log($"[АПДЕЙТЕР] Найдена версия сборки: {manifest.Version} (Активных модов: {manifest.ActiveModsCount}, файлов: {manifest.TotalBakedFiles}).");
+            _log($"[АПДЕЙТЕР] Найдена версия сборки: {manifest.Version} (Активных модов: {manifest.ActiveModsCount}, томов базы: {manifest.BaseVolumes?.Count ?? 0}).");
 
-            bool hasBaseInstalled =
-                Directory.Exists(Path.Combine(targetInstallDir, "db")) &&
-                Directory.Exists(Path.Combine(targetInstallDir, "gamedata", "configs")) &&
-                File.Exists(Path.Combine(targetInstallDir, "bin", "AnomalyDX11AVX.exe"));
+            bool hasBaseInstalled = !forceDownloadBase && IsFullGammaBaseInstalled(targetInstallDir);
 
             string cacheDir = Path.Combine(targetInstallDir, "_release_cache");
             Directory.CreateDirectory(cacheDir);
 
-            // 1. If base game is missing, download all volumes and extract
+            // 1. If base game is missing (or forceDownloadBase requested), download all 21 volumes and extract
             if (!hasBaseInstalled && manifest.BaseVolumes != null && manifest.BaseVolumes.Count > 0)
             {
                 int totalVols = manifest.BaseVolumes.Count;
-                _log($"[УСТАНОВКА С НУЛЯ] Игра ещё не установлена в {targetInstallDir}. Скачивание {totalVols} томов базы в 8 потоков...");
+                long totalBaseBytes = manifest.BaseVolumes.Sum(v => v.SizeBytes);
+                long downloadedBytes = 0;
 
+                // Pre-count already downloaded volumes so the progress bar starts at accurate %
+                foreach (var v in manifest.BaseVolumes)
+                {
+                    string dv = Path.Combine(cacheDir, v.FileName);
+                    if (File.Exists(dv) && new FileInfo(dv).Length == v.SizeBytes)
+                    {
+                        downloadedBytes += v.SizeBytes;
+                    }
+                    else if (File.Exists(dv + ".part"))
+                    {
+                        long pLen = new FileInfo(dv + ".part").Length;
+                        if (pLen > 0 && pLen <= v.SizeBytes) downloadedBytes += pLen;
+                    }
+                }
+
+                _log($"[УСТАНОВКА БАЗЫ 38.5 ГБ] Целевая папка: {targetInstallDir}. Скачивание {totalVols} томов (в 4 параллельных потока с докачкой)...");
+                var sw = Stopwatch.StartNew();
+                long sessionBytesStart = downloadedBytes;
+                long lastReportMs = 0;
                 int doneVols = 0;
-                await Parallel.ForEachAsync(manifest.BaseVolumes, new ParallelOptions { MaxDegreeOfParallelism = 8, CancellationToken = ct }, async (vol, token) =>
+
+                await Parallel.ForEachAsync(manifest.BaseVolumes, new ParallelOptions { MaxDegreeOfParallelism = 4, CancellationToken = ct }, async (vol, token) =>
                 {
                     string dstVol = Path.Combine(cacheDir, vol.FileName);
                     if (File.Exists(dstVol) && new FileInfo(dstVol).Length == vol.SizeBytes)
                     {
                         int cur = Interlocked.Increment(ref doneVols);
-                        Report($"Том уже скачан ({cur}/{totalVols}): {vol.FileName}", cur, totalVols, vol.FileName);
+                        _log($"[КЭШ] Том уже скачан ({cur}/{totalVols}): {vol.FileName}");
+                        int permille = totalBaseBytes > 0 ? (int)Math.Clamp((Interlocked.Read(ref downloadedBytes) * 1000L) / totalBaseBytes, 1, 1000) : 100;
+                        Report($"Том в кэше ({cur}/{totalVols}): {vol.FileName}", permille, 1000, $"{cur}/{totalVols} томов");
                         return;
                     }
 
                     if (isLocalDir)
                     {
+                        _log($"[КОПИРОВАНИЕ] {vol.FileName} ({vol.SizeBytes / (1024 * 1024)} МБ)...");
                         File.Copy(Path.Combine(baseSourceUrlOrDir, vol.FileName), dstVol, true);
+                        Interlocked.Add(ref downloadedBytes, vol.SizeBytes);
                     }
                     else
                     {
                         string volUrl = $"{baseSourceUrlOrDir}/{vol.FileName}";
-                        await DownloadFileWithResumeAsync(http, volUrl, dstVol, vol.SizeBytes, token);
+                        _log($"[СКАЧИВАНИЕ] Начата загрузка {vol.FileName} ({vol.SizeBytes / (1024 * 1024)} МБ)...");
+                        await DownloadFileWithResumeAsync(http, volUrl, dstVol, vol.SizeBytes, bytesDelta =>
+                        {
+                            long curBytes = Interlocked.Add(ref downloadedBytes, bytesDelta);
+                            long nowMs = sw.ElapsedMilliseconds;
+                            long prevMs = Interlocked.Read(ref lastReportMs);
+                            if (nowMs - prevMs >= 250 && Interlocked.CompareExchange(ref lastReportMs, nowMs, prevMs) == prevMs)
+                            {
+                                double elapsedSec = Math.Max(0.5, nowMs / 1000.0);
+                                double speedMbps = ((curBytes - sessionBytesStart) / (1024.0 * 1024.0)) / elapsedSec;
+                                double curGb = curBytes / (1024.0 * 1024.0 * 1024.0);
+                                double totGb = totalBaseBytes / (1024.0 * 1024.0 * 1024.0);
+                                double pct = totalBaseBytes > 0 ? (curBytes * 100.0) / totalBaseBytes : 0;
+                                int permille = (int)Math.Clamp(pct * 10.0, 1, 999);
+                                int curDone = Volatile.Read(ref doneVols);
+                                Report(
+                                    $"Загрузка базы: {curGb:0.00} / {totGb:0.00} ГБ ({pct:0.0}%) — {speedMbps:0.1} МБ/с",
+                                    permille,
+                                    1000,
+                                    $"Томов: {curDone}/{totalVols}");
+                            }
+                        }, token);
                     }
 
                     int completed = Interlocked.Increment(ref doneVols);
-                    Report($"Скачано томов: {completed} / {totalVols}", completed, totalVols, vol.FileName);
+                    _log($"[ГОТОВ ТОМ {completed}/{totalVols}] {vol.FileName} успешно скачан.");
+                    int pDone = totalBaseBytes > 0 ? (int)Math.Clamp((Interlocked.Read(ref downloadedBytes) * 1000L) / totalBaseBytes, 1, 1000) : 1000;
+                    Report($"Скачано томов: {completed} / {totalVols}", pDone, 1000, vol.FileName);
                 });
 
                 string firstVol = Path.Combine(cacheDir, manifest.BaseVolumes[0].FileName);
-                _log($"[РАСПАКОВКА БАЗЫ] Распаковка {firstVol} -> {targetInstallDir}...");
-                Report("Распаковка базовой сборки G.A.M.M.A. Co-op...", totalVols, totalVols, firstVol);
-                await RunSevenZipAsync(sevenZip, targetInstallDir, $"x -y -mmt=on \"{firstVol}\" -o\"{targetInstallDir}\"", ct);
+                _log($"[РАСПАКОВКА БАЗЫ] Распаковка 21 тома ({firstVol}) -> {targetInstallDir}...");
+                Report("Распаковка базовой сборки G.A.M.M.A. Co-op (75 ГБ)...", 990, 1000, firstVol);
+                await RunSevenZipWithProgressAsync(sevenZip, targetInstallDir, $"x -y -mmt=on -bsp1 \"{firstVol}\" -o\"{targetInstallDir}\"", "Распаковка базовой сборки G.A.M.M.A. (75 ГБ)", ct);
             }
 
             // 2. Check & apply fast patch archive (gamma_coop_patch.7z)
@@ -421,11 +555,11 @@ namespace GammaZoneLauncher
                 string stampFile = Path.Combine(targetInstallDir, ".gamma_patch_sha256");
                 string currentSha = File.Exists(stampFile) ? (await File.ReadAllTextAsync(stampFile, ct)).Trim() : "";
 
-                if (!string.Equals(currentSha, manifest.PatchArchiveSha256, StringComparison.OrdinalIgnoreCase))
+                if (forceApplyPatch || !hasBaseInstalled || !string.Equals(currentSha, manifest.PatchArchiveSha256, StringComparison.OrdinalIgnoreCase))
                 {
                     string dstPatch = Path.Combine(cacheDir, manifest.PatchArchiveName);
                     _log($"[ОБНОВЛЕНИЕ ПАТЧА] Загрузка свежего патча {manifest.PatchArchiveName} ({manifest.PatchArchiveSize / (1024.0 * 1024.0):0.1} МБ)...");
-                    Report($"Скачивание патча {manifest.Version}...", 1, 2, manifest.PatchArchiveName);
+                    Report($"Скачивание патча {manifest.Version}...", 10, 100, manifest.PatchArchiveName);
 
                     if (isLocalDir)
                     {
@@ -434,11 +568,17 @@ namespace GammaZoneLauncher
                     else
                     {
                         string patchUrl = $"{baseSourceUrlOrDir}/{manifest.PatchArchiveName}";
-                        await DownloadFileWithResumeAsync(http, patchUrl, dstPatch, manifest.PatchArchiveSize, ct);
+                        long patchRead = 0;
+                        await DownloadFileWithResumeAsync(http, patchUrl, dstPatch, manifest.PatchArchiveSize, delta =>
+                        {
+                            long cur = Interlocked.Add(ref patchRead, delta);
+                            int pct = manifest.PatchArchiveSize > 0 ? (int)Math.Clamp((cur * 100L) / manifest.PatchArchiveSize, 1, 99) : 50;
+                            Report($"Скачивание патча: {cur / (1024.0 * 1024.0):0.1} / {manifest.PatchArchiveSize / (1024.0 * 1024.0):0.1} МБ", pct, 100, manifest.PatchArchiveName);
+                        }, ct);
                     }
 
                     _log($"[ОБНОВЛЕНИЕ ПАТЧА] Установка патча {manifest.Version} в {targetInstallDir}...");
-                    Report($"Распаковка патча {manifest.Version}...", 2, 2, manifest.PatchArchiveName);
+                    Report($"Распаковка патча {manifest.Version}...", 95, 100, manifest.PatchArchiveName);
                     await RunSevenZipAsync(sevenZip, targetInstallDir, $"x -y -mmt=on \"{dstPatch}\" -o\"{targetInstallDir}\"", ct);
 
                     // Clear shaders_cache so updated shaders recompile cleanly
@@ -449,8 +589,9 @@ namespace GammaZoneLauncher
                     }
 
                     await File.WriteAllTextAsync(stampFile, manifest.PatchArchiveSha256 ?? "", Encoding.UTF8, ct);
+                    Directory.CreateDirectory(Path.Combine(targetInstallDir, "gamedata"));
                     File.WriteAllText(Path.Combine(targetInstallDir, "gamedata", ".gamma_baked_ready"), $"Installed {manifest.Version} at {DateTime.Now:O}\r\n", Encoding.UTF8);
-                    _log($"[ГОТОВО] Сборка успешно обновлена до версии {manifest.Version}!");
+                    _log($"[ГОТОВО] Сборка успешно установлена и обновлена до версии {manifest.Version}!");
                 }
                 else
                 {
@@ -461,40 +602,67 @@ namespace GammaZoneLauncher
             Report($"Сборка {manifest.Version} полностью готова к игре!", 100, 100, manifest.Version);
         }
 
-        private static async Task DownloadFileWithResumeAsync(HttpClient http, string url, string destPath, long expectedSize, CancellationToken ct)
+        private static async Task DownloadFileWithResumeAsync(
+            HttpClient http,
+            string url,
+            string destPath,
+            long expectedSize,
+            Action<long> onBytesReceived,
+            CancellationToken ct)
         {
             string partPath = destPath + ".part";
-            long existingLen = File.Exists(partPath) ? new FileInfo(partPath).Length : 0;
-            if (existingLen > expectedSize && expectedSize > 0)
+            for (int attempt = 1; attempt <= 4; attempt++)
             {
-                File.Delete(partPath);
-                existingLen = 0;
-            }
+                try
+                {
+                    long existingLen = File.Exists(partPath) ? new FileInfo(partPath).Length : 0;
+                    if (existingLen > expectedSize && expectedSize > 0)
+                    {
+                        File.Delete(partPath);
+                        existingLen = 0;
+                    }
+                    if (existingLen == expectedSize && expectedSize > 0)
+                    {
+                        if (File.Exists(destPath)) File.Delete(destPath);
+                        File.Move(partPath, destPath);
+                        return;
+                    }
 
-            using var req = new HttpRequestMessage(HttpMethod.Get, url);
-            if (existingLen > 0)
-                req.Headers.Range = new RangeHeaderValue(existingLen, null);
+                    using var req = new HttpRequestMessage(HttpMethod.Get, url);
+                    if (existingLen > 0)
+                        req.Headers.Range = new RangeHeaderValue(existingLen, null);
 
-            using var resp = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
-            if (resp.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable)
-            {
-                File.Delete(partPath);
-                existingLen = 0;
-            }
-            else
-            {
-                resp.EnsureSuccessStatusCode();
-            }
+                    using var resp = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+                    if (resp.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable)
+                    {
+                        File.Delete(partPath);
+                        existingLen = 0;
+                        continue;
+                    }
+                    resp.EnsureSuccessStatusCode();
 
-            bool append = resp.StatusCode == HttpStatusCode.PartialContent && existingLen > 0;
-            using (var fs = new FileStream(partPath, append ? FileMode.Append : FileMode.Create, FileAccess.Write, FileShare.None, 262144, true))
-            using (var net = await resp.Content.ReadAsStreamAsync(ct))
-            {
-                await net.CopyToAsync(fs, 262144, ct);
-            }
+                    bool append = resp.StatusCode == HttpStatusCode.PartialContent && existingLen > 0;
+                    using (var fs = new FileStream(partPath, append ? FileMode.Append : FileMode.Create, FileAccess.Write, FileShare.None, 262144, true))
+                    using (var net = await resp.Content.ReadAsStreamAsync(ct))
+                    {
+                        byte[] buffer = new byte[262144];
+                        int read;
+                        while ((read = await net.ReadAsync(buffer.AsMemory(0, buffer.Length), ct)) > 0)
+                        {
+                            await fs.WriteAsync(buffer.AsMemory(0, read), ct);
+                            onBytesReceived?.Invoke(read);
+                        }
+                    }
 
-            if (File.Exists(destPath)) File.Delete(destPath);
-            File.Move(partPath, destPath);
+                    if (File.Exists(destPath)) File.Delete(destPath);
+                    File.Move(partPath, destPath);
+                    return;
+                }
+                catch (Exception) when (attempt < 4 && !ct.IsCancellationRequested)
+                {
+                    await Task.Delay(2000 * attempt, ct);
+                }
+            }
         }
 
         private async Task RunSevenZipWithProgressAsync(string sevenZipExe, string workingDir, string arguments, string phaseTitle, CancellationToken ct)
