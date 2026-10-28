@@ -2521,6 +2521,41 @@ namespace GammaZoneLauncher
                     form.SaveTabPreviews(@"C:\Users\stanis\.gemini\antigravity\brain\bbf95dd9-e57c-41ac-b668-9e6154be0ddd");
                     return;
                 }
+                if (args.Contains("--test-unpack"))
+                {
+                    string testDir = @"C:\Anomaly_Unpack_Test";
+                    Directory.CreateDirectory(testDir);
+                    string logFile = Path.Combine(testDir, "unpack_test.log");
+                    if (File.Exists(logFile)) File.Delete(logFile);
+                    object logLock = new object();
+                    void WriteTestLog(string line)
+                    {
+                        lock (logLock)
+                        {
+                            File.AppendAllText(logFile, $"[{DateTime.Now:HH:mm:ss}] {line}\r\n", Encoding.UTF8);
+                        }
+                    }
+                    WriteTestLog("=== START UNPACK TEST ===");
+                    var updater = new ReleasePackagerAndUpdater(
+                        testDir,
+                        @"C:\NonExistentGammaDir",
+                        @"C:\NonExistentReleaseOutDir",
+                        msg => WriteTestLog(msg),
+                        prog => WriteTestLog($"[PROGRESS] {prog.Phase} | {prog.CurrentStep}/{prog.TotalSteps} | {prog.Detail}"));
+                    Task.Run(async () =>
+                    {
+                        await updater.InstallOrUpdateClientFromUrlAsync(
+                            ReleasePackagerAndUpdater.DefaultGitHubReleaseUrl,
+                            testDir,
+                            CancellationToken.None,
+                            forceDownloadBase: true,
+                            forceApplyPatch: true);
+                    }).GetAwaiter().GetResult();
+                    bool ok = ReleasePackagerAndUpdater.IsFullGammaBaseInstalled(testDir);
+                    WriteTestLog($"[TEST RESULT] IsFullGammaBaseInstalled({testDir}) = {ok}");
+                    if (!ok) Environment.ExitCode = 2;
+                    return;
+                }
                 Application.Run(form);
             }
             catch (Exception ex)

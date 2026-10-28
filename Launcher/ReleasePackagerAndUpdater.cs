@@ -549,6 +549,20 @@ namespace GammaZoneLauncher
                 _log($"[РАСПАКОВКА БАЗЫ] Распаковка 21 тома ({firstVol}) -> {targetInstallDir}...");
                 Report("Распаковка базовой сборки G.A.M.M.A. Co-op (75 ГБ)...", 990, 1000, firstVol);
                 await RunSevenZipWithProgressAsync(sevenZip, targetInstallDir, $"x -y -mmt=on -bsp1 \"{firstVol}\" -o\"{targetInstallDir}\"", "Распаковка базовой сборки G.A.M.M.A. (75 ГБ)", ct);
+
+                if (IsFullGammaBaseInstalled(targetInstallDir))
+                {
+                    _log("[ОЧИСТКА КЭША] Удаление временных архивов базы (38.5 ГБ) после успешной распаковки...");
+                    foreach (var v in manifest.BaseVolumes)
+                    {
+                        try
+                        {
+                            string cachedVol = Path.Combine(cacheDir, v.FileName);
+                            if (File.Exists(cachedVol)) File.Delete(cachedVol);
+                        }
+                        catch { }
+                    }
+                }
             }
 
             // 2. Check & apply fast patch archive (gamma_coop_patch.7z)
@@ -571,11 +585,18 @@ namespace GammaZoneLauncher
                     {
                         string patchUrl = $"{baseSourceUrlOrDir}/{manifest.PatchArchiveName}";
                         long patchRead = 0;
+                        var patchSw = Stopwatch.StartNew();
+                        long lastPatchReportMs = 0;
                         await DownloadFileWithResumeAsync(http, patchUrl, dstPatch, manifest.PatchArchiveSize, delta =>
                         {
                             long cur = Interlocked.Add(ref patchRead, delta);
-                            int pct = manifest.PatchArchiveSize > 0 ? (int)Math.Clamp((cur * 100L) / manifest.PatchArchiveSize, 1, 99) : 50;
-                            Report($"Скачивание патча: {cur / (1024.0 * 1024.0):0.1} / {manifest.PatchArchiveSize / (1024.0 * 1024.0):0.1} МБ", pct, 100, manifest.PatchArchiveName);
+                            long nowMs = patchSw.ElapsedMilliseconds;
+                            long prevMs = Interlocked.Read(ref lastPatchReportMs);
+                            if (nowMs - prevMs >= 200 && Interlocked.CompareExchange(ref lastPatchReportMs, nowMs, prevMs) == prevMs)
+                            {
+                                int pct = manifest.PatchArchiveSize > 0 ? (int)Math.Clamp((cur * 100L) / manifest.PatchArchiveSize, 1, 99) : 50;
+                                Report($"Скачивание патча: {cur / (1024.0 * 1024.0):0.1} / {manifest.PatchArchiveSize / (1024.0 * 1024.0):0.1} МБ", pct, 100, manifest.PatchArchiveName);
+                            }
                         }, ct);
                     }
 
@@ -680,20 +701,57 @@ namespace GammaZoneLauncher
                 RedirectStandardError = true
             };
 
+            bool isPacking = arguments.TrimStart().StartsWith("a ", StringComparison.OrdinalIgnoreCase);
             using var proc = Process.Start(psi) ?? throw new InvalidOperationException("Не удалось запустить 7z.exe");
-            var stdOutTask = proc.StandardOutput.ReadToEndAsync();
             var stdErrTask = proc.StandardError.ReadToEndAsync();
 
+            int lastParsedPct = 0;
+            var stdOutTask = Task.Run(async () =>
+            {
+                char[] buf = new char[512];
+                var reader = proc.StandardOutput;
+                int n;
+                while ((n = await reader.ReadAsync(buf, 0, buf.Length)) > 0)
+                {
+                    string chunk = new string(buf, 0, n);
+                    for (int i = 0; i < chunk.Length; i++)
+                    {
+                        if (chunk[i] == '%')
+                        {
+                            int end = i;
+                            int start = i - 1;
+                            while (start >= 0 && char.IsDigit(chunk[start])) start--;
+                            start++;
+                            if (end > start && (end - start) <= 3 && int.TryParse(chunk.AsSpan(start, end - start), out int pct))
+                            {
+                                if (pct >= 0 && pct <= 100)
+                                    Volatile.Write(ref lastParsedPct, pct);
+                            }
+                        }
+                    }
+                }
+            }, ct);
+
+            var sw = Stopwatch.StartNew();
             while (!proc.HasExited)
             {
-                await Task.WhenAny(proc.WaitForExitAsync(ct), Task.Delay(1000, ct));
+                await Task.WhenAny(proc.WaitForExitAsync(ct), Task.Delay(500, ct));
                 if (proc.HasExited) break;
 
-                var vols = Directory.GetFiles(_releaseOutDir, "gamma_coop_base.7z.*");
-                long totalPacked = vols.Sum(v => { try { return new FileInfo(v).Length; } catch { return 0L; } });
-                double gb = totalPacked / (1024.0 * 1024.0 * 1024.0);
-                int estPct = (int)Math.Clamp(Math.Round(gb / 38.0 * 100.0), 1, 99);
-                Report($"{phaseTitle}: {estPct}%", estPct, 100, $"Томов: {vols.Length} шт. ({gb:0.1} ГБ)");
+                int pct = Volatile.Read(ref lastParsedPct);
+                if (isPacking && !string.IsNullOrWhiteSpace(_releaseOutDir) && Directory.Exists(_releaseOutDir))
+                {
+                    var vols = Directory.GetFiles(_releaseOutDir, "gamma_coop_base.7z.*");
+                    long totalPacked = vols.Sum(v => { try { return new FileInfo(v).Length; } catch { return 0L; } });
+                    double gb = totalPacked / (1024.0 * 1024.0 * 1024.0);
+                    int estPct = pct > 0 ? pct : (int)Math.Clamp(Math.Round(gb / 38.0 * 100.0), 1, 99);
+                    Report($"{phaseTitle}: {estPct}%", estPct, 100, $"Томов: {vols.Length} шт. ({gb:0.1} ГБ)");
+                }
+                else
+                {
+                    int displayPct = Math.Clamp(pct, 1, 99);
+                    Report($"{phaseTitle}: {displayPct}%", displayPct, 100, $"Прошло: {sw.Elapsed:mm\\:ss}");
+                }
             }
 
             await Task.WhenAll(stdOutTask, stdErrTask);
